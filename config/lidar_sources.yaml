@@ -1,0 +1,94 @@
+schema_version: "1.0"
+sources:
+  - id: usgs_manatee_b25_2025
+    dataset_name: 2025 USGS QL1 Manatee County Florida LiDAR
+    priority: 100
+    counties: [Manatee]
+    acquired_start: "2025-03-31"
+    acquired_end: "2025-04-02"
+    access: usgs_tnm
+    endpoint: null
+    catalog_name_patterns:
+      - "(?i)(manatee.*2025|2025.*manatee)"
+    data_kind: classified_point_cloud
+    minimum_density_ppsm: 8.0
+    allowed_classes: [2, 6]
+    roof_classes: [6]
+    provider: USGS 3DEP
+    license: US-GOVERNMENT-PUBLIC-DOMAIN
+    metadata_url: https://www.fisheries.noaa.gov/inport/item/79687
+    enabled: true
+
+  - id: lcmcd_lee_2026
+    dataset_name: 2026 Lee County Mosquito Control District LiDAR
+    priority: 110
+    counties: [Lee]
+    acquired_start: "2026-01-01"
+    acquired_end: "2026-05-31"
+    access: local_ept
+    endpoint: null
+    catalog_name_patterns: []
+    data_kind: classified_point_cloud
+    minimum_density_ppsm: 30.0
+    allowed_classes: [1, 2, 6]
+    roof_classes: [1, 6]
+    provider: Lee County Mosquito Control District
+    license: PENDING_AGENCY_CONFIRMATION
+    metadata_url: https://leecountymcdfl.gov/public-records-requests/
+    enabled: false
+
+  - id: noaa_post_ian_2022
+    dataset_name: 2022 NOAA NGS Post-Hurricane Ian Topobathy LiDAR
+    priority: 81
+    counties: [Sarasota, Charlotte, Lee, Collier]
+    acquired_start: "2022-11-16"
+    acquired_end: "2022-11-18"
+    access: ept
+    endpoint: https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/entwine/geoid18/9651/ept.json
+    catalog_name_patterns: []
+    data_kind: classified_point_cloud
+    minimum_density_ppsm: 8.0
+    allowed_classes: [1, 2, 6]
+    roof_classes: [1, 6]
+    provider: NOAA Digital Coast
+    license: NOAA-PUBLIC-DATASET
+    metadata_url: https://www.fisheries.noaa.gov/inport/item/71695
+    enabled: true
+
+  - id: noaa_pre_ian_2022
+    dataset_name: 2022 NOAA NGS Pre-Hurricane Ian Topobathy LiDAR
+    priority: 80
+    counties: [Sarasota, Charlotte, Lee, Collier]
+    acquired_start: "2022-02-04"
+    acquired_end: "2022-05-16"
+    access: ept
+    endpoint: https://noaa-nos-coastal-lidar-pds.s3.amazonaws.com/entwine/geoid18/10263/ept.json
+    catalog_name_patterns: []
+    data_kind: classified_point_cloud
+    minimum_density_ppsm: 8.0
+    allowed_classes: [1, 2, 6]
+    roof_classes: [1, 6]
+    provider: NOAA Digital Coast
+    license: NOAA-PUBLIC-DATASET
+    metadata_url: https://www.fisheries.noaa.gov/inport/item/74865
+    enabled: true
+
+  - id: usgs_florida_peninsular_2018_2020
+    dataset_name: USGS Florida Peninsular LiDAR 2018-2020
+    priority: 50
+    counties: [Sarasota, DeSoto, Charlotte, Lee, Collier, Glades, Hendry]
+    acquired_start: "2018-01-01"
+    acquired_end: "2020-12-31"
+    access: usgs_tnm
+    endpoint: null
+    catalog_name_patterns:
+      - "(?i)(fl[_ -]?peninsular|florida.*peninsular|southwest.*florida).*(2018|2019|2020)"
+      - "(?i)(2018|2019|2020).*(fl[_ -]?peninsular|florida.*peninsular|southwest.*florida)"
+    data_kind: classified_point_cloud
+    minimum_density_ppsm: 8.0
+    allowed_classes: [2, 6]
+    roof_classes: [6]
+    provider: USGS 3DEP
+    license: US-GOVERNMENT-PUBLIC-DOMAIN
+    metadata_url: https://www.fisheries.noaa.gov/inport/item/75872
+    enabled: true

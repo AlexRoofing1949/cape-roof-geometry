@@ -1,0 +1,4 @@
+{$GEOMETRY_DOMAIN} {
+  encode zstd gzip
+  reverse_proxy geometry:8080
+}

@@ -1,0 +1,26 @@
+schema_version: "1.0"
+sources:
+  # Sources must stay disabled until Cape Coral Roofing records a machine-readable
+  # orthophoto endpoint, exact capture dates, license/reuse terms and a calibrated
+  # structure-change evidence file. Map viewers are not scraped by this service.
+  - id: lee_official_imagery_pending
+    counties: [Lee]
+    capture_start: "2026-01-01"
+    capture_end: "2026-08-24"
+    gsd_meters: 0.08
+    license: PENDING_MACHINE_READABLE_ACCESS_AND_REUSE_REVIEW
+    commercial_estimate_use_allowed: false
+    enabled: false
+    evidence_file: null
+    attribution: Lee County official imagery (pending authorization)
+
+  - id: regional_official_imagery_pending
+    counties: [Manatee, Sarasota, DeSoto, Charlotte, Collier, Glades, Hendry]
+    capture_start: "2025-01-01"
+    capture_end: "2026-08-24"
+    gsd_meters: 0.15
+    license: PENDING_COUNTY_SPECIFIC_ENDPOINTS_AND_REUSE_REVIEW
+    commercial_estimate_use_allowed: false
+    enabled: false
+    evidence_file: null
+    attribution: County or NAIP imagery (pending source-specific authorization)
