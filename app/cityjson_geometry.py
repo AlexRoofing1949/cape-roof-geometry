@@ -338,7 +338,14 @@ def extract_roof_geometry(
                 EdgeUse(facet, start_id, end_id, facet.vertices[index], facet.vertices[(index + 1) % count])
             )
 
-    classified: dict[str, list[dict[str, Any]]] = {"rakes": [], "eaves": [], "valleys": [], "ridges": [], "hips": []}
+    classified: dict[str, list[dict[str, Any]]] = {
+        "rakes": [],
+        "eaves": [],
+        "valleys": [],
+        "ridges": [],
+        "hips": [],
+        "highPerimeters": [],
+    }
     ambiguous: list[dict[str, Any]] = []
     counters: dict[str, int] = defaultdict(int)
     edge_prefixes = {
@@ -347,6 +354,7 @@ def extract_roof_geometry(
         "valleys": "VA",
         "ridges": "RI",
         "hips": "HI",
+        "highPerimeters": "HP",
     }
 
     def add_edge(kind: str, uses: list[EdgeUse]) -> None:
@@ -373,6 +381,11 @@ def extract_roof_geometry(
             edge_height = (first.start[2] + first.end[2]) / 2
             if edge_height <= first.facet.centroid[2] + plane_side_tolerance_meters:
                 add_edge("eaves", uses)
+            elif first.facet.pitch_degrees <= flat_pitch_degrees:
+                # A horizontal high-side boundary on a low-slope plane is a
+                # measured perimeter/flashing edge, not an eave, rake, ridge,
+                # hip, or valley. Keep the category explicit for pricing.
+                add_edge("highPerimeters", uses)
             else:
                 ambiguous.append({"reason": "HIGH_HORIZONTAL_PERIMETER", "facetIds": [first.facet.facet_id]})
             continue
@@ -438,6 +451,7 @@ def extract_roof_geometry(
         "valleysFeet": totals["valleys"],
         "ridgesFeet": totals["ridges"],
         "hipsFeet": totals["hips"],
+        "highPerimeterFeet": totals["highPerimeters"],
         "flatRoofAreaSqFt": _round(flat_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "roofOpeningCount": sum(facet.opening_count for facet in facets),
         "roofOpeningPerimeterFeet": _round(
@@ -450,6 +464,7 @@ def extract_roof_geometry(
         "valleys": classified["valleys"],
         "ridges": classified["ridges"],
         "hips": classified["hips"],
+        "highPerimeters": classified["highPerimeters"],
         "quality": {
             "pointDensityPerSquareMeter": _round(float(attributes.get("rf_pt_density", 0)), 3),
             "nodataFraction": _round(float(attributes.get("rf_nodata_frac", 0)), 4),
