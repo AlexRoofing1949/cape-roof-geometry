@@ -157,18 +157,34 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
         if city_object.get("type") not in {"Building", "BuildingPart"}:
             continue
         for geometry in city_object.get("geometry") or []:
-            if str(geometry.get("lod")) != "2.2" or geometry.get("type") != "Solid":
+            if str(geometry.get("lod")) != "2.2":
                 continue
-            shells = geometry.get("boundaries") or []
+            geometry_type = str(geometry.get("type") or "")
+            boundaries = geometry.get("boundaries") or []
             semantics = geometry.get("semantics") or {}
             surfaces = semantics.get("surfaces") or []
-            semantic_shells = semantics.get("values") or []
-            if len(shells) != len(semantic_shells):
-                raise UnreliableGeometryError("CITYJSON_SEMANTICS_INVALID", "Roofer surface labels do not match the reconstructed shell.")
-            for shell, semantic_values in zip(shells, semantic_shells):
-                if len(shell) != len(semantic_values):
-                    raise UnreliableGeometryError("CITYJSON_SEMANTICS_INVALID", "Roofer surface labels do not match reconstructed faces.")
-                for rings, semantic_index in zip(shell, semantic_values):
+            semantic_values = semantics.get("values") or []
+            if geometry_type == "Solid":
+                if len(boundaries) != len(semantic_values):
+                    raise UnreliableGeometryError(
+                        "CITYJSON_SEMANTICS_INVALID",
+                        "Roofer surface labels do not match the reconstructed shell.",
+                    )
+                surface_groups = zip(boundaries, semantic_values)
+            elif geometry_type in {"MultiSurface", "CompositeSurface"}:
+                # Roofer's CityJSON Sequence writer emits LoD2.2 building
+                # geometry as a MultiSurface.  CityJSON stores its semantic
+                # indices one level shallower than a Solid.
+                surface_groups = [(boundaries, semantic_values)]
+            else:
+                continue
+            for surface_boundaries, surface_semantics in surface_groups:
+                if len(surface_boundaries) != len(surface_semantics):
+                    raise UnreliableGeometryError(
+                        "CITYJSON_SEMANTICS_INVALID",
+                        "Roofer surface labels do not match reconstructed faces.",
+                    )
+                for rings, semantic_index in zip(surface_boundaries, surface_semantics):
                     if semantic_index is None or semantic_index >= len(surfaces):
                         continue
                     semantic = surfaces[semantic_index]

@@ -36,6 +36,19 @@ class CityJsonGeometryTests(unittest.TestCase):
             extract_roof_geometry(feature, transform)
         self.assertEqual(context.exception.code, "LIDAR_DENSITY_TOO_LOW")
 
+    def test_roofer_multisurface_semantics_are_measured(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        geometry = feature["CityObjects"]["TEST-GABLE-0"]["geometry"][0]
+        geometry["type"] = "MultiSurface"
+        geometry["boundaries"] = geometry["boundaries"][0]
+        geometry["semantics"]["values"] = geometry["semantics"]["values"][0]
+
+        result = extract_roof_geometry(feature, transform)
+
+        self.assertEqual(len(result["facets"]), 2)
+        self.assertAlmostEqual(result["averagePitchDegrees"], 45, delta=0.01)
+        self.assertGreater(result["roofAreaSqFt"], 0)
+
     def test_missing_transform_is_allowed_for_unquantized_fixture(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         self.assertIsNone(transform)
