@@ -1,33 +1,22 @@
 schema_version: "1.0"
 sources:
-  - id: lee_county_2025_building_evidence
+  - id: lee_county_2026_building_evidence
     counties: [Lee]
-    capture_start: "2025-01-01"
-    capture_end: "2025-03-11"
+    capture_start: "2025-12-31"
+    capture_end: "2026-03-22"
     gsd_meters: 0.0762
     license: LEE_COUNTY_PUBLIC_INFORMATION_RESOURCE
     commercial_estimate_use_allowed: true
     enabled: true
     evidence_kind: arcgis_building_footprints
     evidence_endpoint: https://gismapserver.leegov.com/gisserver910/rest/services/DataExplorer/LandRecords/MapServer/8/query
-    imagery_endpoint: https://gisimageserver.leegov.com/imageserver/rest/services/Aerials/Aerials2025/ImageServer
+    imagery_endpoint: https://gisimageserver.leegov.com/imageserver/rest/services/Aerials/Aerials2026/ImageServer
     evidence_file: null
     attribution: Eagle View, Lee County Property Appraiser, Lee County GIS
 
   # Sources must stay disabled until Cape Coral Roofing records a machine-readable
   # orthophoto endpoint, exact capture dates, license/reuse terms and a calibrated
   # structure-change evidence file. Map viewers are not scraped by this service.
-  - id: lee_official_imagery_pending
-    counties: [Lee]
-    capture_start: "2026-01-01"
-    capture_end: "2026-08-24"
-    gsd_meters: 0.08
-    license: PENDING_MACHINE_READABLE_ACCESS_AND_REUSE_REVIEW
-    commercial_estimate_use_allowed: false
-    enabled: false
-    evidence_file: null
-    attribution: Lee County official imagery (pending authorization)
-
   - id: regional_official_imagery_pending
     counties: [Manatee, Sarasota, DeSoto, Charlotte, Collier, Glades, Hendry]
     capture_start: "2025-01-01"

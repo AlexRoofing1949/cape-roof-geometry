@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -17,8 +18,9 @@ from .config import Settings
 from .errors import TransientProviderError, UnreliableGeometryError
 from .imagery_validation import validate_current_structure
 from .models import GeometryRequest
+from .plane_validation import validate_roofer_planes
 from .providers import (
-    fetch_overture_footprint,
+    fetch_best_footprint,
     LidarResource,
     select_regional_lidar,
     write_footprint_inputs,
@@ -65,6 +67,29 @@ def _pdal_crop(
         if classification != 6
     ]
     metadata_path = workspace / "pdal-metadata.json"
+    class_one_preprocessing: list[dict[str, Any]] = []
+    if 1 in lidar.roof_classes:
+        class_one_preprocessing = [
+            {
+                "type": "filters.hag_delaunay",
+                "count": 8,
+                "allow_extrapolation": False,
+            },
+            {
+                "type": "filters.expression",
+                "expression": (
+                    "Classification == 6 || "
+                    f"(Classification == 1 && HeightAboveGround >= {settings.minimum_roof_hag_meters} "
+                    f"&& HeightAboveGround <= {settings.maximum_roof_hag_meters})"
+                ),
+            },
+            {
+                "type": "filters.cluster",
+                "tolerance": settings.roof_cluster_tolerance_meters,
+                "min_points": settings.minimum_roof_cluster_points,
+                "is3d": True,
+            },
+        ]
     pipeline = {
         "pipeline": [
             {
@@ -74,12 +99,33 @@ def _pdal_crop(
                 "requests": 8,
             },
             {
+                "type": "filters.reprojection",
+                "out_srs": f"EPSG:{target_epsg}",
+            },
+            {
                 "type": "filters.expression",
                 "expression": class_expression,
             },
             {
+                "type": "filters.outlier",
+                "method": "statistical",
+                "mean_k": 12,
+                "multiplier": 2.2,
+                "where": "Classification == 1 || Classification == 6",
+                "where_merge": True,
+            },
+            {
+                "type": "filters.expression",
+                "expression": "Classification != 7",
+            },
+            *class_one_preprocessing,
+            {
                 "type": "filters.stats",
-                "dimensions": "Classification,GpsTime",
+                "dimensions": (
+                    "Classification,GpsTime,HeightAboveGround,ClusterID"
+                    if class_one_preprocessing
+                    else "Classification,GpsTime"
+                ),
                 "count": "Classification",
             },
             *(
@@ -87,10 +133,6 @@ def _pdal_crop(
                 if roofer_class_assignments
                 else []
             ),
-            {
-                "type": "filters.reprojection",
-                "out_srs": f"EPSG:{target_epsg}",
-            },
             {
                 "type": "writers.las",
                 "filename": str(output_path),
@@ -131,6 +173,21 @@ def _pdal_crop(
         "allowedClasses": list(lidar.allowed_classes),
         "roofClasses": list(lidar.roof_classes),
         "rooferClassNormalization": roofer_class_assignments,
+        "noiseFilter": {
+            "provider": "PDAL filters.outlier",
+            "method": "statistical",
+            "meanK": 12,
+            "multiplier": 2.2,
+            "outlierClassRemoved": 7,
+        },
+        "classOneCorrection": {
+            "applied": bool(class_one_preprocessing),
+            "method": "PDAL filters.hag_delaunay + height filter + 3D clustering",
+            "minimumHeightAboveGroundMeters": settings.minimum_roof_hag_meters,
+            "maximumHeightAboveGroundMeters": settings.maximum_roof_hag_meters,
+            "clusterToleranceMeters": settings.roof_cluster_tolerance_meters,
+            "minimumClusterPoints": settings.minimum_roof_cluster_points,
+        },
         "tileAcquisitionDate": tile_acquisition_date,
         "pipeline": pipeline,
     }
@@ -369,7 +426,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
 
     with tempfile.TemporaryDirectory(prefix=f"{request.requestId}-", dir=settings.work_root) as directory:
         workspace = Path(directory)
-        footprint = fetch_overture_footprint(longitude, latitude, workspace, settings)
+        footprint = fetch_best_footprint(longitude, latitude, workspace, settings)
         registries = load_registries(settings.lidar_registry_path, settings.imagery_registry_path)
         county, lidar_candidates, selection_audit = select_regional_lidar(
             footprint, longitude, latitude, settings, registries
@@ -426,7 +483,13 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     minimum_density=settings.minimum_point_density,
                     maximum_nodata_fraction=settings.maximum_nodata_fraction,
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
+                    include_validation_facets=True,
                 )
+                validation_facets = geometry.pop("_validationFacets")
+                plane_validation = validate_roofer_planes(
+                    pointcloud, validation_facets, workspace, settings
+                )
+                geometry["independentPlaneValidation"] = plane_validation
                 reconciliation = _solar_reconciliation(geometry, request, settings)
                 _validate_selected_roof_type(geometry, request)
                 imagery_decision = validate_current_structure(
@@ -512,22 +575,25 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 "registryIds": [
                     "3DBAG/roofer",
                     "PDAL/PDAL",
-                    "OvertureMaps/overturemaps-py",
+                    "isl-org/Open3D",
+                    footprint.provider,
                     lidar_component,
                 ],
-                "inputDataLicense": f"{lidar_license_text} + OVERTURE-BUILDINGS-ODBL-1.0",
+                "inputDataLicense": f"{lidar_license_text} + {footprint.license}",
                 "inputImageryCommerciallyAuthorized": imagery_decision["currentImagery"].get("validation") == "PASSED",
             },
             "geometry": geometry,
             "dataSources": {
                 "footprint": {
-                    "provider": "Overture Maps Buildings",
+                    "provider": footprint.provider,
                     "id": footprint.overture_id,
                     "release": footprint.overture_release,
-                    "license": "ODbL-1.0",
-                    "attribution": "Overture Maps Foundation and source contributors",
+                    "license": footprint.license,
+                    "attribution": footprint.attribution,
                     "sourceRecords": footprint.source_records[:20],
                     "geocodeDistanceMeters": round(footprint.distance_meters, 2),
+                    "consensusStatus": footprint.consensus_status,
+                    "consensusRecords": list(footprint.consensus_records),
                 },
                 "pointCloud": {
                     "provider": lidar.provider,
@@ -562,6 +628,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "version": settings.pdal_version,
                     "license": "BSD-3-Clause",
                 },
+                "planeValidation": geometry["independentPlaneValidation"],
                 "footprintClient": {
                     "provider": "overturemaps-py",
                     "version": settings.overturemaps_version,
@@ -588,4 +655,9 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
 
 
 def runtime_dependencies() -> dict[str, bool]:
-    return {command: shutil.which(command) is not None for command in ("roofer", "pdal", "ogr2ogr", "overturemaps")}
+    dependencies = {
+        command: shutil.which(command) is not None
+        for command in ("roofer", "pdal", "ogr2ogr", "overturemaps")
+    }
+    dependencies["open3d"] = importlib.util.find_spec("open3d") is not None
+    return dependencies

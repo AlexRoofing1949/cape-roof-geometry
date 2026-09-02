@@ -4,14 +4,15 @@ This directory supplies the missing `POST /v1/roof-geometry` service already exp
 
 ## Production stack
 
-1. The official Overture Maps client downloads a small bounding box from a pinned open Buildings release and selects one unambiguous footprint near Google's server-validated rooftop coordinate.
+1. The footprint resolver first uses the official Overture Maps client against a pinned open Buildings release. If that source has no usable coverage, it falls back in order to the pinned Microsoft GlobalML Building Footprints release, an explicitly authorized Lee County building layer, and OpenStreetMap Overpass. A successful primary polygon is compared with the first available independent source; material disagreement fails closed.
 2. The service resolves the building against the official Census county layer and the eight-county Southwest Florida registry. It ranks registered Manatee 2025, NOAA pre-/post-Ian 2022, and Florida Peninsular 2018–2020 candidates by exact registered acquisition date and complete buffered-footprint coverage. Lee 2026 remains disabled until its files, footprint and reuse terms are verified.
 3. PDAL streams only the selected buffered property crop. Allowed surface, ground and building classes come from the selected source record, so NOAA class-1 surface returns are not discarded and bathymetric-only/noise classes are not accepted as roof evidence. The enumerated class histogram and exact pipeline are retained in the audit response.
 4. 3DBAG Roofer v1.0.0 reconstructs LoD2.2 roof planes from the classified point cloud and the selected footprint.
-5. `cityjson_geometry.py` reads Roofer's semantic `RoofSurface` faces and derives 3D facet area, pitch, azimuth, eaves, rakes, valleys, ridges, hips, and flat-roof area from their topology.
-6. The service reconciles area and pitch against the existing Google Solar measurement. Low density, stale data, high RMSE, ambiguous footprints, unclassified edges, material/geometry conflicts, or provider disagreement return `404`/`422` with `available:false`; no dimensions are guessed.
+5. Open3D independently fits every reconstructed facet to the normalized roof returns and rejects weak support, excessive residual error, or normal disagreement.
+6. `cityjson_geometry.py` reads Roofer's semantic `RoofSurface` faces and derives 3D facet area, pitch, azimuth, eaves, rakes, valleys, ridges, hips, and flat-roof area from their topology. Every facet's mesh area must reconcile with `horizontal_area / cos(pitch_angle)`.
+7. The service reconciles area and pitch against the existing Google Solar measurement. Low density, stale data, high RMSE, ambiguous footprints, unclassified edges, material/geometry conflicts, or provider disagreement return `404`/`422` with `available:false`; no dimensions are guessed.
 
-The current-imagery validator is implemented but intentionally fail-closed. It only accepts immutable per-building evidence from an enabled imagery registry entry whose machine-readable source, exact capture date, resolution, commercial reuse terms, coverage, quality and change metrics have been recorded. The bundled entries remain disabled because those source-specific authorizations and evidence files have not yet been supplied. Until then, successful LiDAR reconstruction returns `INSPECTION_REQUIRED` and `pricingAllowed: false`, preserving geometry for audit while blocking the calculator, PDF and price email.
+The current-imagery validator is implemented and intentionally fail-closed. It accepts only an enabled registry entry whose machine-readable source, exact capture date, resolution, commercial reuse terms, coverage, quality and change metrics have been recorded. Lee County's authorized 2026 building evidence is enabled; counties without authorized current evidence use the Google Solar building-model reconciliation when eligible or return `INSPECTION_REQUIRED`. Geometry remains available for audit while pricing, PDF generation and a price email stay blocked.
 
 Roofer documents about 10 points/m² as a good input density. This service defaults to a minimum of 8 points/m², no more than 10% missing roof coverage, no more than 0.35 m LoD2.2 RMSE, a maximum 10-year LiDAR age, and an overall confidence of at least 0.80. All thresholds are environment-controlled and should be calibrated against onsite measurements before automatic estimates are enabled.
 
@@ -19,10 +20,14 @@ Roofer documents about 10 points/m² as a good input density. This service defau
 
 - Service source and Roofer: GPL-3.0.
 - PDAL: BSD-3-Clause.
+- Open3D: MIT.
 - `overturemaps-py`: MIT.
 - USGS 3DEP data: U.S. Government public domain, free of charge and without use restrictions.
 - NOAA Digital Coast datasets: public access subject to the registered dataset metadata and attribution.
 - Overture Buildings: ODbL 1.0; retain the response's attribution and comply with Overture's source-attribution requirements.
+- Microsoft GlobalML Building Footprints: CDLA-Permissive-2.0.
+- OpenStreetMap Buildings: ODbL 1.0 with OpenStreetMap contributor attribution.
+- Lee County building footprints: public county GIS layer with Lee County Property Appraiser and Lee County GIS attribution.
 
 This service intentionally does not use RoofMapNet's non-commercial assets, the unlicensed `citygml-roof-segment-labels` repository, or the unlicensed `vinycqueiroz/roof-calculator` code.
 
@@ -73,8 +78,8 @@ approximate, and emits the required `Includes data from Google Maps`
 attribution. Any missing, stale, low-quality, or materially changed evidence
 returns `INSPECTION_REQUIRED` and cannot authorize pricing.
 
-Lee County uses the county's public 2025 aerial program (Eagle View imagery,
-January 1 through March 11, 2025, 3-inch resolution) together with the official
+Lee County uses the county's public 2026 aerial program (Eagle View imagery,
+December 31, 2025 through March 22, 2026, 3-inch resolution) together with the official
 machine-readable Building Footprints layer. The service queries only the
 building polygon around the requested property, compares it with the pinned
 Overture/LiDAR footprint, records the county feature ID and evidence update

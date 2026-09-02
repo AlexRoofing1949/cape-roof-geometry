@@ -26,6 +26,7 @@ class Facet:
     vertex_ids: tuple[int, ...]
     vertices: tuple[tuple[float, float, float], ...]
     area_square_meters: float
+    horizontal_area_square_meters: float
     pitch_degrees: float
     azimuth_degrees: float
     centroid: tuple[float, float, float]
@@ -81,6 +82,16 @@ def _centroid(points: Iterable[tuple[float, float, float]]) -> tuple[float, floa
 
 def _edge_length(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
     return _norm(_vector(a, b))
+
+
+def _horizontal_ring_area(points: Iterable[tuple[float, float, float]]) -> float:
+    values = list(points)
+    return abs(
+        sum(
+            current[0] * following[1] - following[0] * current[1]
+            for current, following in zip(values, values[1:] + values[:1])
+        )
+    ) / 2
 
 
 def _edge_height_at_xy(
@@ -238,7 +249,9 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
         ids, points = decoded_rings[0]
         area_vector = _newell(points)
         exterior_area = _norm(area_vector) / 2
+        exterior_horizontal_area = _horizontal_ring_area(points)
         opening_area = 0.0
+        opening_horizontal_area = 0.0
         opening_perimeter = 0.0
         for _, opening_points in decoded_rings[1:]:
             opening_vector = _newell(opening_points)
@@ -248,11 +261,13 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
                     "ROOF_OPENING_INVALID", "Roofer returned a degenerate roof opening."
                 )
             opening_area += opening_vector_length / 2
+            opening_horizontal_area += _horizontal_ring_area(opening_points)
             opening_perimeter += sum(
                 _edge_length(start, end)
                 for start, end in zip(opening_points, opening_points[1:] + opening_points[:1])
             )
         area = exterior_area - opening_area
+        horizontal_area = exterior_horizontal_area - opening_horizontal_area
         if area <= 0.25:
             raise UnreliableGeometryError("ROOF_FACET_TOO_SMALL", "Roofer returned a degenerate roof facet.")
         normal_length = _norm(area_vector)
@@ -262,6 +277,15 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
         if normal[2] <= 1e-5:
             raise UnreliableGeometryError("ROOF_FACET_VERTICAL", "A reconstructed roof facet is vertical and cannot be priced safely.")
         pitch = math.degrees(math.acos(max(-1.0, min(1.0, normal[2]))))
+        cosine = math.cos(math.radians(pitch))
+        slope_area_from_projection = horizontal_area / cosine
+        area_variance = abs(slope_area_from_projection - area) / area * 100
+        if area_variance > 0.5:
+            raise UnreliableGeometryError(
+                "ROOF_AREA_FORMULA_MISMATCH",
+                "The reconstructed 3D facet area does not reconcile with horizontal area divided by cosine of pitch.",
+                details={"facetId": f"F{index}", "areaVariancePercent": _round(area_variance, 3)},
+            )
         downslope_x = normal[0] / normal[2]
         downslope_y = normal[1] / normal[2]
         azimuth = math.degrees(math.atan2(downslope_x, downslope_y)) % 360
@@ -274,6 +298,7 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
                 vertex_ids=ids,
                 vertices=points,
                 area_square_meters=area,
+                horizontal_area_square_meters=horizontal_area,
                 pitch_degrees=pitch,
                 azimuth_degrees=azimuth,
                 centroid=_centroid(points),
@@ -341,6 +366,7 @@ def extract_roof_geometry(
     minimum_density: float = 8.0,
     maximum_nodata_fraction: float = 0.10,
     maximum_rmse_meters: float = 0.35,
+    include_validation_facets: bool = False,
 ) -> dict[str, Any]:
     """Return measured facets and classified roof lines from one Roofer model."""
 
@@ -449,6 +475,16 @@ def extract_roof_geometry(
         {
             "facetId": facet.facet_id,
             "areaSqFt": _round(facet.area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
+            "horizontalAreaSqFt": _round(
+                facet.horizontal_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET
+            ),
+            "slopeAreaFormulaSqFt": _round(
+                (
+                    facet.horizontal_area_square_meters
+                    / math.cos(math.radians(facet.pitch_degrees))
+                )
+                * SQUARE_METERS_TO_SQUARE_FEET
+            ),
             "pitchDegrees": _round(facet.pitch_degrees),
             "azimuthDegrees": _round(facet.azimuth_degrees),
             "classification": "FLAT" if facet.pitch_degrees <= flat_pitch_degrees else "SLOPED",
@@ -462,7 +498,7 @@ def extract_roof_geometry(
         kind: _round(sum(edge["lengthFeet"] for edge in entries))
         for kind, entries in classified.items()
     }
-    return {
+    result = {
         "roofAreaSqFt": _round(roof_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "averagePitchDegrees": _round(weighted_pitch),
         "maximumPitchDegrees": _round(maximum_pitch),
@@ -492,3 +528,13 @@ def extract_roof_geometry(
             "components": {key: _round(value, 3) for key, value in quality_components.items()},
         },
     }
+    if include_validation_facets:
+        result["_validationFacets"] = [
+            {
+                "facetId": facet.facet_id,
+                "verticesMeters": [list(vertex) for vertex in facet.vertices],
+                "normal": list(facet.normal),
+            }
+            for facet in facets
+        ]
+    return result

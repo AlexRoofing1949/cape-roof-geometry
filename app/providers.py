@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import csv
+import gzip
 import math
 import os
 import re
@@ -11,8 +13,9 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +42,11 @@ class FootprintResult:
     overture_release: str
     distance_meters: float
     source_records: list[dict[str, Any]]
+    provider: str = "Overture Maps Buildings"
+    license: str = "ODbL-1.0"
+    attribution: str = "Overture Maps Foundation and source contributors"
+    consensus_status: str = "SINGLE_SOURCE"
+    consensus_records: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,6 +115,91 @@ def _bbox(longitude: float, latitude: float, radius_meters: float) -> tuple[floa
     )
 
 
+def _select_footprint_feature(
+    features: list[dict[str, Any]],
+    longitude: float,
+    latitude: float,
+    settings: Settings,
+    *,
+    provider: str,
+    release: str,
+    license_name: str,
+    attribution: str,
+) -> FootprintResult:
+    """Select one valid, unambiguous building polygon from a provider response."""
+
+    epsg = utm_epsg(longitude, latitude)
+    point = Point(longitude, latitude)
+    point_projected = transform_geometry(point, "EPSG:4326", f"EPSG:{epsg}")
+    candidates: list[tuple[float, float, dict[str, Any], BaseGeometry]] = []
+    for feature in features:
+        try:
+            geometry = shape(feature.get("geometry"))
+        except Exception:
+            continue
+        if geometry.geom_type == "MultiPolygon":
+            containing = [part for part in geometry.geoms if part.covers(point)]
+            if len(containing) == 1:
+                geometry = containing[0]
+            elif len(geometry.geoms) == 1:
+                geometry = geometry.geoms[0]
+            else:
+                continue
+        if geometry.geom_type != "Polygon" or geometry.is_empty or not geometry.is_valid:
+            continue
+        projected = transform_geometry(geometry, "EPSG:4326", f"EPSG:{epsg}")
+        candidates.append(
+            (float(projected.distance(point_projected)), float(projected.area), feature, geometry)
+        )
+
+    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+    if not candidates or candidates[0][0] > settings.footprint_max_distance_meters:
+        raise NoCoverageError(
+            "BUILDING_FOOTPRINT_NOT_FOUND",
+            f"No {provider} building footprint matched the geocoded property point.",
+        )
+    if len(candidates) > 1:
+        first, second = candidates[0], candidates[1]
+        if (
+            second[0] <= settings.footprint_max_distance_meters
+            and abs(second[0] - first[0]) <= settings.footprint_ambiguity_meters
+        ):
+            raise UnreliableGeometryError(
+                "BUILDING_FOOTPRINT_AMBIGUOUS",
+                f"Multiple {provider} building footprints are too close to the geocoded property point.",
+            )
+
+    distance, _, feature, geometry = candidates[0]
+    properties = feature.get("properties") or {}
+    source_id = str(feature.get("id") or properties.get("id") or "").strip()
+    if not source_id:
+        digest = hashlib.sha256(
+            json.dumps(mapping(geometry), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:24]
+        source_id = f"geometry-{digest}"
+    records = properties.get("sources") if isinstance(properties.get("sources"), list) else []
+    return FootprintResult(
+        geometry,
+        source_id,
+        release,
+        distance,
+        records,
+        provider,
+        license_name,
+        attribution,
+    )
+
+
+def _footprint_iou(first: BaseGeometry, second: BaseGeometry) -> float:
+    longitude = float(first.centroid.x)
+    latitude = float(first.centroid.y)
+    epsg = utm_epsg(longitude, latitude)
+    projected_first = transform_geometry(first, "EPSG:4326", f"EPSG:{epsg}")
+    projected_second = transform_geometry(second, "EPSG:4326", f"EPSG:{epsg}")
+    union_area = projected_first.union(projected_second).area
+    return 0.0 if union_area <= 0 else float(projected_first.intersection(projected_second).area / union_area)
+
+
 def _current_overture_release(settings: Settings) -> str:
     request = urllib.request.Request(
         _OVERTURE_STAC_CATALOG_URL, headers={"User-Agent": "CapeRoofGeometry/1.0"}
@@ -168,46 +261,345 @@ def fetch_overture_footprint(
     except (OSError, json.JSONDecodeError) as error:
         raise TransientProviderError("OVERTURE_RESPONSE_INVALID", "Overture returned an invalid building response.") from error
 
-    epsg = utm_epsg(longitude, latitude)
-    point_projected = transform_geometry(Point(longitude, latitude), "EPSG:4326", f"EPSG:{epsg}")
-    candidates: list[tuple[float, float, dict[str, Any], BaseGeometry]] = []
-    for feature in payload.get("features", []):
+    result = _select_footprint_feature(
+        list(payload.get("features") or []),
+        longitude,
+        latitude,
+        settings,
+        provider="Overture Maps Buildings",
+        release=str(release),
+        license_name="ODbL-1.0",
+        attribution="Overture Maps Foundation and source contributors",
+    )
+    if result.overture_id.startswith("geometry-"):
+        raise UnreliableGeometryError(
+            "BUILDING_FOOTPRINT_ID_MISSING", "The selected Overture footprint has no stable identifier."
+        )
+    return result
+
+
+def _bing_quadkey(longitude: float, latitude: float, zoom: int) -> str:
+    latitude = max(-85.05112878, min(85.05112878, latitude))
+    x = (longitude + 180.0) / 360.0
+    sin_latitude = math.sin(math.radians(latitude))
+    y = 0.5 - math.log((1 + sin_latitude) / (1 - sin_latitude)) / (4 * math.pi)
+    map_size = 1 << zoom
+    tile_x = min(map_size - 1, max(0, int(x * map_size)))
+    tile_y = min(map_size - 1, max(0, int(y * map_size)))
+    digits: list[str] = []
+    for level in range(zoom, 0, -1):
+        mask = 1 << (level - 1)
+        digit = (1 if tile_x & mask else 0) + (2 if tile_y & mask else 0)
+        digits.append(str(digit))
+    return "".join(digits)
+
+
+def _microsoft_catalog_row(longitude: float, latitude: float, settings: Settings) -> dict[str, str]:
+    catalog = settings.work_root / f"microsoft-bfp-{settings.microsoft_bfp_release}-catalog.csv"
+    if not catalog.exists() or time.time() - catalog.stat().st_mtime > settings.catalog_cache_seconds:
+        temporary = catalog.with_suffix(".download")
+        temporary.unlink(missing_ok=True)
         try:
-            geometry = shape(feature.get("geometry"))
-        except Exception:
-            continue
-        if geometry.geom_type == "MultiPolygon":
-            containing = [part for part in geometry.geoms if part.covers(Point(longitude, latitude))]
-            if len(containing) == 1:
-                geometry = containing[0]
-            elif len(geometry.geoms) == 1:
-                geometry = geometry.geoms[0]
-            else:
-                continue
-        if geometry.geom_type != "Polygon" or geometry.is_empty or not geometry.is_valid:
-            continue
-        projected = transform_geometry(geometry, "EPSG:4326", f"EPSG:{epsg}")
-        distance = float(projected.distance(point_projected))
-        candidates.append((distance, float(projected.area), feature, geometry))
-
-    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
-    if not candidates or candidates[0][0] > settings.footprint_max_distance_meters:
-        raise NoCoverageError("BUILDING_FOOTPRINT_NOT_FOUND", "No open building footprint matched the geocoded property point.")
-    if len(candidates) > 1:
-        first, second = candidates[0], candidates[1]
-        if second[0] <= settings.footprint_max_distance_meters and abs(second[0] - first[0]) <= settings.footprint_ambiguity_meters:
-            raise UnreliableGeometryError(
-                "BUILDING_FOOTPRINT_AMBIGUOUS",
-                "Multiple open building footprints are too close to the geocoded property point.",
+            _download_file(
+                settings.microsoft_bfp_catalog_url,
+                temporary,
+                timeout=settings.catalog_download_timeout_seconds,
+                maximum_bytes=min(settings.catalog_maximum_bytes, 25_000_000),
             )
+            os.replace(temporary, catalog)
+        finally:
+            temporary.unlink(missing_ok=True)
+    quadkey = _bing_quadkey(longitude, latitude, settings.microsoft_bfp_zoom)
+    try:
+        with catalog.open("r", encoding="utf-8-sig", newline="") as handle:
+            for raw_row in csv.DictReader(handle):
+                row = {str(key).strip().lower(): str(value or "").strip() for key, value in raw_row.items()}
+                if row.get("location", "").lower() in {"unitedstates", "united states"} and row.get(
+                    "quadkey"
+                ) == quadkey:
+                    return row
+    except (OSError, csv.Error) as error:
+        catalog.unlink(missing_ok=True)
+        raise TransientProviderError(
+            "MICROSOFT_FOOTPRINT_CATALOG_INVALID",
+            "The Microsoft building-footprint catalog is unavailable or invalid.",
+        ) from error
+    raise NoCoverageError(
+        "MICROSOFT_FOOTPRINT_TILE_NOT_FOUND",
+        "Microsoft does not publish a building-footprint tile for this location.",
+    )
 
-    distance, _, feature, geometry = candidates[0]
-    properties = feature.get("properties") or {}
-    overture_id = str(feature.get("id") or properties.get("id") or "").strip()
-    if not overture_id:
-        raise UnreliableGeometryError("BUILDING_FOOTPRINT_ID_MISSING", "The selected Overture footprint has no stable identifier.")
-    source_records = properties.get("sources") if isinstance(properties.get("sources"), list) else []
-    return FootprintResult(geometry, overture_id, str(release), distance, source_records)
+
+def fetch_microsoft_footprint(
+    longitude: float, latitude: float, workspace: Path, settings: Settings
+) -> FootprintResult:
+    """Select a building from Microsoft's pinned GlobalML footprint release."""
+
+    if not settings.microsoft_bfp_enabled:
+        raise NoCoverageError(
+            "MICROSOFT_FOOTPRINT_DISABLED", "The Microsoft building-footprint fallback is disabled."
+        )
+    row = _microsoft_catalog_row(longitude, latitude, settings)
+    url = row.get("url") or row.get("downloadurl") or row.get("download_url") or ""
+    if not url.startswith("https://"):
+        raise TransientProviderError(
+            "MICROSOFT_FOOTPRINT_CATALOG_INVALID",
+            "The Microsoft building-footprint catalog contains an invalid tile URL.",
+        )
+    quadkey = row.get("quadkey") or _bing_quadkey(longitude, latitude, settings.microsoft_bfp_zoom)
+    tile = settings.work_root / f"microsoft-bfp-{settings.microsoft_bfp_release}-{quadkey}.csv.gz"
+    if not tile.exists():
+        temporary = tile.with_suffix(".download")
+        temporary.unlink(missing_ok=True)
+        try:
+            _download_file(
+                url,
+                temporary,
+                timeout=settings.catalog_download_timeout_seconds,
+                maximum_bytes=settings.microsoft_bfp_maximum_tile_bytes,
+            )
+            os.replace(temporary, tile)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    west, south, east, north = _bbox(longitude, latitude, settings.footprint_search_radius_meters)
+    search = box(west, south, east, north)
+    features: list[dict[str, Any]] = []
+    try:
+        with gzip.open(tile, "rt", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                batch = raw.get("features") if raw.get("type") == "FeatureCollection" else [raw]
+                for feature in batch or []:
+                    if not isinstance(feature, dict) or not feature.get("geometry"):
+                        continue
+                    try:
+                        geometry = shape(feature["geometry"])
+                    except Exception:
+                        continue
+                    if not geometry.is_empty and geometry.intersects(search):
+                        candidate = dict(feature)
+                        candidate.setdefault("id", f"{quadkey}:{line_number}")
+                        features.append(candidate)
+    except (OSError, EOFError, json.JSONDecodeError) as error:
+        tile.unlink(missing_ok=True)
+        raise TransientProviderError(
+            "MICROSOFT_FOOTPRINT_TILE_INVALID",
+            "The Microsoft building-footprint tile is unavailable or invalid.",
+        ) from error
+    return _select_footprint_feature(
+        features,
+        longitude,
+        latitude,
+        settings,
+        provider="Microsoft GlobalML Building Footprints",
+        release=settings.microsoft_bfp_release,
+        license_name="CDLA-Permissive-2.0",
+        attribution="Microsoft GlobalML Building Footprints",
+    )
+
+
+def fetch_county_footprint(
+    longitude: float, latitude: float, workspace: Path, settings: Settings
+) -> FootprintResult:
+    """Reuse an explicitly authorized county building layer when it covers the point."""
+
+    del workspace
+    county = resolve_service_county_point(longitude, latitude, settings)
+    source = {
+        "Lee": {
+            "url": settings.lee_county_footprint_url,
+            "release": "2026-03-22",
+            "license": "LEE-COUNTY-PUBLIC-GIS",
+            "attribution": "Lee County Property Appraiser and Lee County GIS",
+        }
+    }.get(county)
+    if source is None:
+        raise NoCoverageError(
+            "COUNTY_FOOTPRINT_UNAVAILABLE",
+            "No explicitly authorized county building-footprint layer covers this property.",
+        )
+    west, south, east, north = _bbox(longitude, latitude, settings.footprint_search_radius_meters)
+    parameters = urllib.parse.urlencode(
+        {
+            "geometry": f"{west},{south},{east},{north}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "*",
+            "returnGeometry": "true",
+            "outSR": "4326",
+            "f": "geojson",
+        }
+    )
+    request = urllib.request.Request(
+        f"{source['url']}?{parameters}", headers={"User-Agent": "CapeRoofGeometry/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=settings.provider_timeout_seconds) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        raise TransientProviderError(
+            "COUNTY_FOOTPRINT_UNAVAILABLE", "The county building-footprint service is unavailable."
+        ) from error
+    return _select_footprint_feature(
+        list(payload.get("features") or []),
+        longitude,
+        latitude,
+        settings,
+        provider=f"{county} County Building Footprints",
+        release=str(source["release"]),
+        license_name=str(source["license"]),
+        attribution=str(source["attribution"]),
+    )
+
+
+def fetch_osm_footprint(
+    longitude: float, latitude: float, workspace: Path, settings: Settings
+) -> FootprintResult:
+    """Query a small Overpass window as the final open footprint fallback."""
+
+    del workspace
+    if not settings.osm_footprint_enabled:
+        raise NoCoverageError("OSM_FOOTPRINT_DISABLED", "The OpenStreetMap footprint fallback is disabled.")
+    west, south, east, north = _bbox(longitude, latitude, settings.footprint_search_radius_meters)
+    query = (
+        f"[out:json][timeout:{max(10, settings.provider_timeout_seconds - 5)}];"
+        f"way[\"building\"]({south},{west},{north},{east});out geom meta;"
+    )
+    request = urllib.request.Request(
+        settings.osm_overpass_url,
+        data=urllib.parse.urlencode({"data": query}).encode("utf-8"),
+        headers={
+            "User-Agent": "CapeRoofGeometry/1.0 (https://github.com/AlexRoofing1949/cape-roof-geometry)",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=settings.provider_timeout_seconds) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        raise TransientProviderError(
+            "OSM_OVERPASS_UNAVAILABLE", "The OpenStreetMap footprint service is unavailable."
+        ) from error
+    features: list[dict[str, Any]] = []
+    for element in payload.get("elements") or []:
+        vertices = element.get("geometry") if isinstance(element, dict) else None
+        if not isinstance(vertices, list) or len(vertices) < 4:
+            continue
+        coordinates = [
+            [float(vertex["lon"]), float(vertex["lat"])]
+            for vertex in vertices
+            if isinstance(vertex, dict) and "lon" in vertex and "lat" in vertex
+        ]
+        if len(coordinates) < 4:
+            continue
+        if coordinates[0] != coordinates[-1]:
+            coordinates.append(coordinates[0])
+        features.append(
+            {
+                "type": "Feature",
+                "id": f"way/{element.get('id')}",
+                "properties": {
+                    "version": element.get("version"),
+                    "timestamp": element.get("timestamp"),
+                    "sources": [{"dataset": "OpenStreetMap", "recordId": f"way/{element.get('id')}"}],
+                },
+                "geometry": {"type": "Polygon", "coordinates": [coordinates]},
+            }
+        )
+    return _select_footprint_feature(
+        features,
+        longitude,
+        latitude,
+        settings,
+        provider="OpenStreetMap Buildings",
+        release="live-overpass",
+        license_name="ODbL-1.0",
+        attribution="OpenStreetMap contributors",
+    )
+
+
+def fetch_best_footprint(
+    longitude: float, latitude: float, workspace: Path, settings: Settings
+) -> FootprintResult:
+    """Run the authorized footprint cascade and fail closed on material disagreement."""
+
+    providers = (
+        fetch_overture_footprint,
+        fetch_microsoft_footprint,
+        fetch_county_footprint,
+        fetch_osm_footprint,
+    )
+    primary: FootprintResult | None = None
+    selected_index = -1
+    audit: list[dict[str, Any]] = []
+    for index, provider in enumerate(providers):
+        provider_name = getattr(provider, "__name__", provider.__class__.__name__)
+        try:
+            primary = provider(longitude, latitude, workspace, settings)
+            selected_index = index
+            audit.append({"provider": primary.provider, "decision": "SELECTED"})
+            break
+        except UnreliableGeometryError:
+            raise
+        except (NoCoverageError, TransientProviderError) as error:
+            audit.append(
+                {
+                    "provider": provider_name,
+                    "decision": "UNAVAILABLE",
+                    "errorCode": error.code,
+                }
+            )
+    if primary is None:
+        raise UnreliableGeometryError(
+            "BUILDING_FOOTPRINT_NOT_FOUND",
+            "No authorized open building-footprint provider produced a reliable property polygon.",
+            details={"providerAttempts": audit},
+        )
+
+    # Corroborate with the first available independent source. Microsoft is not
+    # downloaded merely to check a successful Overture result; its large tile is
+    # reserved for an actual fallback path.
+    corroborators = list(providers[selected_index + 1 :])
+    if selected_index == 0:
+        corroborators = [fetch_county_footprint, fetch_osm_footprint]
+    for provider in corroborators:
+        provider_name = getattr(provider, "__name__", provider.__class__.__name__)
+        try:
+            secondary = provider(longitude, latitude, workspace, settings)
+        except (NoCoverageError, TransientProviderError, UnreliableGeometryError) as error:
+            audit.append(
+                {
+                    "provider": provider_name,
+                    "decision": "CORROBORATION_UNAVAILABLE",
+                    "errorCode": error.code,
+                }
+            )
+            continue
+        iou = _footprint_iou(primary.geometry_wgs84, secondary.geometry_wgs84)
+        record = {
+            "provider": secondary.provider,
+            "id": secondary.overture_id,
+            "release": secondary.overture_release,
+            "intersectionOverUnion": round(iou, 4),
+        }
+        audit.append({**record, "decision": "CORROBORATED" if iou >= settings.footprint_consensus_min_iou else "CONFLICT"})
+        if iou < settings.footprint_consensus_min_iou:
+            raise UnreliableGeometryError(
+                "FOOTPRINT_PROVIDER_CONFLICT",
+                "Independent building-footprint providers materially disagree for this property.",
+                details={
+                    "primaryProvider": primary.provider,
+                    "secondaryProvider": secondary.provider,
+                    "intersectionOverUnion": round(iou, 4),
+                    "minimumIntersectionOverUnion": settings.footprint_consensus_min_iou,
+                },
+            )
+        return replace(primary, consensus_status="CORROBORATED", consensus_records=tuple(audit))
+    return replace(primary, consensus_records=tuple(audit))
 
 
 def write_footprint_inputs(
@@ -234,7 +626,11 @@ def write_footprint_inputs(
                     {
                         "type": "Feature",
                         "id": request_id,
-                        "properties": {"request_id": request_id, "overture_id": footprint.overture_id},
+                        "properties": {
+                            "request_id": request_id,
+                            "source_id": footprint.overture_id,
+                            "source_provider": footprint.provider,
+                        },
                         "geometry": mapping(footprint.geometry_wgs84),
                     }
                 ],
@@ -387,6 +783,30 @@ def resolve_service_county(footprint_wgs84: BaseGeometry, settings: Settings) ->
     if not matches or matches[0][0] < 0.98:
         raise NoCoverageError("OUTSIDE_SERVICE_AREA", "The selected building is outside the eight-county service area.")
     return matches[0][1]
+
+
+def resolve_service_county_point(longitude: float, latitude: float, settings: Settings) -> str:
+    """Resolve the service county before a building footprint is available."""
+
+    payload = _cached_json_url(settings.county_boundaries_url, "florida-counties", settings)
+    point = Point(longitude, latitude)
+    matches: list[str] = []
+    for feature in payload.get("features") or []:
+        try:
+            geometry = shape(feature.get("geometry"))
+        except Exception:
+            continue
+        properties = feature.get("properties") or {}
+        raw_name = str(properties.get("NAME") or properties.get("name") or "").strip()
+        name = re.sub(r"\s+County$", "", raw_name, flags=re.IGNORECASE).strip()
+        name = "DeSoto" if name.replace(" ", "").lower() == "desoto" else name
+        if name in SERVICE_COUNTIES and geometry.covers(point):
+            matches.append(name)
+    if len(matches) != 1:
+        raise NoCoverageError(
+            "OUTSIDE_SERVICE_AREA", "The geocoded property point is outside the eight-county service area."
+        )
+    return matches[0]
 
 
 def _ept_coverage(endpoint: str, settings: Settings) -> tuple[BaseGeometry, int]:

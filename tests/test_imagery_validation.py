@@ -116,7 +116,7 @@ class SolarBuildingModelValidationTests(unittest.TestCase):
         }
         urlopen.return_value = io.BytesIO(json.dumps(payload).encode("utf-8"))
         source = SimpleNamespace(
-            id="lee_county_2025_building_evidence",
+            id="lee_county_2026_building_evidence",
             evidence_endpoint="https://example.invalid/query",
             imagery_endpoint="https://example.invalid/imagery",
             capture_start=self.lidar_date,

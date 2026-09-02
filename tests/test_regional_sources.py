@@ -6,15 +6,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app.errors import ConfigurationError
 from app.source_registry import load_registries
 
 try:
     from shapely.geometry import Polygon, mapping
 
     from app.pipeline import _classification_histogram, _exact_gps_acquisition_date, _pdal_crop
-    from app.errors import UnreliableGeometryError
+    from app.errors import NoCoverageError, UnreliableGeometryError
     from app.providers import (
         FootprintResult,
+        _bing_quadkey,
+        fetch_best_footprint,
         fetch_overture_footprint,
         resolve_service_county,
         select_regional_lidar,
@@ -58,6 +61,97 @@ class RegionalSourceTests(unittest.TestCase):
         self.assertIn(1, by_id["usgs_florida_peninsular_2018_2020"].allowed_classes)
         self.assertIn(1, by_id["usgs_florida_peninsular_2018_2020"].roof_classes)
         self.assertEqual(by_id["usgs_manatee_b25_2025"].acquired_end.isoformat(), "2025-04-02")
+
+    def test_registry_rejects_non_lee_eagle_view_source(self):
+        imagery = """\
+schema_version: "1.0"
+sources:
+  - id: manatee_eagle_view
+    counties: [Manatee]
+    capture_start: "2026-01-01"
+    capture_end: "2026-02-01"
+    gsd_meters: 0.0762
+    license: PUBLIC
+    commercial_estimate_use_allowed: true
+    enabled: true
+    evidence_endpoint: https://example.invalid/footprint
+    imagery_endpoint: https://example.invalid/eagleview
+    attribution: EagleView
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            imagery_path = Path(directory) / "imagery_sources.yaml"
+            imagery_path.write_text(imagery, encoding="utf-8")
+            with self.assertRaises(ConfigurationError) as raised:
+                load_registries(ROOT / "config" / "lidar_sources.yaml", imagery_path)
+        self.assertEqual(raised.exception.code, "REGISTRY_PROVIDER_NOT_ALLOWED")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    def test_microsoft_quadkey_is_stable_for_cape_coral(self):
+        self.assertEqual(_bing_quadkey(-81.9495, 26.5629, 9), "032023011")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers.fetch_osm_footprint")
+    @patch("app.providers.fetch_county_footprint")
+    @patch("app.providers.fetch_microsoft_footprint")
+    @patch("app.providers.fetch_overture_footprint")
+    def test_footprint_cascade_uses_microsoft_and_county_consensus(
+        self, overture, microsoft, county, osm
+    ):
+        geometry = footprint().geometry_wgs84
+        overture.side_effect = NoCoverageError("BUILDING_FOOTPRINT_NOT_FOUND", "missing")
+        microsoft.return_value = FootprintResult(
+            geometry,
+            "ms-1",
+            "2026-07-24",
+            0.0,
+            [],
+            "Microsoft GlobalML Building Footprints",
+            "CDLA-Permissive-2.0",
+            "Microsoft GlobalML Building Footprints",
+        )
+        county.return_value = FootprintResult(
+            geometry.buffer(0.000001),
+            "lee-1",
+            "2026-03-22",
+            0.0,
+            [],
+            "Lee County Building Footprints",
+            "LEE-COUNTY-PUBLIC-GIS",
+            "Lee County Property Appraiser and Lee County GIS",
+        )
+        configured = SimpleNamespace(footprint_consensus_min_iou=0.70)
+        with tempfile.TemporaryDirectory() as directory:
+            result = fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
+        self.assertEqual(result.provider, "Microsoft GlobalML Building Footprints")
+        self.assertEqual(result.consensus_status, "CORROBORATED")
+        self.assertGreaterEqual(result.consensus_records[-1]["intersectionOverUnion"], 0.70)
+        osm.assert_not_called()
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers.fetch_county_footprint")
+    @patch("app.providers.fetch_overture_footprint")
+    def test_footprint_consensus_conflict_fails_closed(self, overture, county):
+        first = footprint().geometry_wgs84
+        second = Polygon(
+            [(-81.9501, 26.6210), (-81.9499, 26.6210), (-81.9499, 26.6212), (-81.9501, 26.6212)]
+        )
+        overture.return_value = FootprintResult(first, "overture-1", "2026-08-19.0", 0, [])
+        county.return_value = FootprintResult(
+            second,
+            "lee-2",
+            "2026-03-22",
+            0,
+            [],
+            "Lee County Building Footprints",
+            "LEE-COUNTY-PUBLIC-GIS",
+            "Lee County Property Appraiser and Lee County GIS",
+        )
+        configured = SimpleNamespace(footprint_consensus_min_iou=0.70)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(
+            UnreliableGeometryError
+        ) as raised:
+            fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
+        self.assertEqual(raised.exception.code, "FOOTPRINT_PROVIDER_CONFLICT")
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers._require_pinned_overture_release", side_effect=["2026-08-19.0", "2026-08-19.0"])
@@ -340,18 +434,29 @@ class RegionalSourceTests(unittest.TestCase):
                 32617,
                 output,
                 workspace,
-                SimpleNamespace(command_timeout_seconds=30),
+                SimpleNamespace(
+                    command_timeout_seconds=30,
+                    minimum_roof_hag_meters=1.5,
+                    maximum_roof_hag_meters=25,
+                    roof_cluster_tolerance_meters=1.5,
+                    minimum_roof_cluster_points=20,
+                ),
             )
 
             stages = audit["pipeline"]["pipeline"]
             stage_types = [stage["type"] for stage in stages]
             self.assertLess(stage_types.index("filters.stats"), stage_types.index("filters.assign"))
-            self.assertLess(stage_types.index("filters.assign"), stage_types.index("filters.reprojection"))
+            self.assertLess(stage_types.index("filters.outlier"), stage_types.index("filters.stats"))
+            self.assertLess(stage_types.index("filters.reprojection"), stage_types.index("filters.hag_delaunay"))
+            self.assertLess(stage_types.index("filters.hag_delaunay"), stage_types.index("filters.cluster"))
+            self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.assign"))
             self.assertEqual(
                 audit["rooferClassNormalization"],
                 ["Classification = 6 WHERE Classification == 1"],
             )
             self.assertEqual(audit["classHistogram"], {"1": 120, "2": 80})
+            self.assertEqual(audit["noiseFilter"]["outlierClassRemoved"], 7)
+            self.assertTrue(audit["classOneCorrection"]["applied"])
             run.assert_called_once()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")

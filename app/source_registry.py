@@ -20,6 +20,10 @@ SERVICE_COUNTIES = frozenset(
 )
 PENDING_LICENSE_MARKERS = frozenset({"", "PENDING", "PENDING_AGENCY_CONFIRMATION", "UNKNOWN"})
 ALLOWED_ACCESS_TYPES = frozenset({"ept", "usgs_tnm", "local_ept"})
+LEE_PUBLIC_EAGLE_VIEW_SOURCE_ID = "lee_county_2026_building_evidence"
+LEE_PUBLIC_EAGLE_VIEW_IMAGERY_ENDPOINT = (
+    "https://gisimageserver.leegov.com/imageserver/rest/services/Aerials/Aerials2026/ImageServer"
+)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -208,11 +212,21 @@ def load_registries(lidar_path: Path, imagery_path: Path) -> RegistryBundle:
         evidence_file = (imagery_path.parent / evidence_text).resolve() if evidence_text else None
         evidence_endpoint = str(raw.get("evidence_endpoint") or "").strip()
         imagery_endpoint = str(raw.get("imagery_endpoint") or "").strip()
+        attribution = str(raw.get("attribution") or "").strip()
         if (evidence_endpoint and not evidence_endpoint.startswith("https://")) or (
             imagery_endpoint and not imagery_endpoint.startswith("https://")
         ):
             raise ConfigurationError(
                 "REGISTRY_ENDPOINT_INVALID", f"{source_id} imagery evidence endpoints must use HTTPS."
+            )
+        if "eagleview" in re.sub(r"[^a-z]", "", attribution.lower()) and (
+            source_id != LEE_PUBLIC_EAGLE_VIEW_SOURCE_ID
+            or counties != ("Lee",)
+            or imagery_endpoint != LEE_PUBLIC_EAGLE_VIEW_IMAGERY_ENDPOINT
+        ):
+            raise ConfigurationError(
+                "REGISTRY_PROVIDER_NOT_ALLOWED",
+                "Eagle View sources are restricted to the approved free Lee County public layer.",
             )
         imagery_sources.append(
             ImagerySource(
@@ -228,7 +242,7 @@ def load_registries(lidar_path: Path, imagery_path: Path) -> RegistryBundle:
                 evidence_kind=str(raw.get("evidence_kind") or "immutable_file").strip(),
                 evidence_endpoint=evidence_endpoint,
                 imagery_endpoint=imagery_endpoint,
-                attribution=str(raw.get("attribution") or "").strip(),
+                attribution=attribution,
             )
         )
 

@@ -33,7 +33,16 @@ class Settings:
     roofer_version: str
     pdal_version: str
     overturemaps_version: str
+    open3d_version: str
     overture_release: str
+    microsoft_bfp_enabled: bool
+    microsoft_bfp_release: str
+    microsoft_bfp_catalog_url: str
+    microsoft_bfp_zoom: int
+    microsoft_bfp_maximum_tile_bytes: int
+    osm_footprint_enabled: bool
+    osm_overpass_url: str
+    lee_county_footprint_url: str
     usgs_catalog_url: str
     county_boundaries_url: str
     lidar_registry_path: Path
@@ -46,6 +55,11 @@ class Settings:
     footprint_search_radius_meters: float
     footprint_max_distance_meters: float
     footprint_ambiguity_meters: float
+    footprint_consensus_min_iou: float
+    minimum_roof_hag_meters: float
+    maximum_roof_hag_meters: float
+    roof_cluster_tolerance_meters: float
+    minimum_roof_cluster_points: int
     lidar_buffer_meters: float
     maximum_lidar_age_years: int
     minimum_point_density: float
@@ -65,6 +79,12 @@ class Settings:
     current_lidar_max_age_years: int
     maximum_current_imagery_age_years: int
     allow_historical_verified_pricing: bool
+    open3d_minimum_facet_points: int
+    open3d_minimum_inlier_ratio: float
+    open3d_distance_threshold_meters: float
+    open3d_maximum_normal_variance_degrees: float
+    open3d_maximum_plane_rmse_meters: float
+    open3d_ransac_iterations: int
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -78,7 +98,28 @@ class Settings:
             roofer_version=os.getenv("ROOFER_VERSION", "1.0.0").strip(),
             pdal_version=os.getenv("PDAL_VERSION", "2.9.2").strip(),
             overturemaps_version=os.getenv("OVERTUREMAPS_VERSION", "1.0.1").strip(),
+            open3d_version=os.getenv("OPEN3D_VERSION", "0.19.0").strip(),
             overture_release=os.getenv("OVERTURE_RELEASE", "2026-08-19.0").strip(),
+            microsoft_bfp_enabled=os.getenv("MICROSOFT_BFP_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes"},
+            microsoft_bfp_release=os.getenv("MICROSOFT_BFP_RELEASE", "2026-07-24").strip(),
+            microsoft_bfp_catalog_url=os.getenv(
+                "MICROSOFT_BFP_CATALOG_URL",
+                "https://bfppub.blob.core.windows.net/$web/2026-07-24/dataset-links.csv",
+            ).strip(),
+            microsoft_bfp_zoom=_int("MICROSOFT_BFP_ZOOM", 9),
+            microsoft_bfp_maximum_tile_bytes=_int(
+                "MICROSOFT_BFP_MAXIMUM_TILE_BYTES", 100_000_000
+            ),
+            osm_footprint_enabled=os.getenv("OSM_FOOTPRINT_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes"},
+            osm_overpass_url=os.getenv(
+                "OSM_OVERPASS_URL", "https://overpass-api.de/api/interpreter"
+            ).strip(),
+            lee_county_footprint_url=os.getenv(
+                "LEE_COUNTY_FOOTPRINT_URL",
+                "https://gismapserver.leegov.com/gisserver910/rest/services/DataExplorer/LandRecords/MapServer/8/query",
+            ).strip(),
             usgs_catalog_url=os.getenv(
                 "USGS_3DEP_CATALOG_URL", "https://usgs.entwine.io/boundaries/resources.geojson"
             ).strip(),
@@ -100,6 +141,11 @@ class Settings:
             footprint_search_radius_meters=_float("FOOTPRINT_SEARCH_RADIUS_METERS", 45),
             footprint_max_distance_meters=_float("FOOTPRINT_MAX_DISTANCE_METERS", 20),
             footprint_ambiguity_meters=_float("FOOTPRINT_AMBIGUITY_METERS", 2),
+            footprint_consensus_min_iou=_float("FOOTPRINT_CONSENSUS_MIN_IOU", 0.70),
+            minimum_roof_hag_meters=_float("MINIMUM_ROOF_HAG_METERS", 1.5),
+            maximum_roof_hag_meters=_float("MAXIMUM_ROOF_HAG_METERS", 25.0),
+            roof_cluster_tolerance_meters=_float("ROOF_CLUSTER_TOLERANCE_METERS", 1.5),
+            minimum_roof_cluster_points=_int("MINIMUM_ROOF_CLUSTER_POINTS", 20),
             lidar_buffer_meters=_float("LIDAR_BUFFER_METERS", 8),
             maximum_lidar_age_years=_int("MAXIMUM_LIDAR_AGE_YEARS", 10),
             minimum_point_density=_float("MINIMUM_POINT_DENSITY", 8),
@@ -121,6 +167,14 @@ class Settings:
             allow_historical_verified_pricing=os.getenv(
                 "ALLOW_HISTORICAL_VERIFIED_PRICING", "false"
             ).strip().lower() in {"1", "true", "yes"},
+            open3d_minimum_facet_points=_int("OPEN3D_MINIMUM_FACET_POINTS", 20),
+            open3d_minimum_inlier_ratio=_float("OPEN3D_MINIMUM_INLIER_RATIO", 0.65),
+            open3d_distance_threshold_meters=_float("OPEN3D_DISTANCE_THRESHOLD_METERS", 0.15),
+            open3d_maximum_normal_variance_degrees=_float(
+                "OPEN3D_MAXIMUM_NORMAL_VARIANCE_DEGREES", 5
+            ),
+            open3d_maximum_plane_rmse_meters=_float("OPEN3D_MAXIMUM_PLANE_RMSE_METERS", 0.15),
+            open3d_ransac_iterations=_int("OPEN3D_RANSAC_ITERATIONS", 1000),
         )
         settings.validate()
         return settings
@@ -147,6 +201,36 @@ class Settings:
                 raise ConfigurationError("REGISTRY_MISSING", f"{name} does not identify a readable registry file.")
         if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", self.overture_release):
             raise ConfigurationError("OVERTURE_RELEASE_INVALID", "OVERTURE_RELEASE must be a versioned release date.")
+        if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", self.microsoft_bfp_release):
+            raise ConfigurationError(
+                "MICROSOFT_BFP_RELEASE_INVALID", "MICROSOFT_BFP_RELEASE must be an immutable release date."
+            )
+        for name, url in (
+            ("MICROSOFT_BFP_CATALOG_URL", self.microsoft_bfp_catalog_url),
+            ("OSM_OVERPASS_URL", self.osm_overpass_url),
+            ("LEE_COUNTY_FOOTPRINT_URL", self.lee_county_footprint_url),
+        ):
+            if not url.startswith("https://"):
+                raise ConfigurationError("FOOTPRINT_PROVIDER_URL_INVALID", f"{name} must use HTTPS.")
+        if self.microsoft_bfp_zoom != 9 or self.microsoft_bfp_maximum_tile_bytes < 25_000_000:
+            raise ConfigurationError(
+                "MICROSOFT_BFP_CONFIG_INVALID",
+                "Microsoft footprint tiles must use the published zoom and a safe download limit.",
+            )
+        if not 0.60 <= self.footprint_consensus_min_iou <= 0.95:
+            raise ConfigurationError(
+                "FOOTPRINT_CONSENSUS_INVALID",
+                "FOOTPRINT_CONSENSUS_MIN_IOU must be between 0.60 and 0.95.",
+            )
+        if not 0.5 <= self.minimum_roof_hag_meters < self.maximum_roof_hag_meters <= 40:
+            raise ConfigurationError(
+                "ROOF_HAG_RANGE_INVALID",
+                "The class-1 roof height-above-ground range is outside the supported bounds.",
+            )
+        if not 0.25 <= self.roof_cluster_tolerance_meters <= 3 or self.minimum_roof_cluster_points < 10:
+            raise ConfigurationError(
+                "ROOF_CLUSTER_CONFIG_INVALID", "The roof-point clustering thresholds are unsafe."
+            )
         if not (
             -180 <= self.minimum_longitude < self.maximum_longitude <= 180
             and -90 <= self.minimum_latitude < self.maximum_latitude <= 90
@@ -174,5 +258,28 @@ class Settings:
             raise ConfigurationError(
                 "CATALOG_SIZE_LIMIT_INVALID",
                 "CATALOG_MAXIMUM_BYTES must be between 50 MB and 1 GB.",
+            )
+        if not 0.5 <= self.open3d_minimum_inlier_ratio <= 1:
+            raise ConfigurationError(
+                "OPEN3D_INLIER_THRESHOLD_INVALID",
+                "OPEN3D_MINIMUM_INLIER_RATIO must be between 0.5 and 1.",
+            )
+        if self.open3d_minimum_facet_points < 10 or self.open3d_ransac_iterations < 100:
+            raise ConfigurationError(
+                "OPEN3D_SUPPORT_THRESHOLD_INVALID",
+                "Open3D support and RANSAC thresholds are below the safe minimum.",
+            )
+        if not re.fullmatch(r"\d+\.\d+\.\d+", self.open3d_version):
+            raise ConfigurationError(
+                "OPEN3D_VERSION_INVALID", "OPEN3D_VERSION must be a pinned semantic version."
+            )
+        if not (
+            0 < self.open3d_distance_threshold_meters <= 0.30
+            and 0 < self.open3d_maximum_plane_rmse_meters <= 0.30
+            and 0 < self.open3d_maximum_normal_variance_degrees <= 15
+        ):
+            raise ConfigurationError(
+                "OPEN3D_GEOMETRY_THRESHOLD_INVALID",
+                "Open3D geometry thresholds are outside the supported fail-closed range.",
             )
         self.work_root.mkdir(parents=True, exist_ok=True)
