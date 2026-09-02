@@ -35,6 +35,21 @@ class CityJsonGeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "point density") as context:
             extract_roof_geometry(feature, transform)
         self.assertEqual(context.exception.code, "LIDAR_DENSITY_TOO_LOW")
+        self.assertEqual(
+            context.exception.details,
+            {"pointDensityPpsm": 2.0, "minimumPointDensityPpsm": 8.0},
+        )
+
+    def test_excessive_nodata_fails_closed_with_sanitized_metrics(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        feature["CityObjects"]["TEST-GABLE"]["attributes"]["rf_nodata_frac"] = 0.25
+        with self.assertRaisesRegex(Exception, "missing coverage") as context:
+            extract_roof_geometry(feature, transform)
+        self.assertEqual(context.exception.code, "LIDAR_COVERAGE_INCOMPLETE")
+        self.assertEqual(
+            context.exception.details,
+            {"noDataFraction": 0.25, "maximumNoDataFraction": 0.10},
+        )
 
     def test_roofer_multisurface_semantics_are_measured(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")

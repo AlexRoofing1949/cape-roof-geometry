@@ -295,11 +295,32 @@ def _quality_confidence(attributes: dict[str, Any], minimum_density: float, maxi
     nodata = float(attributes.get("rf_nodata_frac", 1) or 1)
     rmse = float(attributes.get("rf_rmse_lod22", math.inf) or math.inf)
     if density < minimum_density:
-        raise UnreliableGeometryError("LIDAR_DENSITY_TOO_LOW", "The available LiDAR point density is below the verified-measurement threshold.")
+        raise UnreliableGeometryError(
+            "LIDAR_DENSITY_TOO_LOW",
+            "The available LiDAR point density is below the verified-measurement threshold.",
+            details={
+                "pointDensityPpsm": round(density, 4),
+                "minimumPointDensityPpsm": minimum_density,
+            },
+        )
     if nodata > maximum_nodata_fraction:
-        raise UnreliableGeometryError("LIDAR_COVERAGE_INCOMPLETE", "The available LiDAR has excessive missing coverage over the roof.")
+        raise UnreliableGeometryError(
+            "LIDAR_COVERAGE_INCOMPLETE",
+            "The available LiDAR has excessive missing coverage over the roof.",
+            details={
+                "noDataFraction": round(nodata, 4),
+                "maximumNoDataFraction": maximum_nodata_fraction,
+            },
+        )
     if rmse > maximum_rmse:
-        raise UnreliableGeometryError("ROOFER_RMSE_TOO_HIGH", "The reconstructed roof exceeds the maximum geometry error threshold.")
+        raise UnreliableGeometryError(
+            "ROOFER_RMSE_TOO_HIGH",
+            "The reconstructed roof exceeds the maximum geometry error threshold.",
+            details={
+                "rooferRmseMeters": round(rmse, 4),
+                "maximumRooferRmseMeters": maximum_rmse,
+            },
+        )
     components = {
         "density": min(1.0, density / max(minimum_density * 1.5, 0.01)),
         "coverage": max(0.0, min(1.0, 1 - nodata / max(maximum_nodata_fraction, 0.001))),
