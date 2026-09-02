@@ -64,6 +64,53 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertEqual(summary[0]["boundaryDepth"], 4)
         self.assertNotIn("vertices", context.exception.details)
 
+    def test_roof_opening_area_is_subtracted_without_misclassifying_its_edges(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "OPENING",
+            "vertices": [
+                [0, 0, 3],
+                [10, 0, 3],
+                [10, 10, 3],
+                [0, 10, 3],
+                [4, 4, 3],
+                [6, 4, 3],
+                [6, 6, 3],
+                [4, 6, 3],
+            ],
+            "CityObjects": {
+                "OPENING": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [
+                        {
+                            "type": "MultiSurface",
+                            "lod": "2.2",
+                            "boundaries": [[[0, 1, 2, 3], [4, 7, 6, 5]]],
+                            "semantics": {
+                                "surfaces": [{"type": "RoofSurface", "rf_slope": 0}],
+                                "values": [0],
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        self.assertAlmostEqual(result["roofAreaSqFt"], 96 * 10.763910416709722, delta=0.02)
+        self.assertEqual(result["roofOpeningCount"], 1)
+        self.assertAlmostEqual(result["roofOpeningPerimeterFeet"], 8 * 3.280839895013123, delta=0.02)
+        self.assertAlmostEqual(result["eavesFeet"], 40 * 3.280839895013123, delta=0.02)
+
     def test_missing_transform_is_allowed_for_unquantized_fixture(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         self.assertIsNone(transform)

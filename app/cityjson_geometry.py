@@ -30,6 +30,8 @@ class Facet:
     azimuth_degrees: float
     centroid: tuple[float, float, float]
     normal: tuple[float, float, float]
+    opening_count: int
+    opening_perimeter_meters: float
     semantic_attributes: dict[str, Any]
 
 
@@ -221,17 +223,36 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
 
     facets: list[Facet] = []
     for index, (rings, semantic) in enumerate(raw_facets, start=1):
-        if len(rings) != 1:
+        decoded_rings: list[tuple[tuple[int, ...], tuple[tuple[float, float, float], ...]]] = []
+        for ring in rings:
+            ring_ids = tuple(int(value) for value in ring)
+            if len(ring_ids) < 3 or any(value < 0 or value >= len(vertices) for value in ring_ids):
+                raise UnreliableGeometryError(
+                    "ROOF_FACET_INVALID", "Roofer returned an invalid roof facet boundary."
+                )
+            decoded_rings.append((ring_ids, tuple(vertices[value] for value in ring_ids)))
+        if not decoded_rings:
             raise UnreliableGeometryError(
-                "ROOF_OPENING_TOPOLOGY_UNSUPPORTED",
-                "The reconstructed roof contains an opening whose edges cannot yet be classified safely.",
+                "ROOF_FACET_INVALID", "Roofer returned a roof facet without a boundary."
             )
-        ids = tuple(int(value) for value in rings[0])
-        if len(ids) < 3 or any(value < 0 or value >= len(vertices) for value in ids):
-            raise UnreliableGeometryError("ROOF_FACET_INVALID", "Roofer returned an invalid roof facet boundary.")
-        points = tuple(vertices[value] for value in ids)
+        ids, points = decoded_rings[0]
         area_vector = _newell(points)
-        area = _norm(area_vector) / 2
+        exterior_area = _norm(area_vector) / 2
+        opening_area = 0.0
+        opening_perimeter = 0.0
+        for _, opening_points in decoded_rings[1:]:
+            opening_vector = _newell(opening_points)
+            opening_vector_length = _norm(opening_vector)
+            if opening_vector_length <= 0.02:
+                raise UnreliableGeometryError(
+                    "ROOF_OPENING_INVALID", "Roofer returned a degenerate roof opening."
+                )
+            opening_area += opening_vector_length / 2
+            opening_perimeter += sum(
+                _edge_length(start, end)
+                for start, end in zip(opening_points, opening_points[1:] + opening_points[:1])
+            )
+        area = exterior_area - opening_area
         if area <= 0.25:
             raise UnreliableGeometryError("ROOF_FACET_TOO_SMALL", "Roofer returned a degenerate roof facet.")
         normal_length = _norm(area_vector)
@@ -257,6 +278,8 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
                 azimuth_degrees=azimuth,
                 centroid=_centroid(points),
                 normal=normal,  # type: ignore[arg-type]
+                opening_count=max(0, len(decoded_rings) - 1),
+                opening_perimeter_meters=opening_perimeter,
                 semantic_attributes=dict(semantic),
             )
         )
@@ -396,6 +419,8 @@ def extract_roof_geometry(
             "pitchDegrees": _round(facet.pitch_degrees),
             "azimuthDegrees": _round(facet.azimuth_degrees),
             "classification": "FLAT" if facet.pitch_degrees <= flat_pitch_degrees else "SLOPED",
+            "openingCount": facet.opening_count,
+            "openingPerimeterFeet": _round(facet.opening_perimeter_meters * METERS_TO_FEET),
         }
         for facet in facets
     ]
@@ -414,6 +439,10 @@ def extract_roof_geometry(
         "ridgesFeet": totals["ridges"],
         "hipsFeet": totals["hips"],
         "flatRoofAreaSqFt": _round(flat_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
+        "roofOpeningCount": sum(facet.opening_count for facet in facets),
+        "roofOpeningPerimeterFeet": _round(
+            sum(facet.opening_perimeter_meters for facet in facets) * METERS_TO_FEET
+        ),
         "confidence": _round(quality_confidence, 3),
         "facets": result_facets,
         "rakes": classified["rakes"],
