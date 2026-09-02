@@ -160,6 +160,22 @@ class RegionalSourceTests(unittest.TestCase):
         self.assertTrue(any(item["sourceId"] == "lcmcd_lee_2026" for item in audit))
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._catalog_features", return_value=iter(()))
+    @patch("app.providers.resolve_service_county", return_value="Lee")
+    @patch("app.providers._ept_coverage")
+    def test_lee_orders_by_acquisition_date_before_coverage(
+        self, ept_coverage, _county, _catalog
+    ):
+        broad = Polygon([(-83, 25), (-80, 25), (-80, 28), (-83, 28)])
+        tighter = Polygon([(-82.01, 26.55), (-81.89, 26.55), (-81.89, 26.70), (-82.01, 26.70)])
+        ept_coverage.side_effect = [(tighter, 1_000_000), (broad, 1_000_000)]
+        _, candidates, _ = select_regional_lidar(
+            footprint(), -81.9509, 26.6211, settings(), self.registries
+        )
+        self.assertEqual(candidates[0].source_id, "noaa_post_ian_2022")
+        self.assertEqual(candidates[1].source_id, "noaa_pre_ian_2022")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.resolve_service_county", return_value="Lee")
     @patch("app.providers._catalog_features")
     @patch("app.providers._ept_coverage")

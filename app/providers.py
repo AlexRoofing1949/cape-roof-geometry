@@ -533,7 +533,11 @@ def select_regional_lidar(
 
     candidates.sort(
         key=lambda item: (
-            item.tile_acquisition_date,
+            # Per-tile GPS dates are only available after the property crop is
+            # downloaded.  Use the registered acquisition end date for the
+            # initial ordering so a slightly larger coverage polygon cannot
+            # cause an older source to be attempted before a newer one.
+            item.acquired_end,
             item.coverage_ratio,
             item.minimum_density_ppsm,
             next(source.priority for source in registries.lidar_sources if source.id == item.source_id),
