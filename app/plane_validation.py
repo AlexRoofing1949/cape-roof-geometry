@@ -19,7 +19,7 @@ from .errors import TransientProviderError, UnreliableGeometryError
 def _open3d() -> Any:
     try:
         return importlib.import_module("open3d")
-    except ModuleNotFoundError as error:
+    except (ImportError, OSError) as error:
         raise UnreliableGeometryError(
             "OPEN3D_RUNTIME_MISSING", "The independent roof-plane validator is unavailable."
         ) from error

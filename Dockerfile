@@ -9,7 +9,10 @@ RUN micromamba install --yes --name base --file /tmp/environment.yml \
 
 USER root
 COPY --from=roofer /opt/roofer/ /opt/roofer/
-RUN mkdir -p /srv/cape-roof-geometry /tmp/cape-roof-geometry \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends libgl1 libgomp1 libx11-6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /srv/cape-roof-geometry /tmp/cape-roof-geometry \
     && chown -R $MAMBA_USER:$MAMBA_USER /srv/cape-roof-geometry /tmp/cape-roof-geometry
 
 USER $MAMBA_USER

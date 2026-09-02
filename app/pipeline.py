@@ -659,5 +659,9 @@ def runtime_dependencies() -> dict[str, bool]:
         command: shutil.which(command) is not None
         for command in ("roofer", "pdal", "ogr2ogr", "overturemaps")
     }
-    dependencies["open3d"] = importlib.util.find_spec("open3d") is not None
+    try:
+        open3d = importlib.import_module("open3d")
+        dependencies["open3d"] = bool(getattr(open3d, "__version__", ""))
+    except (ImportError, OSError):
+        dependencies["open3d"] = False
     return dependencies

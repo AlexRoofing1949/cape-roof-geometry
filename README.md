@@ -55,18 +55,22 @@ The Docker image pins the official `3dgi/roofer:v1.0.0`, Micromamba, and Caddy i
 
 ## Publish and deploy
 
-The Apps Script provenance gate requires a public GitHub source URL and immutable service commit. Before deployment:
+The Apps Script provenance gate requires a public GitHub source URL and immutable service commit. Production is routed through the `geometry.caperoof.com` external HTTPS load balancer. Its serverless NEG, `cape-roof-geometry-neg`, targets the `cape-roof-geometry` Cloud Run service in `us-central1`; deploying the same service name in another region does not update production.
 
-1. Push this `geometry-service` directory, including `config/`, to a public GitHub repository under GPL-3.0.
-2. Set `SERVICE_SOURCE_URL` to that repository and `SERVICE_COMMIT` to the deployed 40-character Git commit.
-3. Set `AUTH_BEARER_TOKEN` to at least 32 random bytes.
-4. Create DNS for `geometry.caperoof.com` pointing to a Linux host with at least 4 GB RAM and 2 GB temporary disk.
-5. From this directory, run `docker compose -f deploy/docker-compose.yml up -d --build`. Caddy obtains and renews HTTPS automatically.
-6. Confirm `https://geometry.caperoof.com/healthz` returns `ready`.
+Before deployment:
+
+1. Push this directory, including `config/`, to the public GPL-3.0 GitHub repository.
+2. Build an immutable image and record both its digest and the corresponding 40-character Git commit.
+3. Deploy that image to `cape-roof-geometry` in `us-central1`, with `SERVICE_SOURCE_URL` and `SERVICE_COMMIT` matching the public source.
+4. Mount `AUTH_BEARER_TOKEN` from the `cape-roof-geometry-auth` Secret Manager secret. Never place its value in source, command output, or logs.
+5. Keep Cloud Run invoker IAM disabled only because `/v1/roof-geometry` performs constant-time bearer authentication in the application; the endpoint must remain inaccessible without that bearer token.
+6. Confirm `https://geometry.caperoof.com/healthz` returns `ready` and reports the exact deployed `serviceCommit` before changing Apps Script.
 7. In Apps Script Properties set:
    - `OPEN_SOURCE_GEOMETRY_ENDPOINT=https://geometry.caperoof.com/v1/roof-geometry`
    - `OPEN_SOURCE_GEOMETRY_TOKEN=<the same AUTH_BEARER_TOKEN>`
 8. Run `runConfigurationDiagnostics()` and `runAllTests()` in Apps Script, then process controlled onsite-verified test properties before customer automation is enabled.
+
+`deploy/docker-compose.yml` remains an optional self-hosted development path; it is not the Cape Roof production route.
 
 During calibration, the corresponding Apps Script Config values `AUTOMATIC_PRICING_ENABLED` and `ALLOW_HISTORICAL_VERIFIED_PRICING` must remain `false`.
 
