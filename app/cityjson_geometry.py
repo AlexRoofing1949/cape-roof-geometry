@@ -381,13 +381,12 @@ def extract_roof_geometry(
             edge_height = (first.start[2] + first.end[2]) / 2
             if edge_height <= first.facet.centroid[2] + plane_side_tolerance_meters:
                 add_edge("eaves", uses)
-            elif first.facet.pitch_degrees <= flat_pitch_degrees:
-                # A horizontal high-side boundary on a low-slope plane is a
-                # measured perimeter/flashing edge, not an eave, rake, ridge,
-                # hip, or valley. Keep the category explicit for pricing.
-                add_edge("highPerimeters", uses)
             else:
-                ambiguous.append({"reason": "HIGH_HORIZONTAL_PERIMETER", "facetIds": [first.facet.facet_id]})
+                # A horizontal high-side boundary with only one adjacent roof
+                # plane is a measured perimeter/flashing edge, not an eave,
+                # rake, ridge, hip, or valley. Keep the category explicit for
+                # pricing at every pitch instead of guessing a standard type.
+                add_edge("highPerimeters", uses)
             continue
 
         second = uses[1]

@@ -111,11 +111,11 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(result["roofOpeningPerimeterFeet"], 8 * 3.280839895013123, delta=0.02)
         self.assertAlmostEqual(result["eavesFeet"], 40 * 3.280839895013123, delta=0.02)
 
-    def test_low_slope_high_side_is_measured_as_perimeter_flashing(self):
+    def test_high_side_is_measured_as_perimeter_flashing_at_any_pitch(self):
         feature = {
             "type": "CityJSONFeature",
             "id": "LOW-SLOPE",
-            "vertices": [[0, 0, 3], [10, 0, 3], [10, 10, 3.2], [0, 10, 3.2]],
+            "vertices": [[0, 0, 3], [10, 0, 3], [10, 10, 5], [0, 10, 5]],
             "CityObjects": {
                 "LOW-SLOPE": {
                     "type": "Building",
@@ -141,11 +141,11 @@ class CityJsonGeometryTests(unittest.TestCase):
 
         result = extract_roof_geometry(feature, None)
 
-        self.assertLess(result["averagePitchDegrees"], 5)
+        self.assertGreater(result["averagePitchDegrees"], 5)
         self.assertAlmostEqual(result["eavesFeet"], 10 * 3.280839895013123, delta=0.02)
         self.assertAlmostEqual(result["highPerimeterFeet"], 10 * 3.280839895013123, delta=0.02)
         self.assertAlmostEqual(
-            result["rakesFeet"], 2 * math.sqrt(10**2 + 0.2**2) * 3.280839895013123, delta=0.05
+            result["rakesFeet"], 2 * math.sqrt(10**2 + 2**2) * 3.280839895013123, delta=0.05
         )
 
     def test_missing_transform_is_allowed_for_unquantized_fixture(self):
