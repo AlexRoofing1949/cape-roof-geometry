@@ -142,6 +142,21 @@ def _classification_histogram(metadata_path: Path) -> dict[str, int]:
                 counts = node.get("counts") or node.get("enumeration") or node.get("values")
                 if isinstance(counts, list):
                     for item in counts:
+                        # PDAL serializes repeated ``counts`` metadata children as
+                        # strings in the form ``<dimension value>/<point count>``
+                        # (for example ``6.000000/412``).  Some bindings instead
+                        # expose objects, so accept both representations while
+                        # still requiring numeric class IDs and integer counts.
+                        if isinstance(item, str):
+                            value, separator, count = item.partition("/")
+                            if not separator:
+                                continue
+                            try:
+                                class_id = str(int(float(value)))
+                                histogram[class_id] = histogram.get(class_id, 0) + int(count)
+                            except (TypeError, ValueError):
+                                continue
+                            continue
                         if not isinstance(item, dict):
                             continue
                         value = item.get("value", item.get("name"))

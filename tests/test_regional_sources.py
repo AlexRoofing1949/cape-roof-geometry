@@ -209,6 +209,28 @@ class RegionalSourceTests(unittest.TestCase):
             )
             self.assertEqual(_classification_histogram(path), {"1": 120, "2": 80, "6": 40})
 
+    def test_classification_histogram_accepts_pdal_count_strings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "filters.stats": {
+                                "statistic": [
+                                    {
+                                        "name": "Classification",
+                                        "counts": ["1.000000/120", "2.000000/80", "6.000000/40"],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_classification_histogram(path), {"1": 120, "2": 80, "6": 40})
+
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     def test_exact_gps_date_is_derived_only_inside_registered_window(self):
         epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
