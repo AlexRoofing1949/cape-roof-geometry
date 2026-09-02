@@ -374,7 +374,10 @@ def resolve_service_county(footprint_wgs84: BaseGeometry, settings: Settings) ->
             continue
         properties = feature.get("properties") or {}
         raw_name = str(properties.get("NAME") or properties.get("name") or "").strip()
-        name = "DeSoto" if raw_name.replace(" ", "").lower() == "desoto" else raw_name
+        # TIGERweb currently returns values such as "Lee County", while the
+        # pinned LiDAR registry intentionally uses canonical county names.
+        name = re.sub(r"\s+County$", "", raw_name, flags=re.IGNORECASE).strip()
+        name = "DeSoto" if name.replace(" ", "").lower() == "desoto" else name
         if name not in SERVICE_COUNTIES:
             continue
         ratio = _coverage_ratio(geometry, footprint_wgs84)

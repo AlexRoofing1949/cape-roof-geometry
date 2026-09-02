@@ -12,7 +12,12 @@ try:
 
     from app.pipeline import _classification_histogram
     from app.errors import UnreliableGeometryError
-    from app.providers import FootprintResult, fetch_overture_footprint, select_regional_lidar
+    from app.providers import (
+        FootprintResult,
+        fetch_overture_footprint,
+        resolve_service_county,
+        select_regional_lidar,
+    )
 
     SPATIAL_RUNTIME_AVAILABLE = True
 except ModuleNotFoundError:
@@ -111,6 +116,30 @@ class RegionalSourceTests(unittest.TestCase):
         with self.assertRaises(UnreliableGeometryError) as raised:
             _require_pinned_overture_release(configured)
         self.assertEqual(raised.exception.code, "OVERTURE_RELEASE_MISMATCH")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._cached_json_url")
+    def test_tigerweb_county_suffix_is_normalized(self, cached_json):
+        cached_json.return_value = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"NAME": "Lee County", "GEOID": "12071"},
+                    "geometry": mapping(
+                        Polygon([(-82.2, 26.4), (-81.7, 26.4), (-81.7, 26.9), (-82.2, 26.9)])
+                    ),
+                }
+            ],
+        }
+        configured = SimpleNamespace(
+            county_boundaries_url="https://example.invalid/florida-counties",
+            catalog_cache_seconds=86400,
+            catalog_download_timeout_seconds=180,
+            catalog_maximum_bytes=200_000_000,
+            work_root=ROOT,
+        )
+        self.assertEqual(resolve_service_county(footprint().geometry_wgs84, configured), "Lee")
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers._catalog_features", return_value=iter(()))
