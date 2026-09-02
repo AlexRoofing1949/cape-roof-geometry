@@ -436,6 +436,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                         "sourceId": lidar.source_id,
                         "decision": "REJECTED_PROPERTY_CROP",
                         "errorCode": error.code,
+                        **({"errorDetails": error.details} if error.details else {}),
                     }
                 )
 

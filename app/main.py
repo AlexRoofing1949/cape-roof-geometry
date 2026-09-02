@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 from functools import lru_cache
@@ -88,10 +89,11 @@ async def roof_geometry(request: GeometryRequest, configured: Settings = Depends
             result = await asyncio.to_thread(reconstruct_roof, request, configured)
     except GeometryServiceError as error:
         LOGGER.warning(
-            "geometry_rejected request_id=%s code=%s retryable=%s",
+            "geometry_rejected request_id=%s code=%s retryable=%s details=%s",
             request.requestId,
             error.code,
             error.retryable,
+            json.dumps(error.details, sort_keys=True, separators=(",", ":")),
         )
         return JSONResponse(
             status_code=error.http_status,

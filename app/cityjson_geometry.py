@@ -151,17 +151,38 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
 
     parent_attributes: dict[str, Any] = {}
     raw_facets: list[tuple[list[list[int]], dict[str, Any]]] = []
+    geometry_summaries: list[dict[str, Any]] = []
+
+    def list_depth(value: Any) -> int:
+        if not isinstance(value, list):
+            return 0
+        return 1 + max((list_depth(item) for item in value), default=0)
+
     for city_object in feature.get("CityObjects", {}).values():
         if city_object.get("type") == "Building":
             parent_attributes.update(city_object.get("attributes") or {})
         if city_object.get("type") not in {"Building", "BuildingPart"}:
             continue
         for geometry in city_object.get("geometry") or []:
+            semantics = geometry.get("semantics") or {}
+            geometry_summaries.append(
+                {
+                    "cityObjectType": str(city_object.get("type") or ""),
+                    "geometryType": str(geometry.get("type") or ""),
+                    "lod": str(geometry.get("lod") or ""),
+                    "boundaryDepth": list_depth(geometry.get("boundaries")),
+                    "semanticValueDepth": list_depth(semantics.get("values")),
+                    "semanticSurfaceTypes": [
+                        str(surface.get("type") or "")
+                        for surface in (semantics.get("surfaces") or [])
+                        if isinstance(surface, dict)
+                    ],
+                }
+            )
             if str(geometry.get("lod")) != "2.2":
                 continue
             geometry_type = str(geometry.get("type") or "")
             boundaries = geometry.get("boundaries") or []
-            semantics = geometry.get("semantics") or {}
             surfaces = semantics.get("surfaces") or []
             semantic_values = semantics.get("values") or []
             if geometry_type == "Solid":
@@ -192,7 +213,11 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
                         raw_facets.append((rings, semantic))
 
     if not raw_facets:
-        raise UnreliableGeometryError("ROOF_FACETS_MISSING", "Roofer did not reconstruct any LoD2.2 roof surfaces.")
+        raise UnreliableGeometryError(
+            "ROOF_FACETS_MISSING",
+            "Roofer did not reconstruct any LoD2.2 roof surfaces.",
+            details={"cityJsonGeometrySummary": geometry_summaries},
+        )
 
     facets: list[Facet] = []
     for index, (rings, semantic) in enumerate(raw_facets, start=1):

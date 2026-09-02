@@ -49,6 +49,21 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(result["averagePitchDegrees"], 45, delta=0.01)
         self.assertGreater(result["roofAreaSqFt"], 0)
 
+    def test_missing_facets_return_sanitized_schema_audit(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        geometry = feature["CityObjects"]["TEST-GABLE-0"]["geometry"][0]
+        for surface in geometry["semantics"]["surfaces"]:
+            if surface["type"] == "RoofSurface":
+                surface["type"] = "GenericSurface"
+
+        with self.assertRaisesRegex(Exception, "did not reconstruct") as context:
+            extract_roof_geometry(feature, transform)
+
+        summary = context.exception.details["cityJsonGeometrySummary"]
+        self.assertEqual(summary[0]["geometryType"], "Solid")
+        self.assertEqual(summary[0]["boundaryDepth"], 4)
+        self.assertNotIn("vertices", context.exception.details)
+
     def test_missing_transform_is_allowed_for_unquantized_fixture(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         self.assertIsNone(transform)
