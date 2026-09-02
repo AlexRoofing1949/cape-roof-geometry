@@ -134,11 +134,19 @@ def _classification_histogram(metadata_path: Path) -> dict[str, int]:
         ) from error
 
     histogram: dict[str, int] = {}
+    classification_seen = False
+    classification_point_count = 0
 
     def visit(node: Any) -> None:
+        nonlocal classification_seen, classification_point_count
         if isinstance(node, dict):
             name = str(node.get("name") or node.get("dimension") or "")
             if name.lower() == "classification":
+                classification_seen = True
+                try:
+                    classification_point_count += int(node.get("count") or 0)
+                except (TypeError, ValueError):
+                    pass
                 counts = node.get("counts") or node.get("enumeration") or node.get("values")
                 if isinstance(counts, list):
                     for item in counts:
@@ -178,6 +186,8 @@ def _classification_histogram(metadata_path: Path) -> dict[str, int]:
                 visit(value)
 
     visit(payload)
+    if not histogram and classification_seen and classification_point_count == 0:
+        return {}
     if not histogram:
         raise UnreliableGeometryError(
             "LIDAR_CLASSIFICATION_AUDIT_MISSING",
@@ -346,75 +356,115 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
         county, lidar_candidates, selection_audit = select_regional_lidar(
             footprint, longitude, latitude, settings, registries
         )
-        lidar = lidar_candidates[0]
         footprint_gpkg, crop_wkt, target_epsg, projected_footprint = write_footprint_inputs(
             footprint, request.requestId, workspace, longitude, latitude, settings
         )
+        attempts: list[dict[str, Any]] = []
+        selected: tuple[LidarResource, dict[str, Any], float, dict[str, Any]] | None = None
+        for candidate_index, candidate in enumerate(lidar_candidates):
+            lidar = candidate
+            pointcloud = workspace / f"roof-points-{candidate_index}.laz"
+            try:
+                point_audit = _pdal_crop(lidar, crop_wkt, target_epsg, pointcloud, workspace, settings)
+                if point_audit["tileAcquisitionDate"]:
+                    acquired = date.fromisoformat(point_audit["tileAcquisitionDate"])
+                    today = datetime.now(timezone.utc).date()
+                    age_years = max(
+                        0,
+                        today.year
+                        - acquired.year
+                        - ((today.month, today.day) < (acquired.month, acquired.day)),
+                    )
+                    lidar = replace(
+                        lidar,
+                        tile_acquisition_date=point_audit["tileAcquisitionDate"],
+                        age_years=age_years,
+                    )
+                point_density = float(point_audit["filteredPointCount"]) / max(
+                    float(projected_footprint.area), 0.01
+                )
+                required_density = max(settings.minimum_point_density, lidar.minimum_density_ppsm)
+                if point_density < required_density:
+                    raise UnreliableGeometryError(
+                        "LIDAR_DENSITY_TOO_LOW",
+                        "The selected point cloud does not meet its registered post-filter density requirement.",
+                        details={
+                            "sourceId": lidar.source_id,
+                            "pointDensityPpsm": round(point_density, 3),
+                            "minimumDensityPpsm": required_density,
+                        },
+                    )
+                feature_path, metadata_path = _run_roofer(
+                    pointcloud,
+                    footprint_gpkg,
+                    workspace / f"roofer-output-{candidate_index}",
+                    settings,
+                )
+                feature, transform = load_cityjson_feature(feature_path, metadata_path)
+                geometry = extract_roof_geometry(
+                    feature,
+                    transform,
+                    flat_pitch_degrees=settings.flat_pitch_degrees,
+                    minimum_density=settings.minimum_point_density,
+                    maximum_nodata_fraction=settings.maximum_nodata_fraction,
+                    maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
+                )
+                reconciliation = _solar_reconciliation(geometry, request, settings)
+                _validate_selected_roof_type(geometry, request)
+                confidence, confidence_components = _combined_confidence(
+                    float(geometry["confidence"]),
+                    footprint.distance_meters,
+                    lidar.age_years,
+                    reconciliation["confidence"],
+                    settings,
+                )
+                if confidence < settings.minimum_service_confidence:
+                    raise UnreliableGeometryError(
+                        "GEOMETRY_CONFIDENCE_TOO_LOW",
+                        "The open-source roof model did not meet the automatic measurement confidence threshold.",
+                        details={"confidence": confidence, "components": confidence_components},
+                    )
+                geometry["confidence"] = confidence
+                geometry["confidenceComponents"] = confidence_components
+                geometry["reconciliation"] = reconciliation
+                selected = (lidar, point_audit, point_density, geometry)
+                attempts.append({"sourceId": lidar.source_id, "decision": "SELECTED_VALID_CROP"})
+                break
+            except UnreliableGeometryError as error:
+                attempts.append(
+                    {
+                        "sourceId": lidar.source_id,
+                        "decision": "REJECTED_PROPERTY_CROP",
+                        "errorCode": error.code,
+                    }
+                )
 
-        pointcloud = workspace / "roof-points.laz"
-        point_audit = _pdal_crop(lidar, crop_wkt, target_epsg, pointcloud, workspace, settings)
-        if point_audit["tileAcquisitionDate"]:
-            acquired = date.fromisoformat(point_audit["tileAcquisitionDate"])
-            today = datetime.now(timezone.utc).date()
-            age_years = max(
-                0,
-                today.year - acquired.year - ((today.month, today.day) < (acquired.month, acquired.day)),
+        selection_audit.extend(attempts)
+        if selected is None:
+            error_codes = {str(item.get("errorCode") or "") for item in attempts}
+            code = (
+                "NO_USABLE_ROOF_RETURNS"
+                if error_codes and error_codes.issubset({"NO_USABLE_ROOF_RETURNS", "LIDAR_CROP_EMPTY"})
+                else "NO_RELIABLE_LIDAR_GEOMETRY"
             )
-            lidar = replace(
-                lidar,
-                tile_acquisition_date=point_audit["tileAcquisitionDate"],
-                age_years=age_years,
-            )
-        point_density = float(point_audit["filteredPointCount"]) / max(float(projected_footprint.area), 0.01)
-        required_density = max(settings.minimum_point_density, lidar.minimum_density_ppsm)
-        if point_density < required_density:
             raise UnreliableGeometryError(
-                "LIDAR_DENSITY_TOO_LOW",
-                "The selected point cloud does not meet its registered post-filter density requirement.",
-                details={
-                    "sourceId": lidar.source_id,
-                    "pointDensityPpsm": round(point_density, 3),
-                    "minimumDensityPpsm": required_density,
-                },
+                code,
+                "No registered LiDAR candidate produced reliable roof geometry for this property.",
+                details={"selectionAttempts": attempts},
             )
-        feature_path, metadata_path = _run_roofer(
-            pointcloud, footprint_gpkg, workspace / "roofer-output", settings
-        )
-        feature, transform = load_cityjson_feature(feature_path, metadata_path)
-        geometry = extract_roof_geometry(
-            feature,
-            transform,
-            flat_pitch_degrees=settings.flat_pitch_degrees,
-            minimum_density=settings.minimum_point_density,
-            maximum_nodata_fraction=settings.maximum_nodata_fraction,
-            maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
-        )
-
-        reconciliation = _solar_reconciliation(geometry, request, settings)
-        _validate_selected_roof_type(geometry, request)
-        confidence, confidence_components = _combined_confidence(
-            float(geometry["confidence"]),
-            footprint.distance_meters,
-            lidar.age_years,
-            reconciliation["confidence"],
-            settings,
-        )
-        if confidence < settings.minimum_service_confidence:
-            raise UnreliableGeometryError(
-                "GEOMETRY_CONFIDENCE_TOO_LOW",
-                "The open-source roof model did not meet the automatic measurement confidence threshold.",
-                details={"confidence": confidence, "components": confidence_components},
-            )
-        geometry["confidence"] = confidence
-        geometry["confidenceComponents"] = confidence_components
-        geometry["reconciliation"] = reconciliation
+        lidar, point_audit, point_density, geometry = selected
         imagery_decision = validate_current_structure(
             footprint,
             lidar,
             county,
             registries,
             current_lidar_max_age_years=settings.current_lidar_max_age_years,
+            maximum_current_imagery_age_years=settings.maximum_current_imagery_age_years,
             allow_historical_verified_pricing=settings.allow_historical_verified_pricing,
+            solar_reference=request.solarReference,
+            reconstructed_geometry=geometry,
+            maximum_area_variance_percent=settings.maximum_solar_area_variance_percent,
+            maximum_pitch_variance_degrees=settings.maximum_solar_pitch_variance_degrees,
         )
 
         lidar_component = "NOAA/DigitalCoast" if "NOAA" in lidar.provider.upper() else "USGS/3DEP"

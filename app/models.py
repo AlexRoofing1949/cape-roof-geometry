@@ -18,6 +18,7 @@ class SolarFacet(BaseModel):
 
     planeId: str | None = None
     areaSqFt: float = Field(ge=0)
+    groundAreaSqFt: float | None = Field(default=None, ge=0)
     pitchDegrees: float = Field(ge=0, le=90)
     azimuthDegrees: float | None = Field(default=None, ge=0, le=360)
 

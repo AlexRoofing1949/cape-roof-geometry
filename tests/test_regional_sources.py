@@ -231,6 +231,29 @@ class RegionalSourceTests(unittest.TestCase):
             )
             self.assertEqual(_classification_histogram(path), {"1": 120, "2": 80, "6": 40})
 
+    def test_empty_classification_statistic_is_auditable_no_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "filters.stats": {
+                                "statistic": [
+                                    {
+                                        "name": "Classification",
+                                        "count": 0,
+                                        "bins": {},
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(_classification_histogram(path), {})
+
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     def test_exact_gps_date_is_derived_only_inside_registered_window(self):
         epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)

@@ -63,6 +63,16 @@ The Apps Script provenance gate requires a public GitHub source URL and immutabl
 
 During calibration, the corresponding Apps Script Config values `AUTOMATIC_PRICING_ENABLED` and `ALLOW_HISTORICAL_VERIFIED_PRICING` must remain `false`.
 
+When no packaged county orthophoto evidence is enabled, the service can use the
+Google Solar Building Insights values already supplied by Apps Script as a
+fail-closed current-building comparison. It requires newer, high-quality,
+recent imagery metadata plus agreement between Solar ground/roof/pitch values,
+the Overture footprint, and the LiDAR reconstruction. The service does not
+download or redistribute Google imagery, records the provider date as
+approximate, and emits the required `Includes data from Google Maps`
+attribution. Any missing, stale, low-quality, or materially changed evidence
+returns `INSPECTION_REQUIRED` and cannot authorize pricing.
+
 The service loads `config/lidar_sources.yaml` and `config/imagery_sources.yaml` at startup and exposes their combined SHA-256 as `registryVersion`. A registry validation failure keeps `/healthz` in `not_ready`. Dataset years are never parsed from catalog filenames.
 
 Container hosting, DNS control, and the public GitHub push are account-level operations. They cannot be represented as completed until an owner-authorized host and repository are connected.

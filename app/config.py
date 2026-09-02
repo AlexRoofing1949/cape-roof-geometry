@@ -63,6 +63,7 @@ class Settings:
     max_concurrent_jobs: int
     minimum_lidar_coverage_ratio: float
     current_lidar_max_age_years: int
+    maximum_current_imagery_age_years: int
     allow_historical_verified_pricing: bool
 
     @classmethod
@@ -116,6 +117,7 @@ class Settings:
             max_concurrent_jobs=_int("MAX_CONCURRENT_JOBS", 2),
             minimum_lidar_coverage_ratio=_float("MINIMUM_LIDAR_COVERAGE_RATIO", 0.98),
             current_lidar_max_age_years=_int("CURRENT_LIDAR_MAX_AGE_YEARS", 2),
+            maximum_current_imagery_age_years=_int("MAXIMUM_CURRENT_IMAGERY_AGE_YEARS", 2),
             allow_historical_verified_pricing=os.getenv(
                 "ALLOW_HISTORICAL_VERIFIED_PRICING", "false"
             ).strip().lower() in {"1", "true", "yes"},
@@ -162,6 +164,11 @@ class Settings:
         if not 0 <= self.current_lidar_max_age_years <= 5:
             raise ConfigurationError(
                 "CURRENT_LIDAR_AGE_INVALID", "CURRENT_LIDAR_MAX_AGE_YEARS must be between 0 and 5."
+            )
+        if not 0 <= self.maximum_current_imagery_age_years <= 5:
+            raise ConfigurationError(
+                "CURRENT_IMAGERY_AGE_INVALID",
+                "MAXIMUM_CURRENT_IMAGERY_AGE_YEARS must be between 0 and 5.",
             )
         if self.catalog_maximum_bytes < 50_000_000 or self.catalog_maximum_bytes > 1_000_000_000:
             raise ConfigurationError(

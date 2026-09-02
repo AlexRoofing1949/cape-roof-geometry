@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 from shapely.geometry import shape
 
 from .providers import FootprintResult, LidarResource, transform_geometry, utm_epsg
 from .source_registry import PENDING_LICENSE_MARKERS, RegistryBundle
+
+
+SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
 
 
 def _distance_and_change(reference, current) -> tuple[float, float, float]:
@@ -25,6 +28,143 @@ def _distance_and_change(reference, current) -> tuple[float, float, float]:
     return float(iou), float(shift), float(area_change)
 
 
+def _year_age(value: date) -> int:
+    today = datetime.now(timezone.utc).date()
+    return max(0, today.year - value.year - ((today.month, today.day) < (value.month, value.day)))
+
+
+def _solar_model_validation(
+    footprint: FootprintResult,
+    lidar: LidarResource,
+    solar_reference: Any,
+    reconstructed_geometry: dict[str, Any] | None,
+    *,
+    maximum_current_imagery_age_years: int,
+    maximum_area_variance_percent: float,
+    maximum_pitch_variance_degrees: float,
+    current_lidar_max_age_years: int,
+    allow_historical_verified_pricing: bool,
+) -> dict[str, Any]:
+    """Use Google Solar's imagery-derived building model as change evidence.
+
+    This consumes only Building Insights values already supplied by the caller;
+    it does not fetch, cache, or redistribute Google imagery.  The provider's
+    imagery date is explicitly recorded as approximate rather than asserted to
+    be an exact aerial capture timestamp.
+    """
+
+    base = {
+        "sourceId": "google_solar_building_insights",
+        "captureDate": str(getattr(solar_reference, "imageryDate", "") or ""),
+        "captureDatePrecision": "PROVIDER_APPROXIMATE_DAY",
+        "imageryQuality": str(getattr(solar_reference, "imageryQuality", "") or "").upper(),
+        "license": "GOOGLE_MAPS_PLATFORM_TERMS",
+        "attribution": "Includes data from Google Maps",
+        "validationMethod": "BUILDING_MODEL_RECONCILIATION",
+    }
+
+    try:
+        imagery_date = date.fromisoformat(base["captureDate"])
+        lidar_date = date.fromisoformat(lidar.tile_acquisition_date or lidar.acquired_end)
+    except (TypeError, ValueError):
+        return {
+            "verificationStatus": "INSPECTION_REQUIRED",
+            "pricingAllowed": False,
+            "status": "CURRENT_IMAGERY_INSUFFICIENT",
+            "holdReason": "SOLAR_IMAGERY_DATE_INVALID",
+            "currentImagery": {**base, "validation": "FAILED"},
+            "warnings": ["SOLAR_IMAGERY_DATE_INVALID"],
+        }
+
+    facets = list(getattr(solar_reference, "facets", []) or [])
+    ground_area_sqft = sum(float(getattr(facet, "groundAreaSqFt", 0) or 0) for facet in facets)
+    target_epsg = utm_epsg(
+        float(footprint.geometry_wgs84.centroid.x), float(footprint.geometry_wgs84.centroid.y)
+    )
+    footprint_m = transform_geometry(footprint.geometry_wgs84, "EPSG:4326", f"EPSG:{target_epsg}")
+    footprint_area_sqft = float(footprint_m.area) * SQUARE_METERS_TO_SQUARE_FEET
+    footprint_area_variance = (
+        abs(ground_area_sqft - footprint_area_sqft) / max(footprint_area_sqft, 0.01) * 100
+    )
+
+    geometry = reconstructed_geometry or {}
+    solar_roof_area = float(getattr(solar_reference, "roofAreaSqFt", 0) or 0)
+    solar_pitch = float(getattr(solar_reference, "averagePitchDegrees", 0) or 0)
+    geometry_roof_area = float(geometry.get("roofAreaSqFt") or 0)
+    geometry_pitch = float(geometry.get("averagePitchDegrees") or 0)
+    roof_area_variance = abs(geometry_roof_area - solar_roof_area) / max(solar_roof_area, 0.01) * 100
+    pitch_variance = abs(geometry_pitch - solar_pitch)
+
+    failures: list[str] = []
+    if imagery_date <= lidar_date:
+        failures.append("IMAGERY_NOT_NEWER_THAN_LIDAR")
+    if _year_age(imagery_date) > maximum_current_imagery_age_years:
+        failures.append("IMAGERY_TOO_OLD_FOR_CURRENT_VALIDATION")
+    if base["imageryQuality"] != "HIGH":
+        failures.append("IMAGERY_QUALITY_FAILED")
+    if ground_area_sqft <= 0 or footprint_area_sqft <= 0:
+        failures.append("SOLAR_GROUND_AREA_MISSING")
+    elif footprint_area_variance > maximum_area_variance_percent:
+        failures.append("FOOTPRINT_AREA_CHANGED")
+    if solar_roof_area <= 0 or geometry_roof_area <= 0:
+        failures.append("ROOF_AREA_COMPARISON_MISSING")
+    elif roof_area_variance > maximum_area_variance_percent:
+        failures.append("ROOF_AREA_CHANGED")
+    if pitch_variance > maximum_pitch_variance_degrees:
+        failures.append("ROOF_PITCH_CHANGED")
+
+    current_imagery = {
+        **base,
+        "captureDate": imagery_date.isoformat(),
+        "imageryAgeYears": _year_age(imagery_date),
+        "solarGroundAreaSqFt": round(ground_area_sqft, 2),
+        "overtureFootprintAreaSqFt": round(footprint_area_sqft, 2),
+        "footprintAreaVariancePercent": round(footprint_area_variance, 2),
+        "solarRoofAreaSqFt": round(solar_roof_area, 2),
+        "lidarRoofAreaSqFt": round(geometry_roof_area, 2),
+        "roofAreaVariancePercent": round(roof_area_variance, 2),
+        "pitchVarianceDegrees": round(pitch_variance, 2),
+        "solarFacetCount": len(facets),
+        "lidarFacetCount": len(geometry.get("facets") or []),
+        "validation": "FAILED" if failures else "PASSED",
+    }
+    if failures:
+        changed = any(
+            item in failures
+            for item in (
+                "FOOTPRINT_AREA_CHANGED",
+                "ROOF_AREA_CHANGED",
+                "ROOF_PITCH_CHANGED",
+            )
+        )
+        status = "STRUCTURE_CHANGED_AFTER_LIDAR" if changed else "CURRENT_IMAGERY_INSUFFICIENT"
+        return {
+            "verificationStatus": "INSPECTION_REQUIRED",
+            "pricingAllowed": False,
+            "status": status,
+            "holdReason": status,
+            "currentImagery": current_imagery,
+            "warnings": failures,
+        }
+
+    if lidar.age_years <= current_lidar_max_age_years:
+        verification_status = "VERIFIED_CURRENT"
+        pricing_allowed = True
+    else:
+        verification_status = "VERIFIED_HISTORICAL_UNCHANGED"
+        pricing_allowed = allow_historical_verified_pricing
+    return {
+        "verificationStatus": verification_status,
+        "pricingAllowed": pricing_allowed,
+        "status": "GEOMETRY_VERIFIED" if pricing_allowed else "HISTORICAL_PRICING_CALIBRATION_HOLD",
+        "holdReason": "" if pricing_allowed else "HISTORICAL_PRICING_DISABLED_DURING_CALIBRATION",
+        "currentImagery": current_imagery,
+        "warnings": []
+        if pricing_allowed
+        else ["Historical LiDAR passed building-model change checks but pricing remains disabled."],
+    }
+
+
 def validate_current_structure(
     footprint: FootprintResult,
     lidar: LidarResource,
@@ -32,7 +172,12 @@ def validate_current_structure(
     registries: RegistryBundle,
     *,
     current_lidar_max_age_years: int,
+    maximum_current_imagery_age_years: int,
     allow_historical_verified_pricing: bool,
+    solar_reference: Any = None,
+    reconstructed_geometry: dict[str, Any] | None = None,
+    maximum_area_variance_percent: float = 15,
+    maximum_pitch_variance_degrees: float = 10,
 ) -> dict[str, Any]:
     """Validate immutable evidence created from an authorized orthophoto workflow.
 
@@ -65,6 +210,18 @@ def validate_current_structure(
     ]
     eligible.sort(key=lambda source: source.capture_end, reverse=True)
     if not eligible:
+        if solar_reference is not None:
+            return _solar_model_validation(
+                footprint,
+                lidar,
+                solar_reference,
+                reconstructed_geometry,
+                maximum_current_imagery_age_years=maximum_current_imagery_age_years,
+                maximum_area_variance_percent=maximum_area_variance_percent,
+                maximum_pitch_variance_degrees=maximum_pitch_variance_degrees,
+                current_lidar_max_age_years=current_lidar_max_age_years,
+                allow_historical_verified_pricing=allow_historical_verified_pricing,
+            )
         return {
             "verificationStatus": "INSPECTION_REQUIRED",
             "pricingAllowed": False,
