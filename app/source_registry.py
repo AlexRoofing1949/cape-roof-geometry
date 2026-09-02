@@ -108,6 +108,9 @@ class ImagerySource:
     commercial_estimate_use_allowed: bool
     enabled: bool
     evidence_file: Path | None
+    evidence_kind: str
+    evidence_endpoint: str
+    imagery_endpoint: str
     attribution: str
 
 
@@ -203,6 +206,14 @@ def load_registries(lidar_path: Path, imagery_path: Path) -> RegistryBundle:
             raise ConfigurationError("REGISTRY_COUNTY_INVALID", f"{source_id} contains an unsupported county.")
         evidence_text = str(raw.get("evidence_file") or "").strip()
         evidence_file = (imagery_path.parent / evidence_text).resolve() if evidence_text else None
+        evidence_endpoint = str(raw.get("evidence_endpoint") or "").strip()
+        imagery_endpoint = str(raw.get("imagery_endpoint") or "").strip()
+        if (evidence_endpoint and not evidence_endpoint.startswith("https://")) or (
+            imagery_endpoint and not imagery_endpoint.startswith("https://")
+        ):
+            raise ConfigurationError(
+                "REGISTRY_ENDPOINT_INVALID", f"{source_id} imagery evidence endpoints must use HTTPS."
+            )
         imagery_sources.append(
             ImagerySource(
                 id=source_id,
@@ -214,6 +225,9 @@ def load_registries(lidar_path: Path, imagery_path: Path) -> RegistryBundle:
                 commercial_estimate_use_allowed=bool(raw.get("commercial_estimate_use_allowed")),
                 enabled=bool(raw.get("enabled")),
                 evidence_file=evidence_file,
+                evidence_kind=str(raw.get("evidence_kind") or "immutable_file").strip(),
+                evidence_endpoint=evidence_endpoint,
+                imagery_endpoint=imagery_endpoint,
                 attribution=str(raw.get("attribution") or "").strip(),
             )
         )

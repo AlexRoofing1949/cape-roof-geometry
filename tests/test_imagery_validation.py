@@ -1,10 +1,17 @@
+import io
+import json
 import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, mapping
 
-from app.imagery_validation import SQUARE_METERS_TO_SQUARE_FEET, validate_current_structure
+from app.imagery_validation import (
+    SQUARE_METERS_TO_SQUARE_FEET,
+    _arcgis_building_validation,
+    validate_current_structure,
+)
 from app.providers import transform_geometry, utm_epsg
 
 
@@ -90,6 +97,47 @@ class SolarBuildingModelValidationTests(unittest.TestCase):
         self.assertFalse(result["pricingAllowed"])
         self.assertEqual(result["status"], "CURRENT_IMAGERY_INSUFFICIENT")
         self.assertIn("IMAGERY_TOO_OLD_FOR_CURRENT_VALIDATION", result["warnings"])
+
+    @patch("app.imagery_validation.urllib.request.urlopen")
+    def test_official_current_building_footprint_can_verify_unchanged_structure(self, urlopen):
+        payload = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "OBJECTID": 75249,
+                        "BldgDataSource": "LeePA Building Footprints",
+                        "last_edited_date": int(datetime.now(timezone.utc).timestamp() * 1000),
+                    },
+                    "geometry": mapping(self.geometry_wgs84),
+                }
+            ],
+        }
+        urlopen.return_value = io.BytesIO(json.dumps(payload).encode("utf-8"))
+        source = SimpleNamespace(
+            id="lee_county_2025_building_evidence",
+            evidence_endpoint="https://example.invalid/query",
+            imagery_endpoint="https://example.invalid/imagery",
+            capture_start=self.lidar_date,
+            capture_end=self.imagery_date,
+            gsd_meters=0.0762,
+            license="LEE_COUNTY_PUBLIC_INFORMATION_RESOURCE",
+            attribution="Eagle View, Lee County Property Appraiser, Lee County GIS",
+        )
+        result = _arcgis_building_validation(
+            self.footprint,
+            self.lidar,
+            source,
+            provider_timeout_seconds=5,
+            maximum_current_imagery_age_years=2,
+            current_lidar_max_age_years=2,
+            allow_historical_verified_pricing=True,
+        )
+        self.assertEqual(result["verificationStatus"], "VERIFIED_HISTORICAL_UNCHANGED")
+        self.assertTrue(result["pricingAllowed"])
+        self.assertEqual(result["currentImagery"]["validation"], "PASSED")
+        self.assertEqual(result["currentImagery"]["providerFeatureId"], "75249")
 
 
 if __name__ == "__main__":

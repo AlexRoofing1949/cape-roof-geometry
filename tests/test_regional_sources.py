@@ -158,6 +158,35 @@ class RegionalSourceTests(unittest.TestCase):
         self.assertTrue(any(item["sourceId"] == "lcmcd_lee_2026" for item in audit))
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers.resolve_service_county", return_value="Lee")
+    @patch("app.providers._catalog_features")
+    @patch("app.providers._ept_coverage")
+    def test_lee_includes_exact_southwest_2018_catalog_project(
+        self, ept_coverage, catalog, _county
+    ):
+        ept_coverage.return_value = (
+            Polygon([(-83, 25), (-80, 25), (-80, 28), (-83, 28)]),
+            1_000_000,
+        )
+        catalog.return_value = iter(
+            [
+                {
+                    "type": "Feature",
+                    "geometry": mapping(Polygon([(-83, 25), (-80, 25), (-80, 28), (-83, 28)])),
+                    "properties": {
+                        "name": "USGS_LPC_FL_Southwest_A_2018_LAS_2019",
+                        "url": "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/USGS_LPC_FL_Southwest_A_2018_LAS_2019/ept.json",
+                        "count": 500000,
+                    },
+                }
+            ]
+        )
+        _, candidates, _ = select_regional_lidar(
+            footprint(), -81.9509, 26.6211, settings(), self.registries
+        )
+        self.assertIn("usgs_florida_peninsular_2018_2020", [item.source_id for item in candidates])
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.resolve_service_county", return_value="Manatee")
     @patch("app.providers._catalog_features")
     def test_manatee_uses_registered_2025_project_date(self, catalog, _county):

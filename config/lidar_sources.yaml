@@ -82,6 +82,7 @@ sources:
     access: usgs_tnm
     endpoint: null
     catalog_name_patterns:
+      - "(?i)^USGS_LPC_FL_Southwest_A_2018_LAS_2019$"
       - "(?i)(fl[_ -]?peninsular|florida.*peninsular|southwest.*florida).*(2018|2019|2020)"
       - "(?i)(2018|2019|2020).*(fl[_ -]?peninsular|florida.*peninsular|southwest.*florida)"
     data_kind: classified_point_cloud

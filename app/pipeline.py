@@ -465,6 +465,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
             reconstructed_geometry=geometry,
             maximum_area_variance_percent=settings.maximum_solar_area_variance_percent,
             maximum_pitch_variance_degrees=settings.maximum_solar_pitch_variance_degrees,
+            provider_timeout_seconds=settings.provider_timeout_seconds,
         )
 
         lidar_component = "NOAA/DigitalCoast" if "NOAA" in lidar.provider.upper() else "USGS/3DEP"

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -31,6 +34,162 @@ def _distance_and_change(reference, current) -> tuple[float, float, float]:
 def _year_age(value: date) -> int:
     today = datetime.now(timezone.utc).date()
     return max(0, today.year - value.year - ((today.month, today.day) < (value.month, value.day)))
+
+
+def _historical_verification_outcome(
+    current_imagery: dict[str, Any],
+    lidar: LidarResource,
+    *,
+    current_lidar_max_age_years: int,
+    allow_historical_verified_pricing: bool,
+    warning: str,
+) -> dict[str, Any]:
+    if lidar.age_years <= current_lidar_max_age_years:
+        verification_status = "VERIFIED_CURRENT"
+        pricing_allowed = True
+    else:
+        verification_status = "VERIFIED_HISTORICAL_UNCHANGED"
+        pricing_allowed = allow_historical_verified_pricing
+    return {
+        "verificationStatus": verification_status,
+        "pricingAllowed": pricing_allowed,
+        "status": "GEOMETRY_VERIFIED" if pricing_allowed else "HISTORICAL_PRICING_CALIBRATION_HOLD",
+        "holdReason": "" if pricing_allowed else "HISTORICAL_PRICING_DISABLED_DURING_CALIBRATION",
+        "currentImagery": current_imagery,
+        "warnings": [] if pricing_allowed else [warning],
+    }
+
+
+def _arcgis_building_validation(
+    footprint: FootprintResult,
+    lidar: LidarResource,
+    source: Any,
+    *,
+    provider_timeout_seconds: int,
+    maximum_current_imagery_age_years: int,
+    current_lidar_max_age_years: int,
+    allow_historical_verified_pricing: bool,
+) -> dict[str, Any]:
+    min_x, min_y, max_x, max_y = footprint.geometry_wgs84.bounds
+    query = urllib.parse.urlencode(
+        {
+            "where": "1=1",
+            "geometry": f"{min_x},{min_y},{max_x},{max_y}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "OBJECTID,BldgDataSource,ModifyDate,last_edited_date",
+            "returnGeometry": "true",
+            "outSR": "4326",
+            "f": "geojson",
+        }
+    )
+    request = urllib.request.Request(
+        f"{source.evidence_endpoint}?{query}", headers={"User-Agent": "CapeRoofGeometry/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=provider_timeout_seconds) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return {
+            "verificationStatus": "INSPECTION_REQUIRED",
+            "pricingAllowed": False,
+            "status": "CURRENT_IMAGERY_INSUFFICIENT",
+            "holdReason": "CURRENT_BUILDING_EVIDENCE_UNAVAILABLE",
+            "currentImagery": {
+                "sourceId": source.id,
+                "captureDate": source.capture_end.isoformat(),
+                "validation": "FAILED",
+            },
+            "warnings": ["CURRENT_BUILDING_EVIDENCE_UNAVAILABLE"],
+        }
+
+    matches: list[tuple[float, float, float, dict[str, Any]]] = []
+    for feature in payload.get("features") or []:
+        try:
+            current = shape(feature.get("geometry"))
+            if current.is_empty or not current.is_valid:
+                continue
+            iou, shift, area_change = _distance_and_change(footprint.geometry_wgs84, current)
+            matches.append((iou, shift, area_change, feature.get("properties") or {}))
+        except Exception:
+            continue
+    matches.sort(key=lambda item: (item[0], -item[1], -item[2]), reverse=True)
+    if not matches:
+        return {
+            "verificationStatus": "INSPECTION_REQUIRED",
+            "pricingAllowed": False,
+            "status": "STRUCTURE_CHANGED_AFTER_LIDAR",
+            "holdReason": "CURRENT_BUILDING_FOOTPRINT_MISSING",
+            "currentImagery": {
+                "sourceId": source.id,
+                "captureDate": source.capture_end.isoformat(),
+                "validation": "FAILED",
+            },
+            "warnings": ["CURRENT_BUILDING_FOOTPRINT_MISSING"],
+        }
+
+    iou, centroid_shift, area_change, properties = matches[0]
+    failures: list[str] = []
+    lidar_reference_date = date.fromisoformat(lidar.tile_acquisition_date or lidar.acquired_end)
+    if source.capture_end <= lidar_reference_date:
+        failures.append("IMAGERY_NOT_NEWER_THAN_LIDAR")
+    if _year_age(source.capture_end) > maximum_current_imagery_age_years:
+        failures.append("IMAGERY_TOO_OLD_FOR_CURRENT_VALIDATION")
+    if source.gsd_meters <= 0 or source.gsd_meters > 0.15:
+        failures.append("IMAGERY_GSD_INSUFFICIENT")
+    if iou < 0.85:
+        failures.append("FOOTPRINT_IOU_FAILED")
+    if centroid_shift > 2.0:
+        failures.append("FOOTPRINT_CENTROID_SHIFTED")
+    if area_change > 10.0:
+        failures.append("FOOTPRINT_AREA_CHANGED")
+
+    updated_millis = properties.get("last_edited_date") or properties.get("ModifyDate")
+    try:
+        evidence_updated = datetime.fromtimestamp(float(updated_millis) / 1000, tz=timezone.utc).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        evidence_updated = ""
+    current_imagery = {
+        "sourceId": source.id,
+        "captureDate": source.capture_end.isoformat(),
+        "captureDatePrecision": "PROJECT_WINDOW_END",
+        "captureStart": source.capture_start.isoformat(),
+        "gsdMeters": source.gsd_meters,
+        "license": source.license,
+        "attribution": source.attribution,
+        "imageryEndpoint": source.imagery_endpoint,
+        "evidenceEndpoint": source.evidence_endpoint,
+        "providerFeatureId": str(properties.get("OBJECTID") or ""),
+        "providerBuildingSource": str(properties.get("BldgDataSource") or ""),
+        "evidenceUpdatedDate": evidence_updated,
+        "footprintIou": round(iou, 4),
+        "centroidShiftMeters": round(centroid_shift, 3),
+        "areaChangePercent": round(area_change, 3),
+        "validationMethod": "OFFICIAL_BUILDING_FOOTPRINT_FROM_CURRENT_AERIAL_PROGRAM",
+        "validation": "FAILED" if failures else "PASSED",
+    }
+    if failures:
+        changed = any(
+            item in failures
+            for item in ("FOOTPRINT_IOU_FAILED", "FOOTPRINT_CENTROID_SHIFTED", "FOOTPRINT_AREA_CHANGED")
+        )
+        status = "STRUCTURE_CHANGED_AFTER_LIDAR" if changed else "CURRENT_IMAGERY_INSUFFICIENT"
+        return {
+            "verificationStatus": "INSPECTION_REQUIRED",
+            "pricingAllowed": False,
+            "status": status,
+            "holdReason": status,
+            "currentImagery": current_imagery,
+            "warnings": failures,
+        }
+    return _historical_verification_outcome(
+        current_imagery,
+        lidar,
+        current_lidar_max_age_years=current_lidar_max_age_years,
+        allow_historical_verified_pricing=allow_historical_verified_pricing,
+        warning="Historical LiDAR passed official current-building checks but pricing remains disabled.",
+    )
 
 
 def _solar_model_validation(
@@ -147,22 +306,13 @@ def _solar_model_validation(
             "warnings": failures,
         }
 
-    if lidar.age_years <= current_lidar_max_age_years:
-        verification_status = "VERIFIED_CURRENT"
-        pricing_allowed = True
-    else:
-        verification_status = "VERIFIED_HISTORICAL_UNCHANGED"
-        pricing_allowed = allow_historical_verified_pricing
-    return {
-        "verificationStatus": verification_status,
-        "pricingAllowed": pricing_allowed,
-        "status": "GEOMETRY_VERIFIED" if pricing_allowed else "HISTORICAL_PRICING_CALIBRATION_HOLD",
-        "holdReason": "" if pricing_allowed else "HISTORICAL_PRICING_DISABLED_DURING_CALIBRATION",
-        "currentImagery": current_imagery,
-        "warnings": []
-        if pricing_allowed
-        else ["Historical LiDAR passed building-model change checks but pricing remains disabled."],
-    }
+    return _historical_verification_outcome(
+        current_imagery,
+        lidar,
+        current_lidar_max_age_years=current_lidar_max_age_years,
+        allow_historical_verified_pricing=allow_historical_verified_pricing,
+        warning="Historical LiDAR passed building-model change checks but pricing remains disabled.",
+    )
 
 
 def validate_current_structure(
@@ -178,6 +328,7 @@ def validate_current_structure(
     reconstructed_geometry: dict[str, Any] | None = None,
     maximum_area_variance_percent: float = 15,
     maximum_pitch_variance_degrees: float = 10,
+    provider_timeout_seconds: int = 45,
 ) -> dict[str, Any]:
     """Validate immutable evidence created from an authorized orthophoto workflow.
 
@@ -205,8 +356,12 @@ def validate_current_structure(
         and source.commercial_estimate_use_allowed
         and source.license.upper() not in PENDING_LICENSE_MARKERS
         and source.capture_end > lidar_reference_date
-        and source.evidence_file is not None
-        and source.evidence_file.is_file()
+        and (
+            source.evidence_file is not None
+            and source.evidence_file.is_file()
+            or source.evidence_kind == "arcgis_building_footprints"
+            and bool(source.evidence_endpoint)
+        )
     ]
     eligible.sort(key=lambda source: source.capture_end, reverse=True)
     if not eligible:
@@ -232,6 +387,16 @@ def validate_current_structure(
         }
 
     source = eligible[0]
+    if source.evidence_kind == "arcgis_building_footprints":
+        return _arcgis_building_validation(
+            footprint,
+            lidar,
+            source,
+            provider_timeout_seconds=provider_timeout_seconds,
+            maximum_current_imagery_age_years=maximum_current_imagery_age_years,
+            current_lidar_max_age_years=current_lidar_max_age_years,
+            allow_historical_verified_pricing=allow_historical_verified_pricing,
+        )
     try:
         payload = json.loads(source.evidence_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):

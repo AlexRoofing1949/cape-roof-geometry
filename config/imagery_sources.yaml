@@ -1,5 +1,19 @@
 schema_version: "1.0"
 sources:
+  - id: lee_county_2025_building_evidence
+    counties: [Lee]
+    capture_start: "2025-01-01"
+    capture_end: "2025-03-11"
+    gsd_meters: 0.0762
+    license: LEE_COUNTY_PUBLIC_INFORMATION_RESOURCE
+    commercial_estimate_use_allowed: true
+    enabled: true
+    evidence_kind: arcgis_building_footprints
+    evidence_endpoint: https://gismapserver.leegov.com/gisserver910/rest/services/DataExplorer/LandRecords/MapServer/8/query
+    imagery_endpoint: https://gisimageserver.leegov.com/imageserver/rest/services/Aerials/Aerials2025/ImageServer
+    evidence_file: null
+    attribution: Eagle View, Lee County Property Appraiser, Lee County GIS
+
   # Sources must stay disabled until Cape Coral Roofing records a machine-readable
   # orthophoto endpoint, exact capture dates, license/reuse terms and a calibrated
   # structure-change evidence file. Map viewers are not scraped by this service.

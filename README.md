@@ -73,6 +73,15 @@ approximate, and emits the required `Includes data from Google Maps`
 attribution. Any missing, stale, low-quality, or materially changed evidence
 returns `INSPECTION_REQUIRED` and cannot authorize pricing.
 
+Lee County uses the county's public 2025 aerial program (Eagle View imagery,
+January 1 through March 11, 2025, 3-inch resolution) together with the official
+machine-readable Building Footprints layer. The service queries only the
+building polygon around the requested property, compares it with the pinned
+Overture/LiDAR footprint, records the county feature ID and evidence update
+date, and retains the county/Eagle View attribution. It does not store or
+redistribute image pixels. Missing evidence or a material footprint change
+fails closed.
+
 The service loads `config/lidar_sources.yaml` and `config/imagery_sources.yaml` at startup and exposes their combined SHA-256 as `registryVersion`. A registry validation failure keeps `/healthz` in `not_ready`. Dataset years are never parsed from catalog filenames.
 
 Container hosting, DNS control, and the public GitHub push are account-level operations. They cannot be represented as completed until an owner-authorized host and repository are connected.
