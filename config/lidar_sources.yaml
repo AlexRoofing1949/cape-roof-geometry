@@ -87,8 +87,10 @@ sources:
       - "(?i)(2018|2019|2020).*(fl[_ -]?peninsular|florida.*peninsular|southwest.*florida)"
     data_kind: classified_point_cloud
     minimum_density_ppsm: 8.0
-    allowed_classes: [2, 6]
-    roof_classes: [6]
+    # The exact USGS Southwest A 2018 EPT crop is not building-classified:
+    # elevated rooftop surface returns are LAS class 1, while class 2 is ground.
+    allowed_classes: [1, 2, 6]
+    roof_classes: [1, 6]
     provider: USGS 3DEP
     license: US-GOVERNMENT-PUBLIC-DOMAIN
     metadata_url: https://www.fisheries.noaa.gov/inport/item/75872

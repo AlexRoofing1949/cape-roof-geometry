@@ -55,6 +55,8 @@ class RegionalSourceTests(unittest.TestCase):
         self.assertEqual(by_id["lcmcd_lee_2026"].license, "PENDING_AGENCY_CONFIRMATION")
         self.assertIn(1, by_id["noaa_pre_ian_2022"].allowed_classes)
         self.assertIn(1, by_id["noaa_post_ian_2022"].roof_classes)
+        self.assertIn(1, by_id["usgs_florida_peninsular_2018_2020"].allowed_classes)
+        self.assertIn(1, by_id["usgs_florida_peninsular_2018_2020"].roof_classes)
         self.assertEqual(by_id["usgs_manatee_b25_2025"].acquired_end.isoformat(), "2025-04-02")
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
