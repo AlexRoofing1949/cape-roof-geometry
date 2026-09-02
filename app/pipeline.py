@@ -333,19 +333,26 @@ def _combined_confidence(
     lidar_age_years: int,
     reconciliation_confidence: float,
     settings: Settings,
+    *,
+    current_structure_validated: bool = False,
 ) -> tuple[float, dict[str, float]]:
+    lidar_age_component = max(0.0, 1 - lidar_age_years / max(settings.maximum_lidar_age_years, 1))
     components = {
         "rooferQuality": max(0.0, min(1.0, geometry_confidence)),
         "footprintMatch": max(
             0.0, 1 - footprint_distance_meters / max(settings.footprint_max_distance_meters, 0.01)
         ),
-        "lidarAge": max(0.0, 1 - lidar_age_years / max(settings.maximum_lidar_age_years, 1)),
+        "lidarAge": lidar_age_component,
+        # Historical geometry is not trusted merely because it exists. A
+        # registered, newer current-structure comparison must pass before the
+        # temporal component can receive full credit.
+        "temporalVerification": 1.0 if current_structure_validated else lidar_age_component,
         "solarReconciliation": max(0.0, min(1.0, reconciliation_confidence)),
     }
     score = (
         components["rooferQuality"] * 0.55
         + components["footprintMatch"] * 0.10
-        + components["lidarAge"] * 0.10
+        + components["temporalVerification"] * 0.10
         + components["solarReconciliation"] * 0.25
     )
     return round(score, 3), {key: round(value, 3) for key, value in components.items()}
@@ -371,7 +378,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
             footprint, request.requestId, workspace, longitude, latitude, settings
         )
         attempts: list[dict[str, Any]] = []
-        selected: tuple[LidarResource, dict[str, Any], float, dict[str, Any]] | None = None
+        selected: tuple[LidarResource, dict[str, Any], float, dict[str, Any], dict[str, Any]] | None = None
         for candidate_index, candidate in enumerate(lidar_candidates):
             lidar = candidate
             pointcloud = workspace / f"roof-points-{candidate_index}.laz"
@@ -422,12 +429,32 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 )
                 reconciliation = _solar_reconciliation(geometry, request, settings)
                 _validate_selected_roof_type(geometry, request)
+                imagery_decision = validate_current_structure(
+                    footprint,
+                    lidar,
+                    county,
+                    registries,
+                    current_lidar_max_age_years=settings.current_lidar_max_age_years,
+                    maximum_current_imagery_age_years=settings.maximum_current_imagery_age_years,
+                    allow_historical_verified_pricing=settings.allow_historical_verified_pricing,
+                    solar_reference=request.solarReference,
+                    reconstructed_geometry=geometry,
+                    maximum_area_variance_percent=settings.maximum_solar_area_variance_percent,
+                    maximum_pitch_variance_degrees=settings.maximum_solar_pitch_variance_degrees,
+                    provider_timeout_seconds=settings.provider_timeout_seconds,
+                )
+                current_structure_validated = (
+                    imagery_decision.get("verificationStatus")
+                    in {"VERIFIED_CURRENT", "VERIFIED_HISTORICAL_UNCHANGED"}
+                    and (imagery_decision.get("currentImagery") or {}).get("validation") == "PASSED"
+                )
                 confidence, confidence_components = _combined_confidence(
                     float(geometry["confidence"]),
                     footprint.distance_meters,
                     lidar.age_years,
                     reconciliation["confidence"],
                     settings,
+                    current_structure_validated=current_structure_validated,
                 )
                 if confidence < settings.minimum_service_confidence:
                     raise UnreliableGeometryError(
@@ -438,7 +465,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 geometry["confidence"] = confidence
                 geometry["confidenceComponents"] = confidence_components
                 geometry["reconciliation"] = reconciliation
-                selected = (lidar, point_audit, point_density, geometry)
+                selected = (lidar, point_audit, point_density, geometry, imagery_decision)
                 attempts.append({"sourceId": lidar.source_id, "decision": "SELECTED_VALID_CROP"})
                 break
             except UnreliableGeometryError as error:
@@ -464,21 +491,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 "No registered LiDAR candidate produced reliable roof geometry for this property.",
                 details={"selectionAttempts": attempts},
             )
-        lidar, point_audit, point_density, geometry = selected
-        imagery_decision = validate_current_structure(
-            footprint,
-            lidar,
-            county,
-            registries,
-            current_lidar_max_age_years=settings.current_lidar_max_age_years,
-            maximum_current_imagery_age_years=settings.maximum_current_imagery_age_years,
-            allow_historical_verified_pricing=settings.allow_historical_verified_pricing,
-            solar_reference=request.solarReference,
-            reconstructed_geometry=geometry,
-            maximum_area_variance_percent=settings.maximum_solar_area_variance_percent,
-            maximum_pitch_variance_degrees=settings.maximum_solar_pitch_variance_degrees,
-            provider_timeout_seconds=settings.provider_timeout_seconds,
-        )
+        lidar, point_audit, point_density, geometry, imagery_decision = selected
 
         lidar_component = "NOAA/DigitalCoast" if "NOAA" in lidar.provider.upper() else "USGS/3DEP"
         lidar_license_text = (
