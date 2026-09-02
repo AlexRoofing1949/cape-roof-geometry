@@ -47,6 +47,7 @@ class FootprintResult:
     attribution: str = "Overture Maps Foundation and source contributors"
     consensus_status: str = "SINGLE_SOURCE"
     consensus_records: tuple[dict[str, Any], ...] = ()
+    lineage_group: str = "OPEN_MAP_FAMILY"
 
 
 @dataclass(frozen=True)
@@ -190,14 +191,28 @@ def _select_footprint_feature(
     )
 
 
-def _footprint_iou(first: BaseGeometry, second: BaseGeometry) -> float:
+def _footprint_comparison(first: BaseGeometry, second: BaseGeometry) -> dict[str, float]:
     longitude = float(first.centroid.x)
     latitude = float(first.centroid.y)
     epsg = utm_epsg(longitude, latitude)
     projected_first = transform_geometry(first, "EPSG:4326", f"EPSG:{epsg}")
     projected_second = transform_geometry(second, "EPSG:4326", f"EPSG:{epsg}")
+    first_area = float(projected_first.area)
+    second_area = float(projected_second.area)
     union_area = projected_first.union(projected_second).area
-    return 0.0 if union_area <= 0 else float(projected_first.intersection(projected_second).area / union_area)
+    iou = 0.0 if union_area <= 0 else float(projected_first.intersection(projected_second).area / union_area)
+    area_difference = abs(first_area - second_area) / max(first_area, second_area, 0.01) * 100
+    return {
+        "intersectionOverUnion": iou,
+        "centroidSeparationMeters": float(projected_first.centroid.distance(projected_second.centroid)),
+        "areaDifferencePercent": area_difference,
+    }
+
+
+def _footprint_iou(first: BaseGeometry, second: BaseGeometry) -> float:
+    """Backward-compatible scalar used by the imagery validator and tests."""
+
+    return _footprint_comparison(first, second)["intersectionOverUnion"]
 
 
 def _current_overture_release(settings: Settings) -> str:
@@ -444,7 +459,7 @@ def fetch_county_footprint(
         raise TransientProviderError(
             "COUNTY_FOOTPRINT_UNAVAILABLE", "The county building-footprint service is unavailable."
         ) from error
-    return _select_footprint_feature(
+    result = _select_footprint_feature(
         list(payload.get("features") or []),
         longitude,
         latitude,
@@ -454,6 +469,7 @@ def fetch_county_footprint(
         license_name=str(source["license"]),
         attribution=str(source["attribution"]),
     )
+    return replace(result, lineage_group="COUNTY_AUTHORITATIVE")
 
 
 def fetch_osm_footprint(
@@ -469,21 +485,39 @@ def fetch_osm_footprint(
         f"[out:json][timeout:{max(10, settings.provider_timeout_seconds - 5)}];"
         f"way[\"building\"]({south},{west},{north},{east});out geom meta;"
     )
-    request = urllib.request.Request(
-        settings.osm_overpass_url,
-        data=urllib.parse.urlencode({"data": query}).encode("utf-8"),
-        headers={
-            "User-Agent": "CapeRoofGeometry/1.0 (https://github.com/AlexRoofing1949/cape-roof-geometry)",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=settings.provider_timeout_seconds) as response:
-            payload = json.load(response)
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-        raise TransientProviderError(
-            "OSM_OVERPASS_UNAVAILABLE", "The OpenStreetMap footprint service is unavailable."
-        ) from error
+    digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:24]
+    cache = settings.work_root / f"osm-footprints-{digest}.json"
+    payload: dict[str, Any]
+    if cache.exists() and time.time() - cache.stat().st_mtime <= settings.osm_cache_seconds:
+        try:
+            payload = json.loads(cache.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cache.unlink(missing_ok=True)
+            payload = {}
+    else:
+        payload = {}
+    if not payload:
+        request = urllib.request.Request(
+            settings.osm_overpass_url,
+            data=urllib.parse.urlencode({"data": query}).encode("utf-8"),
+            headers={
+                "User-Agent": "CapeRoofGeometry/1.0 (https://github.com/AlexRoofing1949/cape-roof-geometry)",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=settings.provider_timeout_seconds) as response:
+                payload = json.load(response)
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            raise TransientProviderError(
+                "OSM_OVERPASS_UNAVAILABLE", "The OpenStreetMap footprint service is unavailable."
+            ) from error
+        temporary = cache.with_suffix(".download")
+        try:
+            temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            os.replace(temporary, cache)
+        except OSError:
+            temporary.unlink(missing_ok=True)
     features: list[dict[str, Any]] = []
     for element in payload.get("elements") or []:
         vertices = element.get("geometry") if isinstance(element, dict) else None
@@ -541,7 +575,13 @@ def fetch_best_footprint(
         try:
             primary = provider(longitude, latitude, workspace, settings)
             selected_index = index
-            audit.append({"provider": primary.provider, "decision": "SELECTED"})
+            audit.append(
+                {
+                    "provider": primary.provider,
+                    "lineageGroup": primary.lineage_group,
+                    "decision": "SELECTED",
+                }
+            )
             break
         except UnreliableGeometryError:
             raise
@@ -566,6 +606,7 @@ def fetch_best_footprint(
     corroborators = list(providers[selected_index + 1 :])
     if selected_index == 0:
         corroborators = [fetch_county_footprint, fetch_osm_footprint]
+    correlated_support = False
     for provider in corroborators:
         provider_name = getattr(provider, "__name__", provider.__class__.__name__)
         try:
@@ -579,27 +620,69 @@ def fetch_best_footprint(
                 }
             )
             continue
-        iou = _footprint_iou(primary.geometry_wgs84, secondary.geometry_wgs84)
+        comparison = _footprint_comparison(primary.geometry_wgs84, secondary.geometry_wgs84)
+        independent = primary.lineage_group != secondary.lineage_group
         record = {
             "provider": secondary.provider,
             "id": secondary.overture_id,
             "release": secondary.overture_release,
-            "intersectionOverUnion": round(iou, 4),
+            "lineageGroup": secondary.lineage_group,
+            "independent": independent,
+            "intersectionOverUnion": round(comparison["intersectionOverUnion"], 4),
+            "centroidSeparationMeters": round(comparison["centroidSeparationMeters"], 3),
+            "areaDifferencePercent": round(comparison["areaDifferencePercent"], 3),
         }
-        audit.append({**record, "decision": "CORROBORATED" if iou >= settings.footprint_consensus_min_iou else "CONFLICT"})
-        if iou < settings.footprint_consensus_min_iou:
+        if not independent:
+            correlated_passed = (
+                comparison["intersectionOverUnion"] >= settings.footprint_correlated_min_iou
+                and comparison["areaDifferencePercent"] <= settings.footprint_review_area_difference_percent
+            )
+            audit.append(
+                {
+                    **record,
+                    "decision": "CORRELATED_SUPPORT_ONLY" if correlated_passed else "CORRELATED_CONFLICT",
+                }
+            )
+            if not correlated_passed:
+                raise UnreliableGeometryError(
+                    "FOOTPRINT_PROVIDER_CONFLICT",
+                    "Related open-map building sources materially disagree for this property.",
+                    details={
+                        "primaryProvider": primary.provider,
+                        "secondaryProvider": secondary.provider,
+                        **{key: round(value, 4) for key, value in comparison.items()},
+                    },
+                )
+            correlated_support = True
+            continue
+
+        independent_passed = (
+            comparison["intersectionOverUnion"] >= settings.footprint_consensus_min_iou
+            and comparison["centroidSeparationMeters"]
+            <= settings.footprint_maximum_centroid_separation_meters
+            and comparison["areaDifferencePercent"]
+            <= settings.footprint_maximum_area_difference_percent
+        )
+        audit.append({**record, "decision": "CORROBORATED" if independent_passed else "CONFLICT"})
+        if not independent_passed:
             raise UnreliableGeometryError(
                 "FOOTPRINT_PROVIDER_CONFLICT",
                 "Independent building-footprint providers materially disagree for this property.",
                 details={
                     "primaryProvider": primary.provider,
                     "secondaryProvider": secondary.provider,
-                    "intersectionOverUnion": round(iou, 4),
+                    **{key: round(value, 4) for key, value in comparison.items()},
                     "minimumIntersectionOverUnion": settings.footprint_consensus_min_iou,
+                    "maximumCentroidSeparationMeters": settings.footprint_maximum_centroid_separation_meters,
+                    "maximumAreaDifferencePercent": settings.footprint_maximum_area_difference_percent,
                 },
             )
         return replace(primary, consensus_status="CORROBORATED", consensus_records=tuple(audit))
-    return replace(primary, consensus_records=tuple(audit))
+    return replace(
+        primary,
+        consensus_status="CORRELATED_SUPPORT_ONLY" if correlated_support else "SINGLE_SOURCE",
+        consensus_records=tuple(audit),
+    )
 
 
 def write_footprint_inputs(

@@ -42,6 +42,7 @@ class Settings:
     microsoft_bfp_maximum_tile_bytes: int
     osm_footprint_enabled: bool
     osm_overpass_url: str
+    osm_cache_seconds: int
     lee_county_footprint_url: str
     usgs_catalog_url: str
     county_boundaries_url: str
@@ -56,6 +57,10 @@ class Settings:
     footprint_max_distance_meters: float
     footprint_ambiguity_meters: float
     footprint_consensus_min_iou: float
+    footprint_correlated_min_iou: float
+    footprint_maximum_centroid_separation_meters: float
+    footprint_maximum_area_difference_percent: float
+    footprint_review_area_difference_percent: float
     minimum_roof_hag_meters: float
     maximum_roof_hag_meters: float
     roof_cluster_tolerance_meters: float
@@ -116,6 +121,7 @@ class Settings:
             osm_overpass_url=os.getenv(
                 "OSM_OVERPASS_URL", "https://overpass-api.de/api/interpreter"
             ).strip(),
+            osm_cache_seconds=_int("OSM_CACHE_SECONDS", 604800),
             lee_county_footprint_url=os.getenv(
                 "LEE_COUNTY_FOOTPRINT_URL",
                 "https://gismapserver.leegov.com/gisserver910/rest/services/DataExplorer/LandRecords/MapServer/8/query",
@@ -141,7 +147,17 @@ class Settings:
             footprint_search_radius_meters=_float("FOOTPRINT_SEARCH_RADIUS_METERS", 45),
             footprint_max_distance_meters=_float("FOOTPRINT_MAX_DISTANCE_METERS", 20),
             footprint_ambiguity_meters=_float("FOOTPRINT_AMBIGUITY_METERS", 2),
-            footprint_consensus_min_iou=_float("FOOTPRINT_CONSENSUS_MIN_IOU", 0.70),
+            footprint_consensus_min_iou=_float("FOOTPRINT_CONSENSUS_MIN_IOU", 0.80),
+            footprint_correlated_min_iou=_float("FOOTPRINT_CORRELATED_MIN_IOU", 0.70),
+            footprint_maximum_centroid_separation_meters=_float(
+                "FOOTPRINT_MAXIMUM_CENTROID_SEPARATION_METERS", 2.0
+            ),
+            footprint_maximum_area_difference_percent=_float(
+                "FOOTPRINT_MAXIMUM_AREA_DIFFERENCE_PERCENT", 10.0
+            ),
+            footprint_review_area_difference_percent=_float(
+                "FOOTPRINT_REVIEW_AREA_DIFFERENCE_PERCENT", 20.0
+            ),
             minimum_roof_hag_meters=_float("MINIMUM_ROOF_HAG_METERS", 1.5),
             maximum_roof_hag_meters=_float("MAXIMUM_ROOF_HAG_METERS", 25.0),
             roof_cluster_tolerance_meters=_float("ROOF_CLUSTER_TOLERANCE_METERS", 1.5),
@@ -217,10 +233,29 @@ class Settings:
                 "MICROSOFT_BFP_CONFIG_INVALID",
                 "Microsoft footprint tiles must use the published zoom and a safe download limit.",
             )
-        if not 0.60 <= self.footprint_consensus_min_iou <= 0.95:
+        if not 0.80 <= self.footprint_consensus_min_iou <= 0.95:
             raise ConfigurationError(
                 "FOOTPRINT_CONSENSUS_INVALID",
-                "FOOTPRINT_CONSENSUS_MIN_IOU must be between 0.60 and 0.95.",
+                "FOOTPRINT_CONSENSUS_MIN_IOU must be between 0.80 and 0.95.",
+            )
+        if not 0.60 <= self.footprint_correlated_min_iou < self.footprint_consensus_min_iou:
+            raise ConfigurationError(
+                "FOOTPRINT_CORRELATION_INVALID",
+                "The correlated-source threshold must be below the independent consensus threshold.",
+            )
+        if not (
+            0 < self.footprint_maximum_centroid_separation_meters <= 5
+            and 0 < self.footprint_maximum_area_difference_percent <= 15
+            and self.footprint_maximum_area_difference_percent
+            < self.footprint_review_area_difference_percent
+            <= 25
+        ):
+            raise ConfigurationError(
+                "FOOTPRINT_COMPARISON_INVALID", "The footprint agreement thresholds are unsafe."
+            )
+        if not 3600 <= self.osm_cache_seconds <= 2_592_000:
+            raise ConfigurationError(
+                "OSM_CACHE_INVALID", "OSM_CACHE_SECONDS must be between one hour and 30 days."
             )
         if not 0.5 <= self.minimum_roof_hag_meters < self.maximum_roof_hag_meters <= 40:
             raise ConfigurationError(

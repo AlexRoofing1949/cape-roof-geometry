@@ -118,13 +118,20 @@ sources:
             "Lee County Building Footprints",
             "LEE-COUNTY-PUBLIC-GIS",
             "Lee County Property Appraiser and Lee County GIS",
+            lineage_group="COUNTY_AUTHORITATIVE",
         )
-        configured = SimpleNamespace(footprint_consensus_min_iou=0.70)
+        configured = SimpleNamespace(
+            footprint_consensus_min_iou=0.80,
+            footprint_correlated_min_iou=0.70,
+            footprint_maximum_centroid_separation_meters=2,
+            footprint_maximum_area_difference_percent=10,
+            footprint_review_area_difference_percent=20,
+        )
         with tempfile.TemporaryDirectory() as directory:
             result = fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
         self.assertEqual(result.provider, "Microsoft GlobalML Building Footprints")
         self.assertEqual(result.consensus_status, "CORROBORATED")
-        self.assertGreaterEqual(result.consensus_records[-1]["intersectionOverUnion"], 0.70)
+        self.assertGreaterEqual(result.consensus_records[-1]["intersectionOverUnion"], 0.80)
         osm.assert_not_called()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
@@ -145,13 +152,50 @@ sources:
             "Lee County Building Footprints",
             "LEE-COUNTY-PUBLIC-GIS",
             "Lee County Property Appraiser and Lee County GIS",
+            lineage_group="COUNTY_AUTHORITATIVE",
         )
-        configured = SimpleNamespace(footprint_consensus_min_iou=0.70)
+        configured = SimpleNamespace(
+            footprint_consensus_min_iou=0.80,
+            footprint_correlated_min_iou=0.70,
+            footprint_maximum_centroid_separation_meters=2,
+            footprint_maximum_area_difference_percent=10,
+            footprint_review_area_difference_percent=20,
+        )
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(
             UnreliableGeometryError
         ) as raised:
             fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
         self.assertEqual(raised.exception.code, "FOOTPRINT_PROVIDER_CONFLICT")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers.fetch_osm_footprint")
+    @patch("app.providers.fetch_county_footprint")
+    @patch("app.providers.fetch_overture_footprint")
+    def test_osm_does_not_independently_corroborate_overture(self, overture, county, osm):
+        geometry = footprint().geometry_wgs84
+        overture.return_value = FootprintResult(geometry, "overture-1", "2026-08-19.0", 0, [])
+        county.side_effect = NoCoverageError("COUNTY_FOOTPRINT_UNAVAILABLE", "missing")
+        osm.return_value = FootprintResult(
+            geometry,
+            "way/1",
+            "live-overpass",
+            0,
+            [],
+            "OpenStreetMap Buildings",
+            "ODbL-1.0",
+            "OpenStreetMap contributors",
+        )
+        configured = SimpleNamespace(
+            footprint_consensus_min_iou=0.80,
+            footprint_correlated_min_iou=0.70,
+            footprint_maximum_centroid_separation_meters=2,
+            footprint_maximum_area_difference_percent=10,
+            footprint_review_area_difference_percent=20,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
+        self.assertEqual(result.consensus_status, "CORRELATED_SUPPORT_ONLY")
+        self.assertFalse(result.consensus_records[-1]["independent"])
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers._require_pinned_overture_release", side_effect=["2026-08-19.0", "2026-08-19.0"])

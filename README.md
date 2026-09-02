@@ -4,7 +4,7 @@ This directory supplies the missing `POST /v1/roof-geometry` service already exp
 
 ## Production stack
 
-1. The footprint resolver first uses the official Overture Maps client against a pinned open Buildings release. If that source has no usable coverage, it falls back in order to the pinned Microsoft GlobalML Building Footprints release, an explicitly authorized Lee County building layer, and OpenStreetMap Overpass. A successful primary polygon is compared with the first available independent source; material disagreement fails closed.
+1. The footprint resolver first uses the official Overture Maps client against a pinned open Buildings release. If that source has no usable coverage, it falls back in order to the pinned Microsoft GlobalML Building Footprints release, an explicitly authorized Lee County building layer, and a cached OpenStreetMap Overpass response. Overture, Microsoft and OSM are one correlated open-map lineage rather than three votes. County/open-map consensus requires IoU at least 0.80, centroid separation no more than 2 m and area difference no more than 10%; material or correlated-source disagreement fails closed.
 2. The service resolves the building against the official Census county layer and the eight-county Southwest Florida registry. It ranks registered Manatee 2025, NOAA pre-/post-Ian 2022, and Florida Peninsular 2018–2020 candidates by exact registered acquisition date and complete buffered-footprint coverage. Lee 2026 remains disabled until its files, footprint and reuse terms are verified.
 3. PDAL streams only the selected buffered property crop. Allowed surface, ground and building classes come from the selected source record, so NOAA class-1 surface returns are not discarded and bathymetric-only/noise classes are not accepted as roof evidence. The enumerated class histogram and exact pipeline are retained in the audit response.
 4. 3DBAG Roofer v1.0.0 reconstructs LoD2.2 roof planes from the classified point cloud and the selected footprint.
@@ -30,6 +30,8 @@ Roofer documents about 10 points/m² as a good input density. This service defau
 - Lee County building footprints: public county GIS layer with Lee County Property Appraiser and Lee County GIS attribution.
 
 This service intentionally does not use RoofMapNet's non-commercial assets, the unlicensed `citygml-roof-segment-labels` repository, or the unlicensed `vinycqueiroz/roof-calculator` code.
+
+SamGeo, MobileSAM, TorchGeo and Open-CD are not production pricing authorities in this revision. They require expressly reusable source pixels plus a versioned Southwest Florida calibration set; running an uncalibrated checkpoint is not accepted as current-roof validation. County building evidence and Google Solar model reconciliation remain the deployed fail-closed paths until those inputs exist.
 
 ## Test locally
 
