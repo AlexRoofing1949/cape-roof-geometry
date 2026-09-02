@@ -31,7 +31,7 @@ Roofer documents about 10 points/m² as a good input density. This service defau
 
 This service intentionally does not use RoofMapNet's non-commercial assets, the unlicensed `citygml-roof-segment-labels` repository, or the unlicensed `vinycqueiroz/roof-calculator` code.
 
-SamGeo, MobileSAM, TorchGeo and Open-CD are not production pricing authorities in this revision. They require expressly reusable source pixels plus a versioned Southwest Florida calibration set; running an uncalibrated checkpoint is not accepted as current-roof validation. County building evidence and Google Solar model reconciliation remain the deployed fail-closed paths until those inputs exist.
+SamGeo, MobileSAM, TorchGeo and Open-CD are not production pricing authorities in this revision. They require expressly reusable source pixels plus a versioned Southwest Florida calibration set; running an uncalibrated checkpoint is not accepted as current-roof validation. Model-produced evidence must record model/checkpoint identity, calibration-dataset version, orthorectification, co-registration, shadow/vegetation masking, polygon IoU, boundary F1, area error, addition/deletion precision and recall, false-change rate and failure rate. Missing or sub-threshold evidence is forced to `INSPECTION_REQUIRED`. County building evidence and Google Solar model reconciliation remain the deployed fail-closed paths until those inputs exist.
 
 ## Test locally
 

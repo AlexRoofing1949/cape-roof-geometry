@@ -17,6 +17,53 @@ from .source_registry import PENDING_LICENSE_MARKERS, RegistryBundle
 
 SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
 
+_CALIBRATION_THRESHOLDS = {
+    "polygonIou": (0.90, "minimum"),
+    "boundaryF1": (0.90, "minimum"),
+    "medianAreaErrorPercent": (5.0, "maximum"),
+    "additionDeletionPrecision": (0.90, "minimum"),
+    "additionDeletionRecall": (0.90, "minimum"),
+    "falseChangeRatePercent": (5.0, "maximum"),
+    "failureRatePercent": (5.0, "maximum"),
+}
+
+
+def _imagery_evidence_calibration_failures(record: dict[str, Any]) -> list[str]:
+    """Reject model-produced imagery evidence that lacks production calibration."""
+
+    failures: list[str] = []
+    identity_fields = {
+        "modelName": "MODEL_NAME",
+        "modelVersion": "MODEL_VERSION",
+        "calibrationDatasetVersion": "DATASET_VERSION",
+    }
+    for field, code in identity_fields.items():
+        if not str(record.get(field) or "").strip():
+            failures.append(f"CALIBRATION_{code}_MISSING")
+    processing_fields = {
+        "orthorectified": "ORTHORECTIFICATION",
+        "coregistered": "COREGISTRATION",
+        "shadowVegetationMasked": "SHADOW_VEGETATION_MASK",
+    }
+    for field, code in processing_fields.items():
+        if record.get(field) is not True:
+            failures.append(f"CALIBRATION_{code}_FAILED")
+
+    metrics = record.get("calibrationMetrics")
+    if not isinstance(metrics, dict):
+        return failures + ["CALIBRATION_METRICS_MISSING"]
+    for name, (threshold, direction) in _CALIBRATION_THRESHOLDS.items():
+        try:
+            value = float(metrics[name])
+        except (KeyError, TypeError, ValueError):
+            failures.append(f"CALIBRATION_{name.upper()}_MISSING")
+            continue
+        if direction == "minimum" and value < threshold:
+            failures.append(f"CALIBRATION_{name.upper()}_BELOW_THRESHOLD")
+        elif direction == "maximum" and value > threshold:
+            failures.append(f"CALIBRATION_{name.upper()}_ABOVE_THRESHOLD")
+    return failures
+
 
 def _distance_and_change(reference, current) -> tuple[float, float, float]:
     longitude = float(reference.centroid.x)
@@ -443,6 +490,7 @@ def validate_current_structure(
         }
 
     failures: list[str] = []
+    failures.extend(_imagery_evidence_calibration_failures(record))
     if capture_date <= lidar_reference_date:
         failures.append("IMAGERY_NOT_NEWER_THAN_LIDAR")
     if source.gsd_meters <= 0 or source.gsd_meters > 0.15:
@@ -466,6 +514,10 @@ def validate_current_structure(
         "gsdMeters": source.gsd_meters,
         "license": source.license,
         "attribution": source.attribution,
+        "modelName": str(record.get("modelName") or ""),
+        "modelVersion": str(record.get("modelVersion") or ""),
+        "calibrationDatasetVersion": str(record.get("calibrationDatasetVersion") or ""),
+        "calibrationMetrics": record.get("calibrationMetrics") or {},
         "footprintIou": round(iou, 4),
         "centroidShiftMeters": round(centroid_shift, 3),
         "areaChangePercent": round(area_change, 3),

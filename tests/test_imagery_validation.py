@@ -10,6 +10,7 @@ from shapely.geometry import Polygon, mapping
 from app.imagery_validation import (
     SQUARE_METERS_TO_SQUARE_FEET,
     _arcgis_building_validation,
+    _imagery_evidence_calibration_failures,
     validate_current_structure,
 )
 from app.providers import transform_geometry, utm_epsg
@@ -138,6 +139,39 @@ class SolarBuildingModelValidationTests(unittest.TestCase):
         self.assertTrue(result["pricingAllowed"])
         self.assertEqual(result["currentImagery"]["validation"], "PASSED")
         self.assertEqual(result["currentImagery"]["providerFeatureId"], "75249")
+
+    def test_uncalibrated_segmentation_evidence_is_rejected(self):
+        failures = _imagery_evidence_calibration_failures(
+            {
+                "modelName": "MobileSAM",
+                "modelVersion": "checkpoint-1",
+                "qualityPassed": True,
+            }
+        )
+        self.assertIn("CALIBRATION_DATASET_VERSION_MISSING", failures)
+        self.assertIn("CALIBRATION_METRICS_MISSING", failures)
+
+    def test_calibrated_segmentation_evidence_meets_contract(self):
+        failures = _imagery_evidence_calibration_failures(
+            {
+                "modelName": "MobileSAM",
+                "modelVersion": "checkpoint-1",
+                "calibrationDatasetVersion": "swfl-roofs-v1",
+                "orthorectified": True,
+                "coregistered": True,
+                "shadowVegetationMasked": True,
+                "calibrationMetrics": {
+                    "polygonIou": 0.94,
+                    "boundaryF1": 0.92,
+                    "medianAreaErrorPercent": 3.1,
+                    "additionDeletionPrecision": 0.93,
+                    "additionDeletionRecall": 0.91,
+                    "falseChangeRatePercent": 2.0,
+                    "failureRatePercent": 3.0,
+                },
+            }
+        )
+        self.assertEqual(failures, [])
 
 
 if __name__ == "__main__":

@@ -206,6 +206,9 @@ def _footprint_comparison(first: BaseGeometry, second: BaseGeometry) -> dict[str
         "intersectionOverUnion": iou,
         "centroidSeparationMeters": float(projected_first.centroid.distance(projected_second.centroid)),
         "areaDifferencePercent": area_difference,
+        "boundaryHausdorffDistanceMeters": float(
+            projected_first.boundary.hausdorff_distance(projected_second.boundary)
+        ),
     }
 
 
@@ -631,6 +634,9 @@ def fetch_best_footprint(
             "intersectionOverUnion": round(comparison["intersectionOverUnion"], 4),
             "centroidSeparationMeters": round(comparison["centroidSeparationMeters"], 3),
             "areaDifferencePercent": round(comparison["areaDifferencePercent"], 3),
+            "boundaryHausdorffDistanceMeters": round(
+                comparison["boundaryHausdorffDistanceMeters"], 3
+            ),
         }
         if not independent:
             correlated_passed = (

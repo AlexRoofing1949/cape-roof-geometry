@@ -132,6 +132,7 @@ sources:
         self.assertEqual(result.provider, "Microsoft GlobalML Building Footprints")
         self.assertEqual(result.consensus_status, "CORROBORATED")
         self.assertGreaterEqual(result.consensus_records[-1]["intersectionOverUnion"], 0.80)
+        self.assertIn("boundaryHausdorffDistanceMeters", result.consensus_records[-1])
         osm.assert_not_called()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
