@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,7 +11,7 @@ from app.source_registry import load_registries
 try:
     from shapely.geometry import Polygon, mapping
 
-    from app.pipeline import _classification_histogram
+    from app.pipeline import _classification_histogram, _exact_gps_acquisition_date
     from app.errors import UnreliableGeometryError
     from app.providers import (
         FootprintResult,
@@ -207,6 +208,35 @@ class RegionalSourceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_classification_histogram(path), {"1": 120, "2": 80, "6": 40})
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    def test_exact_gps_date_is_derived_only_inside_registered_window(self):
+        epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
+        acquired = datetime(2022, 11, 17, 12, 0, tzinfo=timezone.utc)
+        adjusted_gps_seconds = (acquired - epoch).total_seconds() - 1_000_000_000
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "filters.stats": {
+                                "statistic": [
+                                    {
+                                        "name": "GpsTime",
+                                        "minimum": adjusted_gps_seconds,
+                                        "maximum": adjusted_gps_seconds + 3600,
+                                        "average": adjusted_gps_seconds + 1800,
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lidar = SimpleNamespace(acquired_start="2022-11-16", acquired_end="2022-11-18")
+            self.assertEqual(_exact_gps_acquisition_date(path, lidar), "2022-11-17")
 
 
 if __name__ == "__main__":

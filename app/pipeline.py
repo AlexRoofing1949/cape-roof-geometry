@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +74,7 @@ def _pdal_crop(
             },
             {
                 "type": "filters.stats",
-                "dimensions": "Classification",
+                "dimensions": "Classification,GpsTime",
                 "count": "Classification",
             },
             {
@@ -103,6 +105,7 @@ def _pdal_crop(
             "LIDAR_CROP_EMPTY", "The selected regional source did not return usable classified points."
         )
     histogram = _classification_histogram(metadata_path)
+    tile_acquisition_date = _exact_gps_acquisition_date(metadata_path, lidar)
     roof_return_count = sum(histogram.get(str(value), 0) for value in lidar.roof_classes)
     total_count = sum(histogram.values())
     if total_count <= 0 or roof_return_count <= 0:
@@ -117,6 +120,7 @@ def _pdal_crop(
         "roofReturnCount": roof_return_count,
         "allowedClasses": list(lidar.allowed_classes),
         "roofClasses": list(lidar.roof_classes),
+        "tileAcquisitionDate": tile_acquisition_date,
         "pipeline": pipeline,
     }
 
@@ -165,6 +169,53 @@ def _classification_histogram(metadata_path: Path) -> dict[str, int]:
             "PDAL did not report an enumerated LAS classification histogram.",
         )
     return histogram
+
+
+def _exact_gps_acquisition_date(metadata_path: Path, lidar: LidarResource) -> str:
+    """Return one exact crop date only when GPS time and the registry agree."""
+
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    statistics: list[dict[str, Any]] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            if str(node.get("name") or "").lower() == "gpstime":
+                statistics.append(node)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(payload)
+    if not statistics:
+        return ""
+    try:
+        registered_start = date.fromisoformat(lidar.acquired_start)
+        registered_end = date.fromisoformat(lidar.acquired_end)
+    except ValueError:
+        return ""
+    gps_epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
+    matching_dates: set[date] = set()
+    for statistic in statistics:
+        for field in ("minimum", "maximum", "average", "mean", "median"):
+            try:
+                seconds = float(statistic[field])
+            except (KeyError, TypeError, ValueError):
+                continue
+            for offset in (0.0, 1_000_000_000.0):
+                try:
+                    candidate = (gps_epoch + timedelta(seconds=seconds + offset)).date()
+                except OverflowError:
+                    continue
+                if registered_start <= candidate <= registered_end:
+                    matching_dates.add(candidate)
+    if len(matching_dates) != 1:
+        return ""
+    return next(iter(matching_dates)).isoformat()
 
 
 def _run_roofer(pointcloud: Path, footprint: Path, output: Path, settings: Settings) -> tuple[Path, Path | None]:
@@ -287,6 +338,18 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
 
         pointcloud = workspace / "roof-points.laz"
         point_audit = _pdal_crop(lidar, crop_wkt, target_epsg, pointcloud, workspace, settings)
+        if point_audit["tileAcquisitionDate"]:
+            acquired = date.fromisoformat(point_audit["tileAcquisitionDate"])
+            today = datetime.now(timezone.utc).date()
+            age_years = max(
+                0,
+                today.year - acquired.year - ((today.month, today.day) < (acquired.month, acquired.day)),
+            )
+            lidar = replace(
+                lidar,
+                tile_acquisition_date=point_audit["tileAcquisitionDate"],
+                age_years=age_years,
+            )
         point_density = float(point_audit["filteredPointCount"]) / max(float(projected_footprint.area), 0.01)
         required_density = max(settings.minimum_point_density, lidar.minimum_density_ppsm)
         if point_density < required_density:
