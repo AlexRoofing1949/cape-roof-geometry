@@ -29,6 +29,7 @@ from .source_registry import LidarSource, RegistryBundle, SERVICE_COUNTIES
 
 
 _CATALOG_LOCK = threading.Lock()
+_OVERTURE_STAC_CATALOG_URL = "https://stac.overturemaps.org/catalog.json"
 
 
 @dataclass(frozen=True)
@@ -106,12 +107,42 @@ def _bbox(longitude: float, latitude: float, radius_meters: float) -> tuple[floa
     )
 
 
+def _current_overture_release(settings: Settings) -> str:
+    request = urllib.request.Request(
+        _OVERTURE_STAC_CATALOG_URL, headers={"User-Agent": "CapeRoofGeometry/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=settings.provider_timeout_seconds) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        raise TransientProviderError(
+            "OVERTURE_CATALOG_UNAVAILABLE", "The Overture release catalog is temporarily unavailable."
+        ) from error
+    latest = str(payload.get("latest") or "").strip() if isinstance(payload, dict) else ""
+    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", latest):
+        raise TransientProviderError(
+            "OVERTURE_CATALOG_INVALID", "The Overture release catalog did not identify a valid latest release."
+        )
+    return latest
+
+
+def _require_pinned_overture_release(settings: Settings) -> str:
+    latest = _current_overture_release(settings)
+    if latest != settings.overture_release:
+        raise UnreliableGeometryError(
+            "OVERTURE_RELEASE_MISMATCH",
+            "The configured Overture release is not the current published release.",
+            details={"configuredRelease": settings.overture_release, "currentRelease": latest},
+        )
+    return latest
+
+
 def fetch_overture_footprint(
     longitude: float, latitude: float, workspace: Path, settings: Settings
 ) -> FootprintResult:
     """Download only nearby Overture buildings and select one unambiguous polygon."""
 
-    release = settings.overture_release
+    release = _require_pinned_overture_release(settings)
     west, south, east, north = _bbox(longitude, latitude, settings.footprint_search_radius_meters)
     output_path = workspace / "overture-buildings.geojson"
     _run(
@@ -122,12 +153,16 @@ def fetch_overture_footprint(
             "-f",
             "geojson",
             "--type=building",
-            f"--release={release}",
             "--output",
             str(output_path),
         ],
         timeout=settings.provider_timeout_seconds,
     )
+    if _require_pinned_overture_release(settings) != release:
+        raise UnreliableGeometryError(
+            "OVERTURE_RELEASE_CHANGED_DURING_DOWNLOAD",
+            "The Overture release changed while the building footprint was being downloaded.",
+        )
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:

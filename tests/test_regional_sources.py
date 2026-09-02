@@ -11,7 +11,8 @@ try:
     from shapely.geometry import Polygon, mapping
 
     from app.pipeline import _classification_histogram
-    from app.providers import FootprintResult, select_regional_lidar
+    from app.errors import UnreliableGeometryError
+    from app.providers import FootprintResult, fetch_overture_footprint, select_regional_lidar
 
     SPATIAL_RUNTIME_AVAILABLE = True
 except ModuleNotFoundError:
@@ -49,6 +50,67 @@ class RegionalSourceTests(unittest.TestCase):
         self.assertIn(1, by_id["noaa_pre_ian_2022"].allowed_classes)
         self.assertIn(1, by_id["noaa_post_ian_2022"].roof_classes)
         self.assertEqual(by_id["usgs_manatee_b25_2025"].acquired_end.isoformat(), "2025-04-02")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._require_pinned_overture_release", side_effect=["2026-08-19.0", "2026-08-19.0"])
+    @patch("app.providers._run")
+    def test_overture_download_works_around_absolute_catalog_link_bug(self, run, _release):
+        observed = {}
+
+        def write_fixture(command, *, timeout):
+            observed["command"] = command
+            output = Path(command[command.index("--output") + 1])
+            output.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "id": "overture-building-1",
+                                "properties": {"sources": []},
+                                "geometry": mapping(
+                                    Polygon(
+                                        [
+                                            (-81.9588, 26.6324),
+                                            (-81.9583, 26.6324),
+                                            (-81.9583, 26.6329),
+                                            (-81.9588, 26.6329),
+                                            (-81.9588, 26.6324),
+                                        ]
+                                    )
+                                ),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        run.side_effect = write_fixture
+        configured = SimpleNamespace(
+            overture_release="2026-08-19.0",
+            footprint_search_radius_meters=45,
+            footprint_max_distance_meters=20,
+            footprint_ambiguity_meters=2,
+            provider_timeout_seconds=45,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = fetch_overture_footprint(
+                -81.95855, 26.63265, Path(directory), configured
+            )
+        self.assertEqual(result.overture_release, "2026-08-19.0")
+        self.assertFalse(any(value.startswith("--release") for value in observed["command"]))
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._current_overture_release", return_value="2026-09-16.0")
+    def test_overture_release_mismatch_fails_closed(self, _release):
+        from app.providers import _require_pinned_overture_release
+
+        configured = SimpleNamespace(overture_release="2026-08-19.0")
+        with self.assertRaises(UnreliableGeometryError) as raised:
+            _require_pinned_overture_release(configured)
+        self.assertEqual(raised.exception.code, "OVERTURE_RELEASE_MISMATCH")
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers._catalog_features", return_value=iter(()))
