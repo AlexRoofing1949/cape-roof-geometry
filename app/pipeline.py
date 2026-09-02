@@ -59,6 +59,11 @@ def _pdal_crop(
     class_expression = " || ".join(
         f"Classification == {classification}" for classification in lidar.allowed_classes
     )
+    roofer_class_assignments = [
+        f"Classification = 6 WHERE Classification == {classification}"
+        for classification in lidar.roof_classes
+        if classification != 6
+    ]
     metadata_path = workspace / "pdal-metadata.json"
     pipeline = {
         "pipeline": [
@@ -77,6 +82,11 @@ def _pdal_crop(
                 "dimensions": "Classification,GpsTime",
                 "count": "Classification",
             },
+            *(
+                [{"type": "filters.assign", "value": roofer_class_assignments}]
+                if roofer_class_assignments
+                else []
+            ),
             {
                 "type": "filters.reprojection",
                 "out_srs": f"EPSG:{target_epsg}",
@@ -120,6 +130,7 @@ def _pdal_crop(
         "roofReturnCount": roof_return_count,
         "allowedClasses": list(lidar.allowed_classes),
         "roofClasses": list(lidar.roof_classes),
+        "rooferClassNormalization": roofer_class_assignments,
         "tileAcquisitionDate": tile_acquisition_date,
         "pipeline": pipeline,
     }
@@ -521,6 +532,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "classHistogram": point_audit["classHistogram"],
                     "allowedClasses": point_audit["allowedClasses"],
                     "roofClasses": point_audit["roofClasses"],
+                    "rooferClassNormalization": point_audit["rooferClassNormalization"],
                     "license": lidar.license,
                     "licenseStatus": "AUTHORIZED_PUBLIC_DATASET",
                     "selectionReason": lidar.selection_reason,

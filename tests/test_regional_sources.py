@@ -11,7 +11,7 @@ from app.source_registry import load_registries
 try:
     from shapely.geometry import Polygon, mapping
 
-    from app.pipeline import _classification_histogram, _exact_gps_acquisition_date
+    from app.pipeline import _classification_histogram, _exact_gps_acquisition_date, _pdal_crop
     from app.errors import UnreliableGeometryError
     from app.providers import (
         FootprintResult,
@@ -284,6 +284,59 @@ class RegionalSourceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_classification_histogram(path), {})
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.pipeline._run")
+    def test_unclassified_roof_returns_are_normalized_after_audit(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            output = workspace / "roof.laz"
+            output.write_bytes(b"0" * 2048)
+            (workspace / "pdal-metadata.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "filters.stats": {
+                                "statistic": [
+                                    {
+                                        "name": "Classification",
+                                        "counts": ["1.000000/120", "2.000000/80"],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lidar = SimpleNamespace(
+                ept_url="https://example.com/ept.json",
+                allowed_classes=(1, 2, 6),
+                roof_classes=(1, 6),
+                source_id="usgs_florida_peninsular_2018_2020",
+                acquired_start="2018-01-01",
+                acquired_end="2020-12-31",
+            )
+
+            audit = _pdal_crop(
+                lidar,
+                "POLYGON((-82 26,-82 27,-81 27,-81 26,-82 26))",
+                32617,
+                output,
+                workspace,
+                SimpleNamespace(command_timeout_seconds=30),
+            )
+
+            stages = audit["pipeline"]["pipeline"]
+            stage_types = [stage["type"] for stage in stages]
+            self.assertLess(stage_types.index("filters.stats"), stage_types.index("filters.assign"))
+            self.assertLess(stage_types.index("filters.assign"), stage_types.index("filters.reprojection"))
+            self.assertEqual(
+                audit["rooferClassNormalization"],
+                ["Classification = 6 WHERE Classification == 1"],
+            )
+            self.assertEqual(audit["classHistogram"], {"1": 120, "2": 80})
+            run.assert_called_once()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     def test_exact_gps_date_is_derived_only_inside_registered_window(self):
