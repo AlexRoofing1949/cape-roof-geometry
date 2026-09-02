@@ -13,7 +13,10 @@ class CityJsonGeometryTests(unittest.TestCase):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         result = extract_roof_geometry(feature, transform)
 
-        expected_area = 20 * math.sqrt(18) * 10.763910416709722
+        horizontal_area_square_meters = 60
+        expected_area = (
+            horizontal_area_square_meters / math.cos(math.radians(45))
+        ) * 10.763910416709722
         self.assertAlmostEqual(result["roofAreaSqFt"], expected_area, delta=0.02)
         self.assertAlmostEqual(result["averagePitchDegrees"], 45, delta=0.01)
         self.assertAlmostEqual(result["maximumPitchDegrees"], 45, delta=0.01)

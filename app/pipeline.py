@@ -73,7 +73,7 @@ def _pdal_crop(
             {
                 "type": "filters.stats",
                 "dimensions": "Classification",
-                "enumerate": "Classification",
+                "count": "Classification",
             },
             {
                 "type": "filters.reprojection",
