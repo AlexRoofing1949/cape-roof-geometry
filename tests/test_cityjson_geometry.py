@@ -28,6 +28,9 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertEqual(len(result["rakes"]), 4)
         self.assertEqual(len(result["eaves"]), 2)
         self.assertEqual(result["valleys"], [])
+        self.assertAlmostEqual(result["totalHorizontalRoofAreaSqFt"], horizontal_area_square_meters * 10.763910416709722, delta=0.03)
+        self.assertAlmostEqual(result["externalPerimeterFeet"], result["eavesFeet"] + result["rakesFeet"], delta=0.01)
+        self.assertAlmostEqual(result["internalRoofEdgeFeet"], result["ridgesFeet"], delta=0.01)
         self.assertAlmostEqual(
             sum(facet["horizontalAreaSqFt"] for facet in result["facets"]),
             horizontal_area_square_meters * 10.763910416709722,
@@ -35,6 +38,7 @@ class CityJsonGeometryTests(unittest.TestCase):
         )
         for facet in result["facets"]:
             self.assertAlmostEqual(facet["areaSqFt"], facet["slopeAreaFormulaSqFt"], delta=0.02)
+            self.assertAlmostEqual(facet["pitchRisePer12"], 12, delta=0.01)
 
     def test_low_density_fails_closed(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")

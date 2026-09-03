@@ -486,6 +486,7 @@ def extract_roof_geometry(
                 * SQUARE_METERS_TO_SQUARE_FEET
             ),
             "pitchDegrees": _round(facet.pitch_degrees),
+            "pitchRisePer12": _round(12 * math.tan(math.radians(facet.pitch_degrees))),
             "azimuthDegrees": _round(facet.azimuth_degrees),
             "classification": "FLAT" if facet.pitch_degrees <= flat_pitch_degrees else "SLOPED",
             "openingCount": facet.opening_count,
@@ -507,6 +508,14 @@ def extract_roof_geometry(
         "valleysFeet": totals["valleys"],
         "ridgesFeet": totals["ridges"],
         "hipsFeet": totals["hips"],
+        "totalHorizontalRoofAreaSqFt": _round(
+            sum(facet.horizontal_area_square_meters for facet in facets)
+            * SQUARE_METERS_TO_SQUARE_FEET
+        ),
+        "externalPerimeterFeet": _round(totals["eaves"] + totals["rakes"]),
+        "internalRoofEdgeFeet": _round(
+            totals["ridges"] + totals["hips"] + totals["valleys"]
+        ),
         "highPerimeterFeet": totals["highPerimeters"],
         "flatRoofAreaSqFt": _round(flat_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "roofOpeningCount": sum(facet.opening_count for facet in facets),
