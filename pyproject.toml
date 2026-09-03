@@ -4,6 +4,9 @@ version = "1.0.0"
 requires-python = ">=3.12"
 license = { text = "GPL-3.0-only" }
 
+[project.optional-dependencies]
+calibration = ["pypdf==6.10.0"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

@@ -74,6 +74,23 @@ Before deployment:
 
 During calibration, the corresponding Apps Script Config values `AUTOMATIC_PRICING_ENABLED` and `ALLOW_HISTORICAL_VERIFIED_PRICING` must remain `false`.
 
+### Private EagleView calibration
+
+Operator-authorized EagleView PDFs, measurement JSON and OBJ meshes can be checked offline without copying
+customer files into this repository. Install the optional calibration dependency and point the tool at the private
+export directory:
+
+```bash
+python -m pip install '.[calibration]'
+python tools/eagleview_calibration.py /private/eagleview --output /private/eagleview/calibration-manifest.json
+```
+
+The manifest is deliberately de-identified: it contains report IDs, measurement totals, file hashes and comparison
+errors, but no customer names, addresses, claims or imagery. OBJ facets are measured in their native foot units,
+and every triangle verifies `sloped_area = horizontal_area / cos(pitch_angle)`. A report is not a calibration pass
+unless area and pitch are within the configured tolerances and the roof-facet count agrees exactly. Missing or
+failed geometry remains `inspectionRequired:true`; this tool never enables customer pricing.
+
 When no packaged county orthophoto evidence is enabled, the service can use the
 Google Solar Building Insights values already supplied by Apps Script as a
 fail-closed current-building comparison. It requires newer, high-quality,
