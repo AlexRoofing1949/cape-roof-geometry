@@ -28,6 +28,12 @@ from .providers import (
 from .source_registry import load_registries
 
 
+ROOF_COPLANAR_KNN = 8
+ROOF_NORMAL_KNN = 12
+MINIMUM_ROOF_NORMAL_Z = 0.65
+MAXIMUM_ROOF_CURVATURE = 0.12
+
+
 def _run(
     command: list[str], *, timeout: int, environment: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -89,6 +95,30 @@ def _pdal_crop(
                 "min_points": settings.minimum_roof_cluster_points,
                 "is3d": True,
             },
+            {
+                "type": "filters.expression",
+                "expression": "ClusterID > 0",
+            },
+            {
+                "type": "filters.approximatecoplanar",
+                "knn": ROOF_COPLANAR_KNN,
+            },
+            {
+                "type": "filters.expression",
+                "expression": "Coplanar == 1",
+            },
+            {
+                "type": "filters.normal",
+                "knn": ROOF_NORMAL_KNN,
+                "always_up": True,
+            },
+            {
+                "type": "filters.expression",
+                "expression": (
+                    f"NormalZ >= {MINIMUM_ROOF_NORMAL_Z} "
+                    f"&& Curvature <= {MAXIMUM_ROOF_CURVATURE}"
+                ),
+            },
         ]
     pipeline = {
         "pipeline": [
@@ -122,7 +152,8 @@ def _pdal_crop(
             {
                 "type": "filters.stats",
                 "dimensions": (
-                    "Classification,GpsTime,HeightAboveGround,ClusterID"
+                    "Classification,GpsTime,HeightAboveGround,ClusterID,"
+                    "Coplanar,NormalZ,Curvature"
                     if class_one_preprocessing
                     else "Classification,GpsTime"
                 ),
@@ -182,11 +213,18 @@ def _pdal_crop(
         },
         "classOneCorrection": {
             "applied": bool(class_one_preprocessing),
-            "method": "PDAL filters.hag_delaunay + height filter + 3D clustering",
+            "method": (
+                "PDAL HAG + 3D clustering + approximate coplanarity + "
+                "surface-normal/curvature filtering"
+            ),
             "minimumHeightAboveGroundMeters": settings.minimum_roof_hag_meters,
             "maximumHeightAboveGroundMeters": settings.maximum_roof_hag_meters,
             "clusterToleranceMeters": settings.roof_cluster_tolerance_meters,
             "minimumClusterPoints": settings.minimum_roof_cluster_points,
+            "coplanarKnn": ROOF_COPLANAR_KNN,
+            "normalKnn": ROOF_NORMAL_KNN,
+            "minimumNormalZ": MINIMUM_ROOF_NORMAL_Z,
+            "maximumCurvature": MAXIMUM_ROOF_CURVATURE,
         },
         "tileAcquisitionDate": tile_acquisition_date,
         "pipeline": pipeline,

@@ -566,6 +566,22 @@ sources:
             self.assertLess(stage_types.index("filters.outlier"), stage_types.index("filters.stats"))
             self.assertLess(stage_types.index("filters.reprojection"), stage_types.index("filters.hag_delaunay"))
             self.assertLess(stage_types.index("filters.hag_delaunay"), stage_types.index("filters.cluster"))
+            self.assertLess(
+                stage_types.index("filters.cluster"),
+                stage_types.index("filters.approximatecoplanar"),
+            )
+            self.assertLess(
+                stage_types.index("filters.approximatecoplanar"),
+                stage_types.index("filters.normal"),
+            )
+            self.assertEqual(
+                sum(
+                    stage.get("expression") == "ClusterID > 0"
+                    for stage in stages
+                    if stage.get("type") == "filters.expression"
+                ),
+                1,
+            )
             self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.assign"))
             self.assertEqual(
                 audit["rooferClassNormalization"],
@@ -574,6 +590,8 @@ sources:
             self.assertEqual(audit["classHistogram"], {"1": 120, "2": 80})
             self.assertEqual(audit["noiseFilter"]["outlierClassRemoved"], 7)
             self.assertTrue(audit["classOneCorrection"]["applied"])
+            self.assertEqual(audit["classOneCorrection"]["minimumNormalZ"], 0.65)
+            self.assertEqual(audit["classOneCorrection"]["maximumCurvature"], 0.12)
             run.assert_called_once()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
