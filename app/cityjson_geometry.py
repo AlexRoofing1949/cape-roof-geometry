@@ -18,7 +18,7 @@ from .errors import UnreliableGeometryError
 
 METERS_TO_FEET = 3.280839895013123
 SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
-EDGE_NODE_TOLERANCE_METERS = 0.02
+EDGE_NODE_TOLERANCE_METERS = 0.10
 
 
 @dataclass(frozen=True)
@@ -505,6 +505,7 @@ def extract_roof_geometry(
     horizontal_edge_tolerance_meters: float = 0.15,
     plane_side_tolerance_meters: float = 0.08,
     coplanar_tolerance_degrees: float = 2.0,
+    edge_node_tolerance_meters: float = EDGE_NODE_TOLERANCE_METERS,
     minimum_density: float = 8.0,
     maximum_nodata_fraction: float = 0.10,
     maximum_rmse_meters: float = 0.35,
@@ -517,7 +518,7 @@ def extract_roof_geometry(
         attributes, minimum_density, maximum_nodata_fraction, maximum_rmse_meters
     )
 
-    edge_uses = _noded_edge_uses(facets)
+    edge_uses = _noded_edge_uses(facets, edge_node_tolerance_meters)
 
     classified: dict[str, list[dict[str, Any]]] = {
         "rakes": [],
@@ -668,6 +669,12 @@ def extract_roof_geometry(
             totals["ridges"] + totals["hips"] + totals["valleys"]
         ),
         "highPerimeterFeet": totals["highPerimeters"],
+        "topology": {
+            "edgeNodeToleranceMeters": _round(edge_node_tolerance_meters, 3),
+            "nodedEdgeCount": len(edge_uses),
+            "sharedEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 2),
+            "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1),
+        },
         "flatRoofAreaSqFt": _round(flat_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "roofOpeningCount": sum(facet.opening_count for facet in facets),
         "roofOpeningPerimeterFeet": _round(

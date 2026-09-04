@@ -59,6 +59,7 @@ class Settings:
     solar_mask_maximum_bytes: int
     solar_mask_maximum_ground_area_variance_percent: float
     solar_mask_simplification_tolerance_meters: float
+    roof_edge_node_tolerance_meters: float
     usgs_catalog_url: str
     county_boundaries_url: str
     lidar_registry_path: Path
@@ -155,6 +156,9 @@ class Settings:
             ),
             solar_mask_simplification_tolerance_meters=_float(
                 "SOLAR_MASK_SIMPLIFICATION_TOLERANCE_METERS", 0.25
+            ),
+            roof_edge_node_tolerance_meters=_float(
+                "ROOF_EDGE_NODE_TOLERANCE_METERS", 0.10
             ),
             usgs_catalog_url=os.getenv(
                 "USGS_3DEP_CATALOG_URL", "https://usgs.entwine.io/boundaries/resources.geojson"
@@ -278,6 +282,7 @@ class Settings:
             and 1_000_000 <= self.solar_mask_maximum_bytes <= 50_000_000
             and 1 <= self.solar_mask_maximum_ground_area_variance_percent <= 10
             and 0.10 <= self.solar_mask_simplification_tolerance_meters <= 0.50
+            and 0.02 <= self.roof_edge_node_tolerance_meters <= 0.15
         ):
             raise ConfigurationError(
                 "SOLAR_ROOFPRINT_CONFIG_INVALID",
