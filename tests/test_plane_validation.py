@@ -64,6 +64,37 @@ class PlaneValidationTests(unittest.TestCase):
         self.assertEqual(result["facetCount"], 1)
         self.assertAlmostEqual(result["facets"][0]["normalVarianceDegrees"], 0, delta=0.01)
 
+    def test_large_projected_coordinates_are_centered_before_plane_fit(self):
+        east = 412_345.0
+        north = 2_938_765.0
+        points = np.asarray(
+            [
+                [east + x, north + y, 3 + 0.5 * y]
+                for x in np.linspace(0.1, 9.9, 12)
+                for y in np.linspace(0.1, 4.9, 8)
+            ],
+            dtype=float,
+        )
+        result = validate_facet_points(
+            points,
+            [
+                {
+                    "facetId": "F1",
+                    "verticesMeters": [
+                        [east, north, 3],
+                        [east + 10, north, 3],
+                        [east + 10, north + 5, 5.5],
+                        [east, north + 5, 5.5],
+                    ],
+                    "normal": [0, -0.5, 1],
+                }
+            ],
+            settings(),
+        )
+
+        self.assertEqual(result["validation"], "PASSED")
+        self.assertAlmostEqual(result["facets"][0]["normalVarianceDegrees"], 0, delta=0.01)
+
     def test_disagreeing_plane_fails_closed(self):
         points = np.asarray(
             [[x, y, 3 + 0.5 * y] for x in np.linspace(0.1, 9.9, 12) for y in np.linspace(0.1, 4.9, 8)],

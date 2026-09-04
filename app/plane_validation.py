@@ -77,8 +77,16 @@ def validate_facet_points(
                 },
             )
 
+        # Southwest Florida projected coordinates are hundreds of thousands of
+        # metres east and millions of metres north.  Feeding those absolute
+        # values directly to RANSAC can make an otherwise ordinary residential
+        # facet numerically ill-conditioned and produce a spurious vertical
+        # plane with every point reported as a zero-error inlier.  Translation
+        # does not change a plane normal, so fit in a local centroid frame.
+        local_origin = np.mean(selected, axis=0)
+        centered = selected - local_origin
         cloud = o3d.geometry.PointCloud()
-        cloud.points = o3d.utility.Vector3dVector(selected)
+        cloud.points = o3d.utility.Vector3dVector(centered)
         plane_model, inlier_indexes = cloud.segment_plane(
             distance_threshold=settings.open3d_distance_threshold_meters,
             ransac_n=3,
@@ -94,7 +102,7 @@ def validate_facet_points(
         fitted_pitch = math.degrees(
             math.acos(float(np.clip(fitted_normal[2], -1.0, 1.0)))
         )
-        inliers = selected[np.asarray(inlier_indexes, dtype=int)]
+        inliers = centered[np.asarray(inlier_indexes, dtype=int)]
         inlier_ratio = len(inliers) / len(selected)
         denominator = float(np.linalg.norm(coefficients[:3]))
         distances = np.abs(inliers @ coefficients[:3] + coefficients[3]) / denominator
