@@ -67,7 +67,10 @@ def _first(text: str, pattern: str, flags: int = re.IGNORECASE) -> re.Match[str]
 
 
 def _metric(text: str, label: str, unit: str) -> float | None:
-    match = _first(text, rf"{label}\s*=\s*{NUMBER}\s*{unit}")
+    # Edge totals must come from their own Report Summary rows.  Without the
+    # line anchor, ``Hips`` also matches the cover-page aggregate
+    # ``Total Ridges/Hips`` and overstates hip length by the ridge total.
+    match = _first(text, rf"^\s*{label}\s*=\s*{NUMBER}\s*{unit}", re.IGNORECASE | re.MULTILINE)
     return _number(match.group(1)) if match else None
 
 
@@ -90,7 +93,7 @@ def parse_eagleview_text(text: str) -> ReferenceMeasurements:
         hips_ft=_metric(text, "Hips", "ft"),
         valleys_ft=_metric(text, "Valleys", "ft"),
         rakes_ft=_metric(text, "Rakes", "ft"),
-        eaves_ft=_metric(text, "Eaves", "ft"),
+        eaves_ft=_metric(text, r"Eaves(?:/Starter)?", "ft"),
         flashing_ft=_metric(text, "Flashing", "ft"),
         step_flashing_ft=_metric(text, r"Step\s+flashing", "ft"),
     )

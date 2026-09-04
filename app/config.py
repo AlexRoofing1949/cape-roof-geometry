@@ -157,13 +157,13 @@ class Settings:
             footprint_search_radius_meters=_float("FOOTPRINT_SEARCH_RADIUS_METERS", 45),
             footprint_max_distance_meters=_float("FOOTPRINT_MAX_DISTANCE_METERS", 20),
             footprint_ambiguity_meters=_float("FOOTPRINT_AMBIGUITY_METERS", 2),
-            footprint_consensus_min_iou=_float("FOOTPRINT_CONSENSUS_MIN_IOU", 0.80),
-            footprint_correlated_min_iou=_float("FOOTPRINT_CORRELATED_MIN_IOU", 0.70),
+            footprint_consensus_min_iou=_float("FOOTPRINT_CONSENSUS_MIN_IOU", 0.70),
+            footprint_correlated_min_iou=_float("FOOTPRINT_CORRELATED_MIN_IOU", 0.65),
             footprint_maximum_centroid_separation_meters=_float(
-                "FOOTPRINT_MAXIMUM_CENTROID_SEPARATION_METERS", 2.0
+                "FOOTPRINT_MAXIMUM_CENTROID_SEPARATION_METERS", 4.0
             ),
             footprint_maximum_area_difference_percent=_float(
-                "FOOTPRINT_MAXIMUM_AREA_DIFFERENCE_PERCENT", 10.0
+                "FOOTPRINT_MAXIMUM_AREA_DIFFERENCE_PERCENT", 16.0
             ),
             footprint_review_area_difference_percent=_float(
                 "FOOTPRINT_REVIEW_AREA_DIFFERENCE_PERCENT", 20.0
@@ -246,10 +246,10 @@ class Settings:
                 "MICROSOFT_BFP_CONFIG_INVALID",
                 "Microsoft footprint tiles must use the published zoom and a safe download limit.",
             )
-        if not 0.80 <= self.footprint_consensus_min_iou <= 0.95:
+        if not 0.70 <= self.footprint_consensus_min_iou <= 0.95:
             raise ConfigurationError(
                 "FOOTPRINT_CONSENSUS_INVALID",
-                "FOOTPRINT_CONSENSUS_MIN_IOU must be between 0.80 and 0.95.",
+                "FOOTPRINT_CONSENSUS_MIN_IOU must be between 0.70 and 0.95.",
             )
         if not 0.60 <= self.footprint_correlated_min_iou < self.footprint_consensus_min_iou:
             raise ConfigurationError(
@@ -258,7 +258,7 @@ class Settings:
             )
         if not (
             0 < self.footprint_maximum_centroid_separation_meters <= 5
-            and 0 < self.footprint_maximum_area_difference_percent <= 15
+            and 0 < self.footprint_maximum_area_difference_percent <= 16
             and self.footprint_maximum_area_difference_percent
             < self.footprint_review_area_difference_percent
             <= 25

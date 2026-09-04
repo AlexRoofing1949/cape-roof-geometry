@@ -40,6 +40,25 @@ class EagleViewCalibrationTests(unittest.TestCase):
         self.assertEqual(result.ridges_ft, 59)
         self.assertEqual(result.step_flashing_ft, 17)
 
+    def test_hip_length_does_not_match_cover_page_ridge_hip_aggregate(self):
+        result = calibration.parse_eagleview_text(
+            """
+            Report: 28464089
+            Total Roof Area =7,895 sq ft
+            Total Roof Facets =44
+            Predominant Pitch =6/12
+            Total Ridges/Hips =626 ft
+            Ridges = 106 ft
+            Hips = 520 ft
+            Valleys = 200 ft
+            Rakes = 3 ft
+            Eaves/Starter = 646 ft
+            """
+        )
+        self.assertEqual(result.ridges_ft, 106)
+        self.assertEqual(result.hips_ft, 520)
+        self.assertEqual(result.eaves_ft, 646)
+
     def test_obj_area_pitch_facets_and_cosine_formula(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "123456.obj"

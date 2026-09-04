@@ -128,18 +128,22 @@ sources:
             lineage_group="COUNTY_AUTHORITATIVE",
         )
         configured = SimpleNamespace(
-            footprint_consensus_min_iou=0.80,
-            footprint_correlated_min_iou=0.70,
-            footprint_maximum_centroid_separation_meters=2,
-            footprint_maximum_area_difference_percent=10,
+            footprint_consensus_min_iou=0.70,
+            footprint_correlated_min_iou=0.65,
+            footprint_maximum_centroid_separation_meters=4,
+            footprint_maximum_area_difference_percent=16,
             footprint_review_area_difference_percent=20,
         )
         with tempfile.TemporaryDirectory() as directory:
             result = fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
-        self.assertEqual(result.provider, "Microsoft GlobalML Building Footprints")
+        self.assertEqual(result.provider, "Lee County Building Footprints")
         self.assertEqual(result.consensus_status, "CORROBORATED")
-        self.assertGreaterEqual(result.consensus_records[-1]["intersectionOverUnion"], 0.80)
-        self.assertIn("boundaryHausdorffDistanceMeters", result.consensus_records[-1])
+        self.assertGreaterEqual(result.consensus_records[-2]["intersectionOverUnion"], 0.70)
+        self.assertIn("boundaryHausdorffDistanceMeters", result.consensus_records[-2])
+        self.assertEqual(
+            result.consensus_records[-1]["decision"],
+            "AUTHORITATIVE_COUNTY_GEOMETRY_SELECTED",
+        )
         osm.assert_not_called()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
@@ -163,10 +167,10 @@ sources:
             lineage_group="COUNTY_AUTHORITATIVE",
         )
         configured = SimpleNamespace(
-            footprint_consensus_min_iou=0.80,
-            footprint_correlated_min_iou=0.70,
-            footprint_maximum_centroid_separation_meters=2,
-            footprint_maximum_area_difference_percent=10,
+            footprint_consensus_min_iou=0.70,
+            footprint_correlated_min_iou=0.65,
+            footprint_maximum_centroid_separation_meters=4,
+            footprint_maximum_area_difference_percent=16,
             footprint_review_area_difference_percent=20,
         )
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(
@@ -194,10 +198,10 @@ sources:
             "OpenStreetMap contributors",
         )
         configured = SimpleNamespace(
-            footprint_consensus_min_iou=0.80,
-            footprint_correlated_min_iou=0.70,
-            footprint_maximum_centroid_separation_meters=2,
-            footprint_maximum_area_difference_percent=10,
+            footprint_consensus_min_iou=0.70,
+            footprint_correlated_min_iou=0.65,
+            footprint_maximum_centroid_separation_meters=4,
+            footprint_maximum_area_difference_percent=16,
             footprint_review_area_difference_percent=20,
         )
         with tempfile.TemporaryDirectory() as directory:

@@ -683,7 +683,16 @@ def fetch_best_footprint(
                     "maximumAreaDifferencePercent": settings.footprint_maximum_area_difference_percent,
                 },
             )
-        return replace(primary, consensus_status="CORROBORATED", consensus_records=tuple(audit))
+        selected = secondary if secondary.provider == "Lee County Building Footprints" else primary
+        if selected is secondary:
+            audit.append(
+                {
+                    "provider": secondary.provider,
+                    "lineageGroup": secondary.lineage_group,
+                    "decision": "AUTHORITATIVE_COUNTY_GEOMETRY_SELECTED",
+                }
+            )
+        return replace(selected, consensus_status="CORROBORATED", consensus_records=tuple(audit))
     return replace(
         primary,
         consensus_status="CORRELATED_SUPPORT_ONLY" if correlated_support else "SINGLE_SOURCE",
