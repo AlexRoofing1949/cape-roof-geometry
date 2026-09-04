@@ -18,6 +18,7 @@ from .errors import UnreliableGeometryError
 
 METERS_TO_FEET = 3.280839895013123
 SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
+EDGE_NODE_TOLERANCE_METERS = 0.02
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,105 @@ def _normal_angle_degrees(first: Facet, second: Facet) -> float:
 
 def _round(value: float, digits: int = 2) -> float:
     return round(float(value), digits)
+
+
+def _edge_parameter(
+    point: tuple[float, float, float],
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+    tolerance_meters: float,
+) -> float | None:
+    direction = _vector(start, end)
+    denominator = _dot(direction, direction)
+    if denominator <= 1e-12:
+        return None
+    offset = _vector(start, point)
+    parameter = _dot(offset, direction) / denominator
+    length = math.sqrt(denominator)
+    parameter_tolerance = tolerance_meters / length
+    if parameter < -parameter_tolerance or parameter > 1 + parameter_tolerance:
+        return None
+    projected = tuple(
+        start[index] + max(0.0, min(1.0, parameter)) * direction[index]
+        for index in range(3)
+    )
+    if _edge_length(point, projected) > tolerance_meters:
+        return None
+    return max(0.0, min(1.0, parameter))
+
+
+def _noded_edge_uses(
+    facets: list[Facet],
+    tolerance_meters: float = EDGE_NODE_TOLERANCE_METERS,
+) -> dict[tuple[int, int], list[EdgeUse]]:
+    """Build facet adjacency from measured 3D edges instead of source vertex IDs.
+
+    Roofer can emit coincident coordinates with different CityJSON vertex IDs,
+    and a long edge on one facet can meet two shorter edges at a T-junction.
+    Coordinate clustering and noding prevent those internal roof lines from
+    being counted twice as exterior eaves or rakes.
+    """
+
+    representatives: list[tuple[float, float, float]] = []
+    point_keys: dict[tuple[float, float, float], int] = {}
+    for facet in facets:
+        for point in facet.vertices:
+            if point in point_keys:
+                continue
+            key = next(
+                (
+                    index
+                    for index, representative in enumerate(representatives)
+                    if _edge_length(point, representative) <= tolerance_meters
+                ),
+                None,
+            )
+            if key is None:
+                key = len(representatives)
+                representatives.append(point)
+            point_keys[point] = key
+
+    edge_uses: dict[tuple[int, int], list[EdgeUse]] = defaultdict(list)
+    all_points = list(point_keys.items())
+    for facet in facets:
+        count = len(facet.vertex_ids)
+        for index, start_id in enumerate(facet.vertex_ids):
+            end_id = facet.vertex_ids[(index + 1) % count]
+            start = facet.vertices[index]
+            end = facet.vertices[(index + 1) % count]
+            if _edge_length(start, end) <= 0.10:
+                continue
+            nodes: list[tuple[float, int, tuple[float, float, float]]] = []
+            for point, key in all_points:
+                parameter = _edge_parameter(point, start, end, tolerance_meters)
+                if parameter is not None:
+                    nodes.append((parameter, key, point))
+            nodes.sort(key=lambda node: node[0])
+            distinct: list[tuple[float, int, tuple[float, float, float]]] = []
+            for node in nodes:
+                if distinct and node[1] == distinct[-1][1]:
+                    continue
+                distinct.append(node)
+            for current, following in zip(distinct, distinct[1:]):
+                if current[1] == following[1]:
+                    continue
+                segment_start = tuple(
+                    start[axis] + current[0] * (end[axis] - start[axis])
+                    for axis in range(3)
+                )
+                segment_end = tuple(
+                    start[axis] + following[0] * (end[axis] - start[axis])
+                    for axis in range(3)
+                )
+                if _edge_length(segment_start, segment_end) <= 0.10:
+                    continue
+                edge_key = tuple(sorted((current[1], following[1])))
+                if any(use.facet.facet_id == facet.facet_id for use in edge_uses[edge_key]):
+                    continue
+                edge_uses[edge_key].append(
+                    EdgeUse(facet, start_id, end_id, segment_start, segment_end)
+                )
+    return edge_uses
 
 
 def _decode_vertices(
@@ -417,15 +517,7 @@ def extract_roof_geometry(
         attributes, minimum_density, maximum_nodata_fraction, maximum_rmse_meters
     )
 
-    edge_uses: dict[tuple[int, int], list[EdgeUse]] = defaultdict(list)
-    for facet in facets:
-        count = len(facet.vertex_ids)
-        for index, start_id in enumerate(facet.vertex_ids):
-            end_id = facet.vertex_ids[(index + 1) % count]
-            key = tuple(sorted((start_id, end_id)))
-            edge_uses[key].append(
-                EdgeUse(facet, start_id, end_id, facet.vertices[index], facet.vertices[(index + 1) % count])
-            )
+    edge_uses = _noded_edge_uses(facets)
 
     classified: dict[str, list[dict[str, Any]]] = {
         "rakes": [],

@@ -75,6 +75,52 @@ class CityJsonGeometryTests(unittest.TestCase):
             self.assertAlmostEqual(facet["areaSqFt"], facet["slopeAreaFormulaSqFt"], delta=0.02)
             self.assertAlmostEqual(facet["pitchRisePer12"], 12, delta=0.01)
 
+    def test_coincident_ids_and_t_junction_are_noded_before_edge_classification(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "NODED-GABLE",
+            "vertices": [
+                [0, 0, 0], [10, 0, 0], [10, 5, 5], [0, 5, 5],
+                [0, 5, 5], [5, 5, 5], [5, 10, 0], [0, 10, 0],
+                [5, 5, 5], [10, 5, 5], [10, 10, 0], [5, 10, 0],
+            ],
+            "CityObjects": {
+                "NODED-GABLE": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [
+                        {
+                            "type": "MultiSurface",
+                            "lod": "2.2",
+                            "boundaries": [
+                                [[0, 1, 2, 3]],
+                                [[4, 5, 6, 7]],
+                                [[8, 9, 10, 11]],
+                            ],
+                            "semantics": {
+                                "surfaces": [{"type": "RoofSurface"}] * 3,
+                                "values": [0, 1, 2],
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        self.assertAlmostEqual(result["ridgesFeet"], 10 * 3.280839895013123, delta=0.02)
+        self.assertAlmostEqual(result["eavesFeet"], 20 * 3.280839895013123, delta=0.02)
+        self.assertEqual(result["highPerimeterFeet"], 0)
+        self.assertEqual(len(result["ridges"]), 2)
+
     def test_one_decisive_shared_edge_side_classifies_tangent_valley(self):
         feature = {
             "type": "CityJSONFeature",

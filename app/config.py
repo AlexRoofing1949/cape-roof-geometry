@@ -199,7 +199,7 @@ class Settings:
             roofer_plane_detect_epsilon_meters=_float(
                 "ROOFER_PLANE_DETECT_EPSILON_METERS", 0.15
             ),
-            roofer_complexity_factor=_float("ROOFER_COMPLEXITY_FACTOR", 1.0),
+            roofer_complexity_factor=_float("ROOFER_COMPLEXITY_FACTOR", 0.95),
             flat_pitch_degrees=_float("FLAT_PITCH_DEGREES", 5),
             minimum_service_confidence=_float("MINIMUM_SERVICE_CONFIDENCE", 0.80),
             maximum_solar_area_variance_percent=_float("MAXIMUM_SOLAR_AREA_VARIANCE_PERCENT", 15),
