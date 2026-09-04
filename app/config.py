@@ -85,6 +85,7 @@ class Settings:
     minimum_point_density: float
     maximum_nodata_fraction: float
     maximum_roofer_rmse_meters: float
+    roofer_plane_detect_epsilon_meters: float
     flat_pitch_degrees: float
     minimum_service_confidence: float
     maximum_solar_area_variance_percent: float
@@ -194,6 +195,9 @@ class Settings:
             minimum_point_density=_float("MINIMUM_POINT_DENSITY", 8),
             maximum_nodata_fraction=_float("MAXIMUM_NODATA_FRACTION", 0.10),
             maximum_roofer_rmse_meters=_float("MAXIMUM_ROOFER_RMSE_METERS", 0.35),
+            roofer_plane_detect_epsilon_meters=_float(
+                "ROOFER_PLANE_DETECT_EPSILON_METERS", 0.15
+            ),
             flat_pitch_degrees=_float("FLAT_PITCH_DEGREES", 5),
             minimum_service_confidence=_float("MINIMUM_SERVICE_CONFIDENCE", 0.80),
             maximum_solar_area_variance_percent=_float("MAXIMUM_SOLAR_AREA_VARIANCE_PERCENT", 15),
@@ -323,6 +327,11 @@ class Settings:
             raise ConfigurationError(
                 "LIDAR_COVERAGE_THRESHOLD_INVALID",
                 "MINIMUM_LIDAR_COVERAGE_RATIO must be between 0.98 and 1.",
+            )
+        if not 0.05 <= self.roofer_plane_detect_epsilon_meters <= 0.30:
+            raise ConfigurationError(
+                "ROOFER_PLANE_EPSILON_INVALID",
+                "ROOFER_PLANE_DETECT_EPSILON_METERS must be between 0.05 and 0.30.",
             )
         if not date(2018, 1, 1) <= self.minimum_lidar_acquisition_date <= date.today():
             raise ConfigurationError(

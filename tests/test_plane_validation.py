@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 
 from app.plane_validation import _open3d, validate_facet_points, validate_roofer_planes
-from app.pipeline import runtime_dependencies
+from app.pipeline import _run_roofer, runtime_dependencies
 
 
 def settings():
@@ -24,6 +24,34 @@ def settings():
 
 
 class PlaneValidationTests(unittest.TestCase):
+    def test_roofer_uses_production_plane_detection_tolerance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            pointcloud = workspace / "roof.laz"
+            footprint = workspace / "roof.gpkg"
+            output = workspace / "roofer-output"
+            pointcloud.write_bytes(b"test")
+            footprint.write_bytes(b"test")
+
+            def fake_run(command, **_kwargs):
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "roof.city.jsonl").write_text("{}\n", encoding="utf-8")
+                self.assertEqual(
+                    command[command.index("--plane-detect-epsilon") + 1], "0.15"
+                )
+
+            configured = SimpleNamespace(
+                command_timeout_seconds=30,
+                roofer_plane_detect_epsilon_meters=0.15,
+            )
+            with patch("app.pipeline._run", side_effect=fake_run):
+                feature, metadata = _run_roofer(
+                    pointcloud, footprint, output, configured
+                )
+
+            self.assertEqual(feature, output / "roof.city.jsonl")
+            self.assertIsNone(metadata)
+
     def test_roofer_validator_exports_all_normalized_roof_returns_at_high_precision(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
