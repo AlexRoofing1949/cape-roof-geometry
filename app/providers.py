@@ -683,16 +683,20 @@ def fetch_best_footprint(
                     "maximumAreaDifferencePercent": settings.footprint_maximum_area_difference_percent,
                 },
             )
-        selected = secondary if secondary.provider == "Lee County Building Footprints" else primary
-        if selected is secondary:
-            audit.append(
-                {
-                    "provider": secondary.provider,
-                    "lineageGroup": secondary.lineage_group,
-                    "decision": "AUTHORITATIVE_COUNTY_GEOMETRY_SELECTED",
-                }
-            )
-        return replace(selected, consensus_status="CORROBORATED", consensus_records=tuple(audit))
+        # The cascade order determines the reconstruction outline.  County GIS
+        # polygons are authoritative evidence that a structure exists, but can
+        # include screened enclosures, patios, or other non-roof additions.  A
+        # passing county comparison therefore corroborates the primary outline;
+        # it must not silently replace that outline before roof-point fitting.
+        audit.append(
+            {
+                "provider": primary.provider,
+                "lineageGroup": primary.lineage_group,
+                "corroboratedBy": secondary.provider,
+                "decision": "PRIMARY_GEOMETRY_RETAINED_AFTER_CORROBORATION",
+            }
+        )
+        return replace(primary, consensus_status="CORROBORATED", consensus_records=tuple(audit))
     return replace(
         primary,
         consensus_status="CORRELATED_SUPPORT_ONLY" if correlated_support else "SINGLE_SOURCE",

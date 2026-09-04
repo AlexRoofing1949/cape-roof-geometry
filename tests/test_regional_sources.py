@@ -101,7 +101,7 @@ sources:
     @patch("app.providers.fetch_county_footprint")
     @patch("app.providers.fetch_microsoft_footprint")
     @patch("app.providers.fetch_overture_footprint")
-    def test_footprint_cascade_uses_microsoft_and_county_consensus(
+    def test_footprint_cascade_retains_microsoft_after_county_consensus(
         self, overture, microsoft, county, osm
     ):
         geometry = footprint().geometry_wgs84
@@ -136,15 +136,62 @@ sources:
         )
         with tempfile.TemporaryDirectory() as directory:
             result = fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
-        self.assertEqual(result.provider, "Lee County Building Footprints")
+        self.assertEqual(result.provider, "Microsoft GlobalML Building Footprints")
         self.assertEqual(result.consensus_status, "CORROBORATED")
         self.assertGreaterEqual(result.consensus_records[-2]["intersectionOverUnion"], 0.70)
         self.assertIn("boundaryHausdorffDistanceMeters", result.consensus_records[-2])
         self.assertEqual(
             result.consensus_records[-1]["decision"],
-            "AUTHORITATIVE_COUNTY_GEOMETRY_SELECTED",
+            "PRIMARY_GEOMETRY_RETAINED_AFTER_CORROBORATION",
+        )
+        self.assertEqual(
+            result.consensus_records[-1]["corroboratedBy"],
+            "Lee County Building Footprints",
         )
         osm.assert_not_called()
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers.fetch_county_footprint")
+    @patch("app.providers.fetch_overture_footprint")
+    def test_footprint_cascade_retains_overture_after_county_consensus(self, overture, county):
+        geometry = footprint().geometry_wgs84
+        overture.return_value = FootprintResult(
+            geometry,
+            "overture-1",
+            "2026-08-19.0",
+            0.0,
+            [],
+        )
+        county.return_value = FootprintResult(
+            geometry.buffer(0.000001),
+            "lee-1",
+            "2026-03-22",
+            0.0,
+            [],
+            "Lee County Building Footprints",
+            "LEE-COUNTY-PUBLIC-GIS",
+            "Lee County Property Appraiser and Lee County GIS",
+            lineage_group="COUNTY_AUTHORITATIVE",
+        )
+        configured = SimpleNamespace(
+            footprint_consensus_min_iou=0.70,
+            footprint_correlated_min_iou=0.65,
+            footprint_maximum_centroid_separation_meters=4,
+            footprint_maximum_area_difference_percent=16,
+            footprint_review_area_difference_percent=20,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = fetch_best_footprint(-81.9509, 26.6211, Path(directory), configured)
+        self.assertEqual(result.provider, "Overture Maps Buildings")
+        self.assertEqual(result.consensus_status, "CORROBORATED")
+        self.assertEqual(
+            result.consensus_records[-1]["decision"],
+            "PRIMARY_GEOMETRY_RETAINED_AFTER_CORROBORATION",
+        )
+        self.assertEqual(
+            result.consensus_records[-1]["corroboratedBy"],
+            "Lee County Building Footprints",
+        )
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.fetch_county_footprint")
