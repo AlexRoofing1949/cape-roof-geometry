@@ -21,6 +21,7 @@ from .models import GeometryRequest
 from .plane_validation import validate_roofer_planes
 from .providers import (
     fetch_best_footprint,
+    fetch_google_solar_roofprint,
     LidarResource,
     select_regional_lidar,
     write_footprint_inputs,
@@ -475,7 +476,15 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
 
     with tempfile.TemporaryDirectory(prefix=f"{request.requestId}-", dir=settings.work_root) as directory:
         workspace = Path(directory)
-        footprint = fetch_best_footprint(longitude, latitude, workspace, settings)
+        building_footprint = fetch_best_footprint(longitude, latitude, workspace, settings)
+        footprint = fetch_google_solar_roofprint(
+            building_footprint,
+            longitude,
+            latitude,
+            workspace,
+            settings,
+            request.solarReference,
+        )
         registries = load_registries(settings.lidar_registry_path, settings.imagery_registry_path)
         county, lidar_candidates, selection_audit = select_regional_lidar(
             footprint, longitude, latitude, settings, registries
@@ -545,7 +554,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 reconciliation = _solar_reconciliation(geometry, request, settings)
                 _validate_selected_roof_type(geometry, request)
                 imagery_decision = validate_current_structure(
-                    footprint,
+                    building_footprint,
                     lidar,
                     county,
                     registries,
@@ -628,10 +637,13 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "3DBAG/roofer",
                     "PDAL/PDAL",
                     "isl-org/Open3D",
+                    building_footprint.provider,
                     footprint.provider,
                     lidar_component,
                 ],
-                "inputDataLicense": f"{lidar_license_text} + {footprint.license}",
+                "inputDataLicense": (
+                    f"{lidar_license_text} + {building_footprint.license} + {footprint.license}"
+                ),
                 "inputImageryCommerciallyAuthorized": imagery_decision["currentImagery"].get("validation") == "PASSED",
             },
             "geometry": geometry,
@@ -646,6 +658,17 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "geocodeDistanceMeters": round(footprint.distance_meters, 2),
                     "consensusStatus": footprint.consensus_status,
                     "consensusRecords": list(footprint.consensus_records),
+                },
+                "buildingFootprint": {
+                    "provider": building_footprint.provider,
+                    "id": building_footprint.overture_id,
+                    "release": building_footprint.overture_release,
+                    "license": building_footprint.license,
+                    "attribution": building_footprint.attribution,
+                    "sourceRecords": building_footprint.source_records[:20],
+                    "geocodeDistanceMeters": round(building_footprint.distance_meters, 2),
+                    "consensusStatus": building_footprint.consensus_status,
+                    "consensusRecords": list(building_footprint.consensus_records),
                 },
                 "pointCloud": {
                     "provider": lidar.provider,
@@ -716,4 +739,9 @@ def runtime_dependencies() -> dict[str, bool]:
         dependencies["open3d"] = bool(getattr(open3d, "__version__", ""))
     except (ImportError, OSError):
         dependencies["open3d"] = False
+    try:
+        gdal = importlib.import_module("osgeo.gdal")
+        dependencies["gdalPython"] = bool(gdal.VersionInfo())
+    except (ImportError, OSError):
+        dependencies["gdalPython"] = False
     return dependencies

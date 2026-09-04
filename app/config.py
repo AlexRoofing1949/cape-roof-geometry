@@ -53,6 +53,11 @@ class Settings:
     osm_overpass_url: str
     osm_cache_seconds: int
     lee_county_footprint_url: str
+    solar_api_key: str
+    solar_roofprint_enabled: bool
+    solar_data_layer_radius_meters: float
+    solar_mask_maximum_bytes: int
+    solar_mask_maximum_ground_area_variance_percent: float
     usgs_catalog_url: str
     county_boundaries_url: str
     lidar_registry_path: Path
@@ -136,6 +141,14 @@ class Settings:
                 "LEE_COUNTY_FOOTPRINT_URL",
                 "https://gismapserver.leegov.com/gisserver910/rest/services/DataExplorer/LandRecords/MapServer/8/query",
             ).strip(),
+            solar_api_key=os.getenv("SOLAR_API_KEY", "").strip(),
+            solar_roofprint_enabled=os.getenv("SOLAR_ROOFPRINT_ENABLED", "false").strip().lower()
+            in {"1", "true", "yes"},
+            solar_data_layer_radius_meters=_float("SOLAR_DATA_LAYER_RADIUS_METERS", 35),
+            solar_mask_maximum_bytes=_int("SOLAR_MASK_MAXIMUM_BYTES", 20_000_000),
+            solar_mask_maximum_ground_area_variance_percent=_float(
+                "SOLAR_MASK_MAXIMUM_GROUND_AREA_VARIANCE_PERCENT", 5
+            ),
             usgs_catalog_url=os.getenv(
                 "USGS_3DEP_CATALOG_URL", "https://usgs.entwine.io/boundaries/resources.geojson"
             ).strip(),
@@ -241,6 +254,20 @@ class Settings:
         ):
             if not url.startswith("https://"):
                 raise ConfigurationError("FOOTPRINT_PROVIDER_URL_INVALID", f"{name} must use HTTPS.")
+        if self.solar_roofprint_enabled and len(self.solar_api_key) < 20:
+            raise ConfigurationError(
+                "SOLAR_API_KEY_MISSING",
+                "SOLAR_API_KEY must be configured when the Google Solar roof-mask provider is enabled.",
+            )
+        if not (
+            10 <= self.solar_data_layer_radius_meters <= 100
+            and 1_000_000 <= self.solar_mask_maximum_bytes <= 50_000_000
+            and 1 <= self.solar_mask_maximum_ground_area_variance_percent <= 10
+        ):
+            raise ConfigurationError(
+                "SOLAR_ROOFPRINT_CONFIG_INVALID",
+                "Google Solar roof-mask limits are outside the supported fail-closed range.",
+            )
         if self.microsoft_bfp_zoom != 9 or self.microsoft_bfp_maximum_tile_bytes < 25_000_000:
             raise ConfigurationError(
                 "MICROSOFT_BFP_CONFIG_INVALID",

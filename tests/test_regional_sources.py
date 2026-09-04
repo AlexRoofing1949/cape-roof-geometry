@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -24,9 +25,12 @@ try:
         FootprintResult,
         _bing_quadkey,
         fetch_best_footprint,
+        fetch_google_solar_roofprint,
         fetch_overture_footprint,
         resolve_service_county,
         select_regional_lidar,
+        transform_geometry,
+        utm_epsg,
     )
 
     SPATIAL_RUNTIME_AVAILABLE = True
@@ -192,6 +196,71 @@ sources:
             result.consensus_records[-1]["corroboratedBy"],
             "Lee County Building Footprints",
         )
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._polygonize_google_solar_mask")
+    @patch("app.providers._download_file")
+    @patch("app.providers.urllib.request.urlopen")
+    def test_google_solar_roofprint_requires_mask_ground_area_and_building_agreement(
+        self, urlopen, download, polygonize
+    ):
+        building = footprint()
+        mask = building.geometry_wgs84.buffer(-0.000005)
+        polygonize.return_value = [mask]
+        urlopen.return_value = BytesIO(
+            json.dumps(
+                {
+                    "imageryDate": {"year": 2019, "month": 6, "day": 5},
+                    "imageryQuality": "HIGH",
+                    "maskUrl": "https://solar.googleapis.com/v1/geoTiff:get?id=test",
+                }
+            ).encode("utf-8")
+        )
+        projected = transform_geometry(
+            mask,
+            "EPSG:4326",
+            f"EPSG:{utm_epsg(-81.9509, 26.6211)}",
+        )
+        ground_area_sqft = projected.area * 10.763910416709722
+        solar = SimpleNamespace(
+            facets=[
+                SimpleNamespace(
+                    areaSqFt=ground_area_sqft / 0.9,
+                    groundAreaSqFt=ground_area_sqft,
+                    pitchDegrees=25,
+                )
+            ]
+        )
+        configured = SimpleNamespace(
+            solar_roofprint_enabled=True,
+            solar_api_key="test-key-with-safe-minimum-length",
+            solar_data_layer_radius_meters=35,
+            solar_mask_maximum_bytes=20_000_000,
+            solar_mask_maximum_ground_area_variance_percent=5,
+            provider_timeout_seconds=30,
+            footprint_max_distance_meters=20,
+            footprint_ambiguity_meters=2,
+            footprint_correlated_min_iou=0.65,
+            footprint_maximum_centroid_separation_meters=4,
+            footprint_review_area_difference_percent=20,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = fetch_google_solar_roofprint(
+                building,
+                -81.9509,
+                26.6211,
+                Path(directory),
+                configured,
+                solar,
+            )
+        self.assertEqual(result.provider, "Google Solar Building Mask")
+        self.assertEqual(result.consensus_status, "ROOF_MASK_CORROBORATED")
+        self.assertEqual(
+            result.consensus_records[-1]["decision"],
+            "ROOFTOP_MASK_SELECTED_FOR_RECONSTRUCTION",
+        )
+        self.assertLess(result.consensus_records[-1]["groundAreaVariancePercent"], 0.01)
+        download.assert_called_once()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.fetch_county_footprint")

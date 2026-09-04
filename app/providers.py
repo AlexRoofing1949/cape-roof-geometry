@@ -704,6 +704,229 @@ def fetch_best_footprint(
     )
 
 
+def _polygonize_google_solar_mask(mask_path: Path) -> list[BaseGeometry]:
+    """Convert the one-bit Solar rooftop mask GeoTIFF to WGS84 polygons."""
+
+    try:
+        from osgeo import gdal, ogr
+    except (ImportError, OSError) as error:
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_RUNTIME_MISSING",
+            "The Google Solar rooftop-mask raster processor is unavailable.",
+        ) from error
+
+    try:
+        gdal.UseExceptions()
+        raster = gdal.OpenEx(str(mask_path), gdal.OF_RASTER | gdal.OF_READONLY)
+        if raster is None or raster.RasterCount != 1:
+            raise ValueError("mask raster is unavailable")
+        projection = str(raster.GetProjectionRef() or "").strip()
+        band = raster.GetRasterBand(1)
+        if not projection or band is None:
+            raise ValueError("mask raster has no georeference")
+        driver = ogr.GetDriverByName("Memory")
+        vector = driver.CreateDataSource("")
+        layer = vector.CreateLayer("roof_mask", raster.GetSpatialRef(), ogr.wkbPolygon)
+        layer.CreateField(ogr.FieldDefn("mask", ogr.OFTInteger))
+        gdal.Polygonize(band, None, layer, 0, ["8CONNECTED=8"])
+        polygons: list[BaseGeometry] = []
+        for feature in layer:
+            if int(feature.GetField("mask") or 0) != 1:
+                continue
+            raw_geometry = feature.GetGeometryRef()
+            if raw_geometry is None:
+                continue
+            geometry = shape(json.loads(raw_geometry.ExportToJson()))
+            if geometry.is_empty or not geometry.is_valid or geometry.geom_type != "Polygon":
+                continue
+            polygons.append(transform_geometry(geometry, projection, "EPSG:4326"))
+        return polygons
+    except (RuntimeError, ValueError, TypeError, json.JSONDecodeError) as error:
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_INVALID",
+            "Google Solar returned an unreadable or ungeoreferenced rooftop mask.",
+        ) from error
+
+
+def fetch_google_solar_roofprint(
+    building_footprint: FootprintResult,
+    longitude: float,
+    latitude: float,
+    workspace: Path,
+    settings: Settings,
+    solar_reference: Any,
+) -> FootprintResult:
+    """Refine a corroborated building polygon to Google's authorized rooftop mask."""
+
+    if not settings.solar_roofprint_enabled:
+        return building_footprint
+    query = urllib.parse.urlencode(
+        {
+            "location.latitude": latitude,
+            "location.longitude": longitude,
+            "radiusMeters": settings.solar_data_layer_radius_meters,
+            "view": "IMAGERY_LAYERS",
+            "requiredQuality": "HIGH",
+            "exactQualityRequired": "true",
+            "pixelSizeMeters": 0.1,
+            "key": settings.solar_api_key,
+        }
+    )
+    request = urllib.request.Request(
+        f"https://solar.googleapis.com/v1/dataLayers:get?{query}",
+        headers={"User-Agent": "CapeRoofGeometry/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=settings.provider_timeout_seconds) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code >= 500 or error.code in {408, 429}:
+            raise TransientProviderError(
+                "SOLAR_ROOF_MASK_HTTP_ERROR",
+                "Google Solar rooftop-mask data is temporarily unavailable.",
+            ) from error
+        raise NoCoverageError(
+            "SOLAR_ROOF_MASK_NOT_FOUND",
+            "Google Solar has no authorized high-quality rooftop mask for this property.",
+        ) from error
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+        raise TransientProviderError(
+            "SOLAR_ROOF_MASK_UNAVAILABLE",
+            "Google Solar rooftop-mask data is temporarily unavailable.",
+        ) from error
+
+    imagery = payload.get("imageryDate") if isinstance(payload, dict) else None
+    try:
+        imagery_date = (
+            f"{int(imagery['year']):04d}-{int(imagery['month']):02d}-{int(imagery['day']):02d}"
+        )
+    except (KeyError, TypeError, ValueError):
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_DATE_INVALID",
+            "Google Solar did not provide an auditable rooftop-mask imagery date.",
+        )
+    imagery_quality = str(payload.get("imageryQuality") or "").upper()
+    mask_url = str(payload.get("maskUrl") or "").strip()
+    if imagery_quality != "HIGH" or not mask_url.startswith("https://solar.googleapis.com/"):
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_QUALITY_INSUFFICIENT",
+            "Google Solar did not provide the required high-quality rooftop mask.",
+            details={"imageryQuality": imagery_quality, "imageryDate": imagery_date},
+        )
+
+    mask_path = workspace / "google-solar-roof-mask.tif"
+    separator = "&" if "?" in mask_url else "?"
+    authenticated_mask_url = (
+        f"{mask_url}{separator}{urllib.parse.urlencode({'key': settings.solar_api_key})}"
+    )
+    _download_file(
+        authenticated_mask_url,
+        mask_path,
+        timeout=settings.provider_timeout_seconds,
+        maximum_bytes=settings.solar_mask_maximum_bytes,
+    )
+    polygons = _polygonize_google_solar_mask(mask_path)
+    features = [
+        {
+            "type": "Feature",
+            "id": "solar-mask-"
+            + hashlib.sha256(
+                json.dumps(mapping(polygon), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:24],
+            "properties": {},
+            "geometry": mapping(polygon),
+        }
+        for polygon in polygons
+    ]
+    roofprint = _select_footprint_feature(
+        features,
+        longitude,
+        latitude,
+        settings,
+        provider="Google Solar Building Mask",
+        release=imagery_date,
+        license_name="GOOGLE_MAPS_PLATFORM_TERMS",
+        attribution="Includes data from Google Maps",
+    )
+
+    reference_ground_area = 0.0
+    for facet in getattr(solar_reference, "facets", []) or []:
+        ground_area = getattr(facet, "groundAreaSqFt", None)
+        if ground_area is None:
+            ground_area = float(getattr(facet, "areaSqFt", 0) or 0) * math.cos(
+                math.radians(float(getattr(facet, "pitchDegrees", 0) or 0))
+            )
+        reference_ground_area += float(ground_area or 0)
+    if reference_ground_area <= 0:
+        raise UnreliableGeometryError(
+            "SOLAR_GROUND_AREA_MISSING",
+            "Google Solar rooftop facets did not provide a usable ground-area reference.",
+        )
+    epsg = utm_epsg(longitude, latitude)
+    roofprint_m = transform_geometry(roofprint.geometry_wgs84, "EPSG:4326", f"EPSG:{epsg}")
+    roofprint_area_sqft = float(roofprint_m.area) * 10.763910416709722
+    ground_area_variance = (
+        abs(roofprint_area_sqft - reference_ground_area) / reference_ground_area * 100
+    )
+    if ground_area_variance > settings.solar_mask_maximum_ground_area_variance_percent:
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_AREA_CONFLICT",
+            "Google Solar's rooftop mask and facet ground area materially disagree.",
+            details={
+                "maskAreaSqFt": round(roofprint_area_sqft, 2),
+                "facetGroundAreaSqFt": round(reference_ground_area, 2),
+                "areaVariancePercent": round(ground_area_variance, 3),
+            },
+        )
+
+    comparison = _footprint_comparison(
+        building_footprint.geometry_wgs84, roofprint.geometry_wgs84
+    )
+    building_agreement = (
+        comparison["intersectionOverUnion"] >= settings.footprint_correlated_min_iou
+        and comparison["centroidSeparationMeters"]
+        <= settings.footprint_maximum_centroid_separation_meters
+        and comparison["areaDifferencePercent"]
+        <= settings.footprint_review_area_difference_percent
+    )
+    if not building_agreement:
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_BUILDING_CONFLICT",
+            "Google Solar's rooftop mask does not agree with the corroborated building location.",
+            details={key: round(value, 4) for key, value in comparison.items()},
+        )
+    audit = list(building_footprint.consensus_records)
+    audit.append(
+        {
+            "provider": roofprint.provider,
+            "lineageGroup": "GOOGLE_SOLAR_ROOF_MASK",
+            "imageryDate": imagery_date,
+            "imageryQuality": imagery_quality,
+            "maskAreaSqFt": round(roofprint_area_sqft, 2),
+            "facetGroundAreaSqFt": round(reference_ground_area, 2),
+            "groundAreaVariancePercent": round(ground_area_variance, 3),
+            "intersectionOverUnion": round(comparison["intersectionOverUnion"], 4),
+            "centroidSeparationMeters": round(comparison["centroidSeparationMeters"], 3),
+            "areaDifferencePercent": round(comparison["areaDifferencePercent"], 3),
+            "decision": "ROOFTOP_MASK_SELECTED_FOR_RECONSTRUCTION",
+        }
+    )
+    return replace(
+        roofprint,
+        source_records=[
+            {
+                "dataset": "Google Solar Data Layers building mask",
+                "imageryDate": imagery_date,
+                "imageryQuality": imagery_quality,
+                "pixelSizeMeters": 0.1,
+            }
+        ],
+        consensus_status="ROOF_MASK_CORROBORATED",
+        consensus_records=tuple(audit),
+        lineage_group="GOOGLE_SOLAR_ROOF_MASK",
+    )
+
+
 def write_footprint_inputs(
     footprint: FootprintResult,
     request_id: str,
