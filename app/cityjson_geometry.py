@@ -85,6 +85,14 @@ def _edge_length(a: tuple[float, float, float], b: tuple[float, float, float]) -
     return _norm(_vector(a, b))
 
 
+def _projected_edge_length(
+    a: tuple[float, float, float], b: tuple[float, float, float]
+) -> float:
+    """Return the planimetric length used to reconcile roof topology."""
+
+    return math.hypot(b[0] - a[0], b[1] - a[1])
+
+
 def _horizontal_ring_area(points: Iterable[tuple[float, float, float]]) -> float:
     values = list(points)
     return abs(
@@ -545,6 +553,9 @@ def extract_roof_geometry(
         entry = {
             "edgeId": f"{edge_prefixes[kind]}{counters[kind]}",
             "lengthFeet": _round(_edge_length(first.start, first.end) * METERS_TO_FEET),
+            "projectedLengthFeet": _round(
+                _projected_edge_length(first.start, first.end) * METERS_TO_FEET
+            ),
             "facetIds": [use.facet.facet_id for use in uses],
         }
         classified[kind].append(entry)
@@ -651,6 +662,10 @@ def extract_roof_geometry(
         kind: _round(sum(edge["lengthFeet"] for edge in entries))
         for kind, entries in classified.items()
     }
+    projected_totals = {
+        kind: _round(sum(edge["projectedLengthFeet"] for edge in entries))
+        for kind, entries in classified.items()
+    }
     result = {
         "roofAreaSqFt": _round(roof_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "averagePitchDegrees": _round(weighted_pitch),
@@ -665,6 +680,11 @@ def extract_roof_geometry(
             * SQUARE_METERS_TO_SQUARE_FEET
         ),
         "externalPerimeterFeet": _round(totals["eaves"] + totals["rakes"]),
+        "externalProjectedPerimeterFeet": _round(
+            projected_totals["eaves"]
+            + projected_totals["rakes"]
+            + projected_totals["highPerimeters"]
+        ),
         "internalRoofEdgeFeet": _round(
             totals["ridges"] + totals["hips"] + totals["valleys"]
         ),

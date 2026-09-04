@@ -60,6 +60,7 @@ class Settings:
     solar_mask_maximum_ground_area_variance_percent: float
     solar_mask_simplification_tolerance_meters: float
     roof_edge_node_tolerance_meters: float
+    maximum_roofprint_perimeter_variance_percent: float
     usgs_catalog_url: str
     county_boundaries_url: str
     lidar_registry_path: Path
@@ -159,6 +160,9 @@ class Settings:
             ),
             roof_edge_node_tolerance_meters=_float(
                 "ROOF_EDGE_NODE_TOLERANCE_METERS", 0.10
+            ),
+            maximum_roofprint_perimeter_variance_percent=_float(
+                "MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT", 10.0
             ),
             usgs_catalog_url=os.getenv(
                 "USGS_3DEP_CATALOG_URL", "https://usgs.entwine.io/boundaries/resources.geojson"
@@ -287,6 +291,11 @@ class Settings:
             raise ConfigurationError(
                 "SOLAR_ROOFPRINT_CONFIG_INVALID",
                 "Google Solar roof-mask limits are outside the supported fail-closed range.",
+            )
+        if not 2 <= self.maximum_roofprint_perimeter_variance_percent <= 15:
+            raise ConfigurationError(
+                "ROOFPRINT_PERIMETER_THRESHOLD_INVALID",
+                "MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT must be between 2 and 15.",
             )
         if self.microsoft_bfp_zoom != 9 or self.microsoft_bfp_maximum_tile_bytes < 25_000_000:
             raise ConfigurationError(

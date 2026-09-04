@@ -1,7 +1,12 @@
 import unittest
 from types import SimpleNamespace
 
-from app.pipeline import _combined_confidence, _confidence_diagnostics
+from app.errors import UnreliableGeometryError
+from app.pipeline import (
+    _combined_confidence,
+    _confidence_diagnostics,
+    _enforce_roofprint_perimeter_consistency,
+)
 
 
 class PipelineConfidenceTests(unittest.TestCase):
@@ -79,6 +84,31 @@ class PipelineConfidenceTests(unittest.TestCase):
         )
         self.assertNotIn("rawImage", result["currentStructure"]["currentImagery"])
         self.assertEqual(result["pointCloud"]["pointDensityPpsm"], 12.346)
+
+    def test_roofprint_perimeter_reconciliation_passes_without_inference(self):
+        geometry = {"externalProjectedPerimeterFeet": 100.0}
+        result = _enforce_roofprint_perimeter_consistency(
+            geometry,
+            SimpleNamespace(length=30.48),
+            10.0,
+        )
+
+        self.assertAlmostEqual(result["variancePercent"], 0.0, delta=0.001)
+        self.assertEqual(geometry["roofprintPerimeterReconciliation"], result)
+
+    def test_roofprint_perimeter_mismatch_fails_closed(self):
+        geometry = {"externalProjectedPerimeterFeet": 145.0}
+
+        with self.assertRaises(UnreliableGeometryError) as context:
+            _enforce_roofprint_perimeter_consistency(
+                geometry,
+                SimpleNamespace(length=30.48),
+                10.0,
+            )
+
+        self.assertEqual(context.exception.code, "ROOF_TOPOLOGY_PERIMETER_MISMATCH")
+        self.assertEqual(context.exception.details["variancePercent"], 45.0)
+        self.assertNotIn("roofprintPerimeterReconciliation", geometry)
 
 
 if __name__ == "__main__":

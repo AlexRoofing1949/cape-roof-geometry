@@ -32,6 +32,50 @@ from .source_registry import load_registries
 ROOF_NORMAL_KNN = 12
 MINIMUM_ROOF_NORMAL_Z = 0.65
 MAXIMUM_ROOF_CURVATURE = 0.12
+METERS_TO_FEET = 3.280839895013123
+
+
+def _enforce_roofprint_perimeter_consistency(
+    geometry: dict[str, Any],
+    projected_footprint: Any,
+    maximum_variance_percent: float,
+) -> dict[str, float]:
+    """Reject reconstructed exterior topology that cannot close to the roofprint.
+
+    The comparison is planimetric on both sides.  It is a topology validation
+    gate, never a source of inferred eave, rake, ridge, hip, or valley lengths.
+    """
+
+    roofprint_perimeter_feet = float(projected_footprint.length) * METERS_TO_FEET
+    reconstructed_perimeter_feet = float(
+        geometry.get("externalProjectedPerimeterFeet") or 0
+    )
+    if roofprint_perimeter_feet <= 0 or reconstructed_perimeter_feet <= 0:
+        raise UnreliableGeometryError(
+            "ROOF_TOPOLOGY_PERIMETER_MISSING",
+            "The reconstructed roof exterior could not be reconciled with the selected roofprint.",
+        )
+    variance_percent = (
+        abs(reconstructed_perimeter_feet - roofprint_perimeter_feet)
+        / roofprint_perimeter_feet
+        * 100
+    )
+    evidence = {
+        "roofprintPerimeterFeet": round(roofprint_perimeter_feet, 2),
+        "reconstructedProjectedPerimeterFeet": round(
+            reconstructed_perimeter_feet, 2
+        ),
+        "variancePercent": round(variance_percent, 3),
+        "maximumVariancePercent": round(maximum_variance_percent, 3),
+    }
+    if variance_percent > maximum_variance_percent:
+        raise UnreliableGeometryError(
+            "ROOF_TOPOLOGY_PERIMETER_MISMATCH",
+            "The reconstructed roof exterior does not close to the selected roofprint within the pricing-safe tolerance.",
+            details=evidence,
+        )
+    geometry["roofprintPerimeterReconciliation"] = evidence
+    return evidence
 
 
 def _run(
@@ -612,6 +656,11 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     maximum_nodata_fraction=settings.maximum_nodata_fraction,
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
                     include_validation_facets=True,
+                )
+                _enforce_roofprint_perimeter_consistency(
+                    geometry,
+                    projected_footprint,
+                    settings.maximum_roofprint_perimeter_variance_percent,
                 )
                 validation_facets = geometry.pop("_validationFacets")
                 plane_validation = validate_roofer_planes(

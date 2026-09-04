@@ -76,6 +76,13 @@ Before deployment:
 
 Cape Roof has approved historical-but-unchanged LiDAR acquired on or after January 1, 2018, so `ALLOW_HISTORICAL_VERIFIED_PRICING` is `true`. Keep `AUTOMATIC_PRICING_ENABLED=false` until deployment and live positive-path tests verify the full measurement, pricing, PDF, Drive and email transaction.
 
+The geometry service also requires the reconstructed planimetric exterior to
+match the selected roofprint perimeter.  Set
+`MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT=10`; the supported fail-closed
+range is 2–15 percent.  This gate only detects broken exterior topology.  It
+never derives roof lines from a parcel, appraiser sketch, or footprint and a
+mismatch returns `INSPECTION_REQUIRED` through the customer-safe workflow.
+
 ### Private EagleView calibration
 
 Operator-authorized EagleView PDFs, measurement JSON and OBJ meshes can be checked offline without copying
