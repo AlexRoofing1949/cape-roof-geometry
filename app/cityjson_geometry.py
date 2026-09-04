@@ -483,9 +483,26 @@ def extract_roof_geometry(
             continue
         first_delta = _facet_side_height_delta(first)
         second_delta = _facet_side_height_delta(second)
-        if first_delta > plane_side_tolerance_meters and second_delta > plane_side_tolerance_meters:
+        first_decisive = abs(first_delta) > plane_side_tolerance_meters
+        second_decisive = abs(second_delta) > plane_side_tolerance_meters
+        # A roof plane can be tangent to a shared edge while the adjacent plane
+        # has a decisive cross-edge derivative.  In that case the non-zero
+        # derivative still determines the local dihedral sign: positive is a
+        # concave/valley edge and negative is a convex ridge/hip edge.  Requiring
+        # both derivatives to clear the tolerance incorrectly rejects valid
+        # flat-to-slope and rake-aligned intersections.  Opposing decisive
+        # derivatives remain ambiguous and fail closed below.
+        decisive_deltas = [
+            delta
+            for delta, decisive in (
+                (first_delta, first_decisive),
+                (second_delta, second_decisive),
+            )
+            if decisive
+        ]
+        if decisive_deltas and all(delta > 0 for delta in decisive_deltas):
             add_edge("valleys", uses)
-        elif first_delta < -plane_side_tolerance_meters and second_delta < -plane_side_tolerance_meters:
+        elif decisive_deltas and all(delta < 0 for delta in decisive_deltas):
             if abs(first.start[2] - first.end[2]) <= horizontal_edge_tolerance_meters:
                 add_edge("ridges", uses)
             else:
