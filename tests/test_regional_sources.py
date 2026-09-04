@@ -773,6 +773,15 @@ sources:
             stage_types = [stage["type"] for stage in stages]
             self.assertLess(stage_types.index("filters.stats"), stage_types.index("filters.assign"))
             self.assertLess(stage_types.index("filters.outlier"), stage_types.index("filters.stats"))
+            self.assertEqual(stage_types.count("filters.mortonorder"), 1)
+            self.assertLess(
+                stage_types.index("filters.reprojection"),
+                stage_types.index("filters.mortonorder"),
+            )
+            self.assertLess(
+                stage_types.index("filters.mortonorder"),
+                stage_types.index("filters.outlier"),
+            )
             self.assertLess(stage_types.index("filters.reprojection"), stage_types.index("filters.hag_delaunay"))
             self.assertLess(stage_types.index("filters.hag_delaunay"), stage_types.index("filters.cluster"))
             self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.normal"))
@@ -791,6 +800,14 @@ sources:
             )
             self.assertEqual(audit["classHistogram"], {"1": 120, "2": 80})
             self.assertEqual(audit["noiseFilter"]["outlierClassRemoved"], 7)
+            self.assertEqual(
+                audit["pointOrder"],
+                {
+                    "provider": "PDAL filters.mortonorder",
+                    "method": "XY Morton order",
+                    "reverse": False,
+                },
+            )
             self.assertTrue(audit["classOneCorrection"]["applied"])
             self.assertEqual(audit["classOneCorrection"]["normalKnn"], 12)
             self.assertEqual(audit["classOneCorrection"]["minimumNormalZ"], 0.65)

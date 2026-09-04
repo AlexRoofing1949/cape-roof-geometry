@@ -170,6 +170,14 @@ def _pdal_crop(
                 "out_srs": f"EPSG:{target_epsg}",
             },
             {
+                # EPT nodes are fetched concurrently, so their arrival order is
+                # not a stable reconstruction input.  Canonical XY ordering
+                # makes every downstream neighbourhood/cluster calculation and
+                # Roofer invocation consume the same point sequence.
+                "type": "filters.mortonorder",
+                "reverse": False,
+            },
+            {
                 "type": "filters.expression",
                 "expression": class_expression,
             },
@@ -240,6 +248,11 @@ def _pdal_crop(
         "allowedClasses": list(lidar.allowed_classes),
         "roofClasses": list(lidar.roof_classes),
         "rooferClassNormalization": roofer_class_assignments,
+        "pointOrder": {
+            "provider": "PDAL filters.mortonorder",
+            "method": "XY Morton order",
+            "reverse": False,
+        },
         "noiseFilter": {
             "provider": "PDAL filters.outlier",
             "method": "statistical",
