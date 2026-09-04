@@ -602,6 +602,10 @@ def extract_roof_geometry(
                 "facetId": facet.facet_id,
                 "verticesMeters": [list(vertex) for vertex in facet.vertices],
                 "normal": list(facet.normal),
+                "areaSqFt": _round(
+                    facet.area_square_meters * SQUARE_METERS_TO_SQUARE_FEET
+                ),
+                "pitchDegrees": _round(facet.pitch_degrees, 3),
             }
             for facet in facets
         ]

@@ -68,6 +68,10 @@ def validate_facet_points(
                 "Too few roof points support a reconstructed facet.",
                 details={
                     "facetId": facet_id,
+                    "facetAreaSqFt": round(float(facet.get("areaSqFt") or 0), 2),
+                    "reconstructedPitchDegrees": round(
+                        float(facet.get("pitchDegrees") or 0), 3
+                    ),
                     "supportPoints": int(len(selected)),
                     "minimumSupportPoints": settings.open3d_minimum_facet_points,
                 },
@@ -87,6 +91,9 @@ def validate_facet_points(
         normal_angle = math.degrees(
             math.acos(float(np.clip(np.dot(fitted_normal, roofer_normal), -1.0, 1.0)))
         )
+        fitted_pitch = math.degrees(
+            math.acos(float(np.clip(fitted_normal[2], -1.0, 1.0)))
+        )
         inliers = selected[np.asarray(inlier_indexes, dtype=int)]
         inlier_ratio = len(inliers) / len(selected)
         denominator = float(np.linalg.norm(coefficients[:3]))
@@ -102,6 +109,11 @@ def validate_facet_points(
             failures.append("PLANE_RMSE_TOO_HIGH")
         result = {
             "facetId": facet_id,
+            "facetAreaSqFt": round(float(facet.get("areaSqFt") or 0), 2),
+            "reconstructedPitchDegrees": round(
+                float(facet.get("pitchDegrees") or 0), 3
+            ),
+            "fittedPitchDegrees": round(fitted_pitch, 3),
             "supportPoints": int(len(selected)),
             "inlierPoints": int(len(inliers)),
             "inlierRatio": round(inlier_ratio, 4),
