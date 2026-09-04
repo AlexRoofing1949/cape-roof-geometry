@@ -51,7 +51,12 @@ class PlaneValidationTests(unittest.TestCase):
                 (workspace / "open3d-points-pipeline.json").read_text(encoding="utf-8")
             )["pipeline"]
             writer = pipeline[-1]
+            stage_types = [stage["type"] if isinstance(stage, dict) else "reader" for stage in pipeline]
             self.assertEqual(result["validation"], "PASSED")
+            self.assertLess(
+                stage_types.index("filters.approximatecoplanar"),
+                stage_types.index("filters.normal"),
+            )
             self.assertEqual(writer["type"], "writers.text")
             self.assertEqual(writer["order"], "X:8,Y:8,Z:8")
             self.assertFalse(writer["keep_unspecified"])

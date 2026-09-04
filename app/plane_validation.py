@@ -16,6 +16,12 @@ from shapely.geometry import Polygon
 from .errors import TransientProviderError, UnreliableGeometryError
 
 
+VALIDATION_COPLANAR_KNN = 8
+VALIDATION_NORMAL_KNN = 12
+VALIDATION_MINIMUM_NORMAL_Z = 0.65
+VALIDATION_MAXIMUM_CURVATURE = 0.12
+
+
 def _open3d() -> Any:
     try:
         return importlib.import_module("open3d")
@@ -180,6 +186,23 @@ def validate_roofer_planes(
                 "pipeline": [
                     str(pointcloud_path),
                     {"type": "filters.expression", "expression": "Classification == 6"},
+                    {
+                        "type": "filters.approximatecoplanar",
+                        "knn": VALIDATION_COPLANAR_KNN,
+                    },
+                    {"type": "filters.expression", "expression": "Coplanar == 1"},
+                    {
+                        "type": "filters.normal",
+                        "knn": VALIDATION_NORMAL_KNN,
+                        "always_up": True,
+                    },
+                    {
+                        "type": "filters.expression",
+                        "expression": (
+                            f"NormalZ >= {VALIDATION_MINIMUM_NORMAL_Z} "
+                            f"&& Curvature <= {VALIDATION_MAXIMUM_CURVATURE}"
+                        ),
+                    },
                     {
                         "type": "writers.text",
                         "filename": str(xyz_path),
