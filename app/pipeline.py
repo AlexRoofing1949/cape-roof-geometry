@@ -28,6 +28,11 @@ from .providers import (
 from .source_registry import load_registries
 
 
+ROOF_NORMAL_KNN = 12
+MINIMUM_ROOF_NORMAL_Z = 0.65
+MAXIMUM_ROOF_CURVATURE = 0.12
+
+
 def _run(
     command: list[str], *, timeout: int, environment: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -93,6 +98,19 @@ def _pdal_crop(
                 "type": "filters.expression",
                 "expression": "ClusterID > 0",
             },
+            {
+                "type": "filters.normal",
+                "knn": ROOF_NORMAL_KNN,
+                "always_up": True,
+            },
+            {
+                "type": "filters.expression",
+                "expression": (
+                    "Classification == 6 || "
+                    f"(Classification == 1 && NormalZ >= {MINIMUM_ROOF_NORMAL_Z} "
+                    f"&& Curvature <= {MAXIMUM_ROOF_CURVATURE})"
+                ),
+            },
         ]
     pipeline = {
         "pipeline": [
@@ -126,7 +144,7 @@ def _pdal_crop(
             {
                 "type": "filters.stats",
                 "dimensions": (
-                    "Classification,GpsTime,HeightAboveGround,ClusterID"
+                    "Classification,GpsTime,HeightAboveGround,ClusterID,NormalZ,Curvature"
                     if class_one_preprocessing
                     else "Classification,GpsTime"
                 ),
@@ -186,11 +204,17 @@ def _pdal_crop(
         },
         "classOneCorrection": {
             "applied": bool(class_one_preprocessing),
-            "method": "PDAL HAG + height filter + 3D cluster noise rejection",
+            "method": (
+                "PDAL HAG + height filter + 3D cluster noise rejection + "
+                "surface-normal/curvature filtering for unclassified returns"
+            ),
             "minimumHeightAboveGroundMeters": settings.minimum_roof_hag_meters,
             "maximumHeightAboveGroundMeters": settings.maximum_roof_hag_meters,
             "clusterToleranceMeters": settings.roof_cluster_tolerance_meters,
             "minimumClusterPoints": settings.minimum_roof_cluster_points,
+            "normalKnn": ROOF_NORMAL_KNN,
+            "minimumNormalZ": MINIMUM_ROOF_NORMAL_Z,
+            "maximumCurvature": MAXIMUM_ROOF_CURVATURE,
         },
         "tileAcquisitionDate": tile_acquisition_date,
         "pipeline": pipeline,

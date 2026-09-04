@@ -566,6 +566,7 @@ sources:
             self.assertLess(stage_types.index("filters.outlier"), stage_types.index("filters.stats"))
             self.assertLess(stage_types.index("filters.reprojection"), stage_types.index("filters.hag_delaunay"))
             self.assertLess(stage_types.index("filters.hag_delaunay"), stage_types.index("filters.cluster"))
+            self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.normal"))
             self.assertEqual(
                 sum(
                     stage.get("expression") == "ClusterID > 0"
@@ -582,6 +583,18 @@ sources:
             self.assertEqual(audit["classHistogram"], {"1": 120, "2": 80})
             self.assertEqual(audit["noiseFilter"]["outlierClassRemoved"], 7)
             self.assertTrue(audit["classOneCorrection"]["applied"])
+            self.assertEqual(audit["classOneCorrection"]["normalKnn"], 12)
+            self.assertEqual(audit["classOneCorrection"]["minimumNormalZ"], 0.65)
+            self.assertEqual(audit["classOneCorrection"]["maximumCurvature"], 0.12)
+            self.assertIn(
+                "Classification == 1 && NormalZ >= 0.65 && Curvature <= 0.12",
+                next(
+                    stage["expression"]
+                    for stage in stages
+                    if stage.get("type") == "filters.expression"
+                    and "NormalZ" in stage.get("expression", "")
+                ),
+            )
             run.assert_called_once()
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
