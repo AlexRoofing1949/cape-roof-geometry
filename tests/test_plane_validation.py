@@ -15,6 +15,7 @@ def settings():
     return SimpleNamespace(
         open3d_minimum_facet_points=20,
         open3d_minimum_inlier_ratio=0.65,
+        open3d_maximum_assignment_distance_meters=0.6,
         open3d_distance_threshold_meters=0.05,
         open3d_maximum_normal_variance_degrees=5,
         open3d_maximum_plane_rmse_meters=0.05,
@@ -166,6 +167,26 @@ class PlaneValidationTests(unittest.TestCase):
         self.assertEqual(result["facets"][0]["planViewCandidatePoints"], 192)
         self.assertEqual(result["facets"][0]["supportPoints"], 96)
         self.assertEqual(result["facets"][1]["supportPoints"], 96)
+
+    def test_plane_assignment_discards_returns_far_from_every_reconstructed_plane(self):
+        roof = np.asarray(
+            [[x, y, 3 + 0.5 * y] for x in np.linspace(0.1, 9.9, 12) for y in np.linspace(0.1, 4.9, 8)],
+            dtype=float,
+        )
+        remote_layer = roof + np.asarray([0, 0, 3], dtype=float)
+        result = validate_facet_points(
+            np.vstack([roof, remote_layer]),
+            [
+                {
+                    "facetId": "F1",
+                    "verticesMeters": [[0, 0, 3], [10, 0, 3], [10, 5, 5.5], [0, 5, 5.5]],
+                    "normal": [0, -0.5, 1],
+                }
+            ],
+            settings(),
+        )
+        self.assertEqual(result["facets"][0]["supportPoints"], len(roof))
+        self.assertEqual(result["facets"][0]["discardedBeyondPlaneDistance"], len(remote_layer))
 
     def test_disagreeing_plane_fails_closed(self):
         points = np.asarray(

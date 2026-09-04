@@ -82,7 +82,10 @@ def validate_facet_points(
             (points[mask] - prepared["origin"]) @ prepared["normal"]
         )
     closest_facets = np.argmin(candidate_distances, axis=0)
-    has_candidate = np.isfinite(np.min(candidate_distances, axis=0))
+    closest_distances = np.min(candidate_distances, axis=0)
+    has_candidate = np.isfinite(closest_distances) & (
+        closest_distances <= settings.open3d_maximum_assignment_distance_meters
+    )
 
     for facet_index, prepared in enumerate(prepared_facets):
         facet = prepared["facet"]
@@ -90,6 +93,9 @@ def validate_facet_points(
         # Include points on reconstructed boundaries without allowing material
         # spillover from an adjacent or vertically overlapping roof plane.
         selected = points[has_candidate & (closest_facets == facet_index)]
+        assigned_before_distance_gate = int(
+            np.count_nonzero(np.isfinite(closest_distances) & (closest_facets == facet_index))
+        )
         if len(selected) < settings.open3d_minimum_facet_points:
             raise UnreliableGeometryError(
                 "OPEN3D_FACET_SUPPORT_INSUFFICIENT",
@@ -102,6 +108,10 @@ def validate_facet_points(
                     ),
                     "planViewCandidatePoints": plan_view_candidate_counts[facet_index],
                     "supportPoints": int(len(selected)),
+                    "discardedBeyondPlaneDistance": assigned_before_distance_gate - int(len(selected)),
+                    "maximumAssignmentDistanceMeters": (
+                        settings.open3d_maximum_assignment_distance_meters
+                    ),
                     "minimumSupportPoints": settings.open3d_minimum_facet_points,
                 },
             )
@@ -163,6 +173,8 @@ def validate_facet_points(
             ],
             "planViewCandidatePoints": plan_view_candidate_counts[facet_index],
             "supportPoints": int(len(selected)),
+            "discardedBeyondPlaneDistance": assigned_before_distance_gate - int(len(selected)),
+            "maximumAssignmentDistanceMeters": settings.open3d_maximum_assignment_distance_meters,
             "inlierPoints": int(len(inliers)),
             "inlierRatio": round(inlier_ratio, 4),
             "normalVarianceDegrees": round(normal_angle, 3),

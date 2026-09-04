@@ -101,6 +101,7 @@ class Settings:
     allow_historical_verified_pricing: bool
     open3d_minimum_facet_points: int
     open3d_minimum_inlier_ratio: float
+    open3d_maximum_assignment_distance_meters: float
     open3d_distance_threshold_meters: float
     open3d_maximum_normal_variance_degrees: float
     open3d_maximum_plane_rmse_meters: float
@@ -211,6 +212,9 @@ class Settings:
             ).strip().lower() in {"1", "true", "yes"},
             open3d_minimum_facet_points=_int("OPEN3D_MINIMUM_FACET_POINTS", 20),
             open3d_minimum_inlier_ratio=_float("OPEN3D_MINIMUM_INLIER_RATIO", 0.65),
+            open3d_maximum_assignment_distance_meters=_float(
+                "OPEN3D_MAXIMUM_ASSIGNMENT_DISTANCE_METERS", 0.60
+            ),
             open3d_distance_threshold_meters=_float("OPEN3D_DISTANCE_THRESHOLD_METERS", 0.15),
             open3d_maximum_normal_variance_degrees=_float(
                 "OPEN3D_MAXIMUM_NORMAL_VARIANCE_DEGREES", 5
@@ -354,7 +358,10 @@ class Settings:
                 "OPEN3D_VERSION_INVALID", "OPEN3D_VERSION must be a pinned semantic version."
             )
         if not (
-            0 < self.open3d_distance_threshold_meters <= 0.30
+            0 < self.open3d_maximum_assignment_distance_meters <= 1.0
+            and self.open3d_distance_threshold_meters
+            < self.open3d_maximum_assignment_distance_meters
+            and 0 < self.open3d_distance_threshold_meters <= 0.30
             and 0 < self.open3d_maximum_plane_rmse_meters <= 0.30
             and 0 < self.open3d_maximum_normal_variance_degrees <= 15
         ):
