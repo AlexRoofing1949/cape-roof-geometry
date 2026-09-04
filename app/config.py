@@ -118,9 +118,9 @@ class Settings:
             service_source_url=os.getenv("SERVICE_SOURCE_URL", "").strip(),
             service_commit=os.getenv("SERVICE_COMMIT", "").strip().lower(),
             roofer_commit=os.getenv(
-                "ROOFER_COMMIT", "bb2a85a99c424001e698dac0e97485a5da31e27e"
+                "ROOFER_COMMIT", "1c06fb1aed9096f4b16f894c2da12bc2d785b71b"
             ).strip().lower(),
-            roofer_version=os.getenv("ROOFER_VERSION", "1.0.0").strip(),
+            roofer_version=os.getenv("ROOFER_VERSION", "1.1.0-beta.1").strip(),
             pdal_version=os.getenv("PDAL_VERSION", "2.9.2").strip(),
             overturemaps_version=os.getenv("OVERTUREMAPS_VERSION", "1.0.1").strip(),
             open3d_version=os.getenv("OPEN3D_VERSION", "0.19.0").strip(),
