@@ -985,6 +985,11 @@ def select_regional_lidar(
             record["decision"] = "REJECTED_LICENSE_UNVERIFIED"
             audit.append(record)
             continue
+        if source.acquired_end < settings.minimum_lidar_acquisition_date:
+            record["decision"] = "REJECTED_BEFORE_MINIMUM_ACQUISITION_DATE"
+            record["minimumAcquisitionDate"] = settings.minimum_lidar_acquisition_date.isoformat()
+            audit.append(record)
+            continue
 
         if source.access == "usgs_tnm":
             if catalog_features is None:
@@ -1055,6 +1060,4 @@ def select_regional_lidar(
     )
     if not candidates:
         raise NoCoverageError("NO_LIDAR_COVERAGE", "No enabled registered LiDAR source completely covers this building.")
-    if candidates[0].age_years > settings.maximum_lidar_age_years:
-        raise UnreliableGeometryError("LIDAR_DATA_TOO_OLD", "The newest registered LiDAR exceeds the maximum age threshold.")
     return county, candidates, audit

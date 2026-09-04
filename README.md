@@ -5,7 +5,7 @@ This directory supplies the missing `POST /v1/roof-geometry` service already exp
 ## Production stack
 
 1. The footprint resolver first uses the official Overture Maps client against a pinned open Buildings release. If that source has no usable coverage, it falls back in order to the pinned Microsoft GlobalML Building Footprints release, an explicitly authorized Lee County building layer, and a cached OpenStreetMap Overpass response. Overture, Microsoft and OSM are one correlated open-map lineage rather than three votes. County/open-map consensus requires IoU at least 0.80, centroid separation no more than 2 m and area difference no more than 10%; material or correlated-source disagreement fails closed.
-2. The service resolves the building against the official Census county layer and the eight-county Southwest Florida registry. It ranks registered Manatee 2025, NOAA pre-/post-Ian 2022, and Florida Peninsular 2018–2020 candidates by exact registered acquisition date and complete buffered-footprint coverage. Lee 2026 remains disabled until its files, footprint and reuse terms are verified.
+2. The service resolves the building against the official Census county layer and the eight-county Southwest Florida registry. It ranks registered Manatee 2025, NOAA pre-/post-Ian 2022, and Florida Peninsular 2018–2020 candidates by exact registered acquisition date and complete buffered-footprint coverage. It always tries the newest valid candidate first and rejects both registered sources and exact property-crop dates earlier than the fixed `2018-01-01` acquisition floor. Lee 2026 remains disabled until its files, footprint and reuse terms are verified.
 3. PDAL streams only the selected buffered property crop. Allowed surface, ground and building classes come from the selected source record, so NOAA class-1 surface returns are not discarded and bathymetric-only/noise classes are not accepted as roof evidence. The enumerated class histogram and exact pipeline are retained in the audit response.
 4. 3DBAG Roofer v1.0.0 reconstructs LoD2.2 roof planes from the classified point cloud and the selected footprint.
 5. Open3D independently fits every reconstructed facet to the normalized roof returns and rejects weak support, excessive residual error, or normal disagreement.
@@ -14,7 +14,7 @@ This directory supplies the missing `POST /v1/roof-geometry` service already exp
 
 The current-imagery validator is implemented and intentionally fail-closed. It accepts only an enabled registry entry whose machine-readable source, exact capture date, resolution, commercial reuse terms, coverage, quality and change metrics have been recorded. Lee County's authorized 2026 building evidence is enabled; counties without authorized current evidence use the Google Solar building-model reconciliation when eligible or return `INSPECTION_REQUIRED`. Geometry remains available for audit while pricing, PDF generation and a price email stay blocked.
 
-Roofer documents about 10 points/m² as a good input density. This service defaults to a minimum of 8 points/m², no more than 10% missing roof coverage, no more than 0.35 m LoD2.2 RMSE, a maximum 10-year LiDAR age, and an overall confidence of at least 0.80. All thresholds are environment-controlled and should be calibrated against onsite measurements before automatic estimates are enabled.
+Roofer documents about 10 points/m² as a good input density. This service defaults to a minimum of 8 points/m², no more than 10% missing roof coverage, no more than 0.35 m LoD2.2 RMSE, a fixed minimum LiDAR acquisition date of January 1, 2018, and an overall confidence of at least 0.80. Historical LiDAR may authorize pricing only after newer authorized evidence verifies the building is unchanged. Missing, stale, low-quality, or conflicting evidence remains `INSPECTION_REQUIRED`.
 
 ## License and data terms
 
@@ -72,7 +72,7 @@ Before deployment:
 
 `deploy/docker-compose.yml` remains an optional self-hosted development path; it is not the Cape Roof production route.
 
-During calibration, the corresponding Apps Script Config values `AUTOMATIC_PRICING_ENABLED` and `ALLOW_HISTORICAL_VERIFIED_PRICING` must remain `false`.
+Cape Roof has approved historical-but-unchanged LiDAR acquired on or after January 1, 2018, so `ALLOW_HISTORICAL_VERIFIED_PRICING` is `true`. Keep `AUTOMATIC_PRICING_ENABLED=false` until deployment and live positive-path tests verify the full measurement, pricing, PDF, Drive and email transaction.
 
 ### Private EagleView calibration
 
@@ -91,7 +91,7 @@ and every triangle verifies `sloped_area = horizontal_area / cos(pitch_angle)`. 
 unless area and pitch are within the configured tolerances and the roof-facet count agrees exactly. Missing or
 failed geometry remains `inspectionRequired:true`; this tool never enables customer pricing.
 
-When no packaged county orthophoto evidence is enabled, the service can use the
+When no packaged county orthophoto evidence is enabled, the service uses the
 Google Solar Building Insights values already supplied by Apps Script as a
 fail-closed current-building comparison. It requires newer, high-quality,
 recent imagery metadata plus agreement between Solar ground/roof/pitch values,

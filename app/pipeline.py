@@ -415,6 +415,27 @@ def _combined_confidence(
     return round(score, 3), {key: round(value, 3) for key, value in components.items()}
 
 
+def _enforce_lidar_acquisition_floor(
+    lidar: LidarResource, tile_acquisition_date: str, settings: Settings
+) -> date | None:
+    """Reject an exact property-crop date older than the approved fixed floor."""
+
+    if not tile_acquisition_date:
+        return None
+    acquired = date.fromisoformat(tile_acquisition_date)
+    if acquired < settings.minimum_lidar_acquisition_date:
+        raise UnreliableGeometryError(
+            "LIDAR_TILE_BEFORE_MINIMUM_ACQUISITION_DATE",
+            "The property crop predates the approved LiDAR acquisition floor.",
+            details={
+                "sourceId": lidar.source_id,
+                "tileAcquisitionDate": acquired.isoformat(),
+                "minimumAcquisitionDate": settings.minimum_lidar_acquisition_date.isoformat(),
+            },
+        )
+    return acquired
+
+
 def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, Any]:
     longitude = request.location.longitude
     latitude = request.location.latitude
@@ -442,7 +463,10 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
             try:
                 point_audit = _pdal_crop(lidar, crop_wkt, target_epsg, pointcloud, workspace, settings)
                 if point_audit["tileAcquisitionDate"]:
-                    acquired = date.fromisoformat(point_audit["tileAcquisitionDate"])
+                    acquired = _enforce_lidar_acquisition_floor(
+                        lidar, point_audit["tileAcquisitionDate"], settings
+                    )
+                    assert acquired is not None
                     today = datetime.now(timezone.utc).date()
                     age_years = max(
                         0,

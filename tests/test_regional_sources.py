@@ -1,7 +1,8 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,7 +13,12 @@ from app.source_registry import load_registries
 try:
     from shapely.geometry import Polygon, mapping
 
-    from app.pipeline import _classification_histogram, _exact_gps_acquisition_date, _pdal_crop
+    from app.pipeline import (
+        _classification_histogram,
+        _enforce_lidar_acquisition_floor,
+        _exact_gps_acquisition_date,
+        _pdal_crop,
+    )
     from app.errors import NoCoverageError, UnreliableGeometryError
     from app.providers import (
         FootprintResult,
@@ -43,6 +49,7 @@ def settings():
         lidar_buffer_meters=8,
         minimum_lidar_coverage_ratio=0.98,
         maximum_lidar_age_years=10,
+        minimum_lidar_acquisition_date=date(2018, 1, 1),
     )
 
 
@@ -297,6 +304,67 @@ sources:
         self.assertEqual(candidates[1].source_id, "noaa_pre_ian_2022")
         self.assertTrue(all(item.source_id != "lcmcd_lee_2026" for item in candidates))
         self.assertTrue(any(item["sourceId"] == "lcmcd_lee_2026" for item in audit))
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._catalog_features", return_value=iter(()))
+    @patch("app.providers.resolve_service_county", return_value="Lee")
+    @patch("app.providers._ept_coverage")
+    def test_registry_source_before_2018_floor_is_rejected(
+        self, ept_coverage, _county, _catalog
+    ):
+        ept_coverage.return_value = (
+            Polygon([(-83, 25), (-80, 25), (-80, 28), (-83, 28)]),
+            1_000_000,
+        )
+        old_fallback = replace(
+            next(
+                source
+                for source in self.registries.lidar_sources
+                if source.id == "usgs_florida_peninsular_2018_2020"
+            ),
+            acquired_start=date(2017, 1, 1),
+            acquired_end=date(2017, 12, 31),
+        )
+        registries = replace(
+            self.registries,
+            lidar_sources=tuple(
+                old_fallback
+                if source.id == "usgs_florida_peninsular_2018_2020"
+                else source
+                for source in self.registries.lidar_sources
+            ),
+        )
+
+        _, candidates, audit = select_regional_lidar(
+            footprint(), -81.9509, 26.6211, settings(), registries
+        )
+
+        self.assertNotIn(old_fallback.id, [item.source_id for item in candidates])
+        self.assertTrue(
+            any(
+                item["sourceId"] == old_fallback.id
+                and item["decision"] == "REJECTED_BEFORE_MINIMUM_ACQUISITION_DATE"
+                and item["minimumAcquisitionDate"] == "2018-01-01"
+                for item in audit
+            )
+        )
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    def test_exact_property_crop_before_2018_floor_is_rejected(self):
+        lidar = SimpleNamespace(source_id="test-pre-2018")
+        with self.assertRaises(UnreliableGeometryError) as raised:
+            _enforce_lidar_acquisition_floor(lidar, "2017-12-31", settings())
+        self.assertEqual(
+            raised.exception.code, "LIDAR_TILE_BEFORE_MINIMUM_ACQUISITION_DATE"
+        )
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    def test_exact_property_crop_on_2018_floor_is_allowed(self):
+        lidar = SimpleNamespace(source_id="test-2018")
+        self.assertEqual(
+            _enforce_lidar_acquisition_floor(lidar, "2018-01-01", settings()),
+            date(2018, 1, 1),
+        )
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers._catalog_features", return_value=iter(()))

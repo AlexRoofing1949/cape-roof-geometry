@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from .errors import ConfigurationError
@@ -22,6 +23,14 @@ def _int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError as error:
         raise ConfigurationError("CONFIG_NUMBER_INVALID", f"{name} must be an integer.") from error
+
+
+def _date(name: str, default: str) -> date:
+    value = os.getenv(name, default).strip()
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise ConfigurationError("CONFIG_DATE_INVALID", f"{name} must use YYYY-MM-DD.") from error
 
 
 @dataclass(frozen=True)
@@ -67,6 +76,7 @@ class Settings:
     minimum_roof_cluster_points: int
     lidar_buffer_meters: float
     maximum_lidar_age_years: int
+    minimum_lidar_acquisition_date: date
     minimum_point_density: float
     maximum_nodata_fraction: float
     maximum_roofer_rmse_meters: float
@@ -164,6 +174,9 @@ class Settings:
             minimum_roof_cluster_points=_int("MINIMUM_ROOF_CLUSTER_POINTS", 20),
             lidar_buffer_meters=_float("LIDAR_BUFFER_METERS", 8),
             maximum_lidar_age_years=_int("MAXIMUM_LIDAR_AGE_YEARS", 10),
+            minimum_lidar_acquisition_date=_date(
+                "MINIMUM_LIDAR_ACQUISITION_DATE", "2018-01-01"
+            ),
             minimum_point_density=_float("MINIMUM_POINT_DENSITY", 8),
             maximum_nodata_fraction=_float("MAXIMUM_NODATA_FRACTION", 0.10),
             maximum_roofer_rmse_meters=_float("MAXIMUM_ROOFER_RMSE_METERS", 0.35),
@@ -279,6 +292,11 @@ class Settings:
             raise ConfigurationError(
                 "LIDAR_COVERAGE_THRESHOLD_INVALID",
                 "MINIMUM_LIDAR_COVERAGE_RATIO must be between 0.98 and 1.",
+            )
+        if not date(2018, 1, 1) <= self.minimum_lidar_acquisition_date <= date.today():
+            raise ConfigurationError(
+                "LIDAR_MINIMUM_DATE_INVALID",
+                "MINIMUM_LIDAR_ACQUISITION_DATE must be between 2018-01-01 and today.",
             )
         if not 0 <= self.current_lidar_max_age_years <= 5:
             raise ConfigurationError(
