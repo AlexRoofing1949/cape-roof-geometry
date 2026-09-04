@@ -288,6 +288,29 @@ sources:
         self.assertEqual(audit["toleranceMeters"], 0.25)
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    def test_google_solar_mask_reduces_tolerance_when_area_would_change(self):
+        notched = Polygon(
+            [
+                (0, 0),
+                (10, 0),
+                (10, 10),
+                (8, 10),
+                (8, 9.6),
+                (2, 9.6),
+                (2, 10),
+                (0, 10),
+            ]
+        )
+
+        simplified, audit = _simplify_google_solar_mask(notched, 0.50)
+
+        self.assertAlmostEqual(simplified.area, notched.area, places=6)
+        self.assertEqual(audit["requestedToleranceMeters"], 0.50)
+        self.assertEqual(audit["toleranceMeters"], 0.25)
+        self.assertTrue(audit["fallbackApplied"])
+        self.assertGreater(audit["attempts"][0]["areaChangePercent"], 2.0)
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.fetch_county_footprint")
     @patch("app.providers.fetch_overture_footprint")
     def test_footprint_consensus_conflict_fails_closed(self, overture, county):

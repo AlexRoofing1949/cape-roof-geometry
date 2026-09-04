@@ -19,6 +19,7 @@ from .errors import UnreliableGeometryError
 METERS_TO_FEET = 3.280839895013123
 SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
 EDGE_NODE_TOLERANCE_METERS = 0.10
+EDGE_NODE_VERTICAL_TOLERANCE_METERS = 0.30
 
 
 @dataclass(frozen=True)
@@ -172,36 +173,44 @@ def _edge_parameter(
     start: tuple[float, float, float],
     end: tuple[float, float, float],
     tolerance_meters: float,
+    vertical_tolerance_meters: float,
 ) -> float | None:
-    direction = _vector(start, end)
-    denominator = _dot(direction, direction)
+    direction_x = end[0] - start[0]
+    direction_y = end[1] - start[1]
+    denominator = direction_x * direction_x + direction_y * direction_y
     if denominator <= 1e-12:
         return None
-    offset = _vector(start, point)
-    parameter = _dot(offset, direction) / denominator
+    parameter = (
+        (point[0] - start[0]) * direction_x
+        + (point[1] - start[1]) * direction_y
+    ) / denominator
     length = math.sqrt(denominator)
     parameter_tolerance = tolerance_meters / length
     if parameter < -parameter_tolerance or parameter > 1 + parameter_tolerance:
         return None
-    projected = tuple(
-        start[index] + max(0.0, min(1.0, parameter)) * direction[index]
-        for index in range(3)
-    )
-    if _edge_length(point, projected) > tolerance_meters:
+    bounded = max(0.0, min(1.0, parameter))
+    projected_x = start[0] + bounded * direction_x
+    projected_y = start[1] + bounded * direction_y
+    projected_z = start[2] + bounded * (end[2] - start[2])
+    if math.hypot(point[0] - projected_x, point[1] - projected_y) > tolerance_meters:
         return None
-    return max(0.0, min(1.0, parameter))
+    if abs(point[2] - projected_z) > vertical_tolerance_meters:
+        return None
+    return bounded
 
 
 def _noded_edge_uses(
     facets: list[Facet],
     tolerance_meters: float = EDGE_NODE_TOLERANCE_METERS,
+    vertical_tolerance_meters: float = EDGE_NODE_VERTICAL_TOLERANCE_METERS,
 ) -> dict[tuple[int, int], list[EdgeUse]]:
-    """Build facet adjacency from measured 3D edges instead of source vertex IDs.
+    """Build facet adjacency from plan-coincident, elevation-compatible edges.
 
     Roofer can emit coincident coordinates with different CityJSON vertex IDs,
     and a long edge on one facet can meet two shorter edges at a T-junction.
-    Coordinate clustering and noding prevent those internal roof lines from
-    being counted twice as exterior eaves or rakes.
+    Independent plan and elevation tolerances prevent small plane-fit height
+    residuals from duplicating internal lines while keeping vertically stacked
+    roof boundaries separate.
     """
 
     representatives: list[tuple[float, float, float]] = []
@@ -214,7 +223,15 @@ def _noded_edge_uses(
                 (
                     index
                     for index, representative in enumerate(representatives)
-                    if _edge_length(point, representative) <= tolerance_meters
+                    if (
+                        math.hypot(
+                            point[0] - representative[0],
+                            point[1] - representative[1],
+                        )
+                        <= tolerance_meters
+                        and abs(point[2] - representative[2])
+                        <= vertical_tolerance_meters
+                    )
                 ),
                 None,
             )
@@ -235,7 +252,13 @@ def _noded_edge_uses(
                 continue
             nodes: list[tuple[float, int, tuple[float, float, float]]] = []
             for point, key in all_points:
-                parameter = _edge_parameter(point, start, end, tolerance_meters)
+                parameter = _edge_parameter(
+                    point,
+                    start,
+                    end,
+                    tolerance_meters,
+                    vertical_tolerance_meters,
+                )
                 if parameter is not None:
                     nodes.append((parameter, key, point))
             nodes.sort(key=lambda node: node[0])
@@ -514,6 +537,7 @@ def extract_roof_geometry(
     plane_side_tolerance_meters: float = 0.08,
     coplanar_tolerance_degrees: float = 2.0,
     edge_node_tolerance_meters: float = EDGE_NODE_TOLERANCE_METERS,
+    edge_node_vertical_tolerance_meters: float = EDGE_NODE_VERTICAL_TOLERANCE_METERS,
     minimum_density: float = 8.0,
     maximum_nodata_fraction: float = 0.10,
     maximum_rmse_meters: float = 0.35,
@@ -526,7 +550,11 @@ def extract_roof_geometry(
         attributes, minimum_density, maximum_nodata_fraction, maximum_rmse_meters
     )
 
-    edge_uses = _noded_edge_uses(facets, edge_node_tolerance_meters)
+    edge_uses = _noded_edge_uses(
+        facets,
+        edge_node_tolerance_meters,
+        edge_node_vertical_tolerance_meters,
+    )
 
     classified: dict[str, list[dict[str, Any]]] = {
         "rakes": [],
@@ -691,6 +719,9 @@ def extract_roof_geometry(
         "highPerimeterFeet": totals["highPerimeters"],
         "topology": {
             "edgeNodeToleranceMeters": _round(edge_node_tolerance_meters, 3),
+            "edgeNodeVerticalToleranceMeters": _round(
+                edge_node_vertical_tolerance_meters, 3
+            ),
             "nodedEdgeCount": len(edge_uses),
             "sharedEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 2),
             "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1),

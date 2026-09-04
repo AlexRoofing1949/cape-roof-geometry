@@ -652,6 +652,9 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     transform,
                     flat_pitch_degrees=settings.flat_pitch_degrees,
                     edge_node_tolerance_meters=settings.roof_edge_node_tolerance_meters,
+                    edge_node_vertical_tolerance_meters=(
+                        settings.roof_edge_vertical_node_tolerance_meters
+                    ),
                     minimum_density=settings.minimum_point_density,
                     maximum_nodata_fraction=settings.maximum_nodata_fraction,
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,

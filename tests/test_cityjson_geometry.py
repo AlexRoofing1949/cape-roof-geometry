@@ -43,6 +43,62 @@ class CityJsonGeometryTests(unittest.TestCase):
 
         self.assertTrue(any(len(uses) == 2 for uses in edge_uses.values()))
 
+    def test_plane_fit_height_residuals_do_not_duplicate_shared_edges(self):
+        first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
+        second_vertices = ((10.0, 0.04, 0.24), (0.0, 0.04, 0.24), (0.0, -5.0, 5.0))
+
+        def facet(facet_id, vertices):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=30.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(sum(point[i] for point in vertices) / 3 for i in range(3)),
+                normal=(0.0, 0.5, math.sqrt(0.75)),
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        edge_uses = _noded_edge_uses(
+            [facet("F1", first_vertices), facet("F2", second_vertices)],
+            tolerance_meters=0.10,
+            vertical_tolerance_meters=0.30,
+        )
+
+        self.assertTrue(any(len(uses) == 2 for uses in edge_uses.values()))
+
+    def test_vertically_separated_edges_remain_distinct(self):
+        first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
+        second_vertices = ((10.0, 0.04, 0.80), (0.0, 0.04, 0.80), (0.0, -5.0, 5.0))
+
+        def facet(facet_id, vertices):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=30.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(sum(point[i] for point in vertices) / 3 for i in range(3)),
+                normal=(0.0, 0.5, math.sqrt(0.75)),
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        edge_uses = _noded_edge_uses(
+            [facet("F1", first_vertices), facet("F2", second_vertices)],
+            tolerance_meters=0.10,
+            vertical_tolerance_meters=0.30,
+        )
+
+        self.assertFalse(any(len(uses) == 2 for uses in edge_uses.values()))
+
     def test_shared_edge_uses_local_interior_side_for_concave_facet(self):
         vertices = (
             (0.0, 0.0, 0.0),

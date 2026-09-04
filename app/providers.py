@@ -750,43 +750,60 @@ def _polygonize_google_solar_mask(mask_path: Path) -> list[BaseGeometry]:
 
 def _simplify_google_solar_mask(
     projected: BaseGeometry, tolerance_meters: float
-) -> tuple[BaseGeometry, dict[str, float | int]]:
-    """Remove raster stair steps without materially changing rooftop area."""
+) -> tuple[BaseGeometry, dict[str, Any]]:
+    """Remove raster stair steps at the highest area-safe tolerance."""
 
     raw_area = float(projected.area)
     raw_perimeter = float(projected.length)
     raw_vertices = len(getattr(projected.exterior, "coords", []))
-    simplified = projected.simplify(tolerance_meters, preserve_topology=True)
-    if (
-        simplified.is_empty
-        or not simplified.is_valid
-        or simplified.geom_type != "Polygon"
-        or simplified.area <= 0
-    ):
-        raise UnreliableGeometryError(
-            "SOLAR_ROOF_MASK_SIMPLIFICATION_INVALID",
-            "The Google Solar rooftop mask could not be safely simplified.",
+    tolerances: list[float] = []
+    for candidate in (tolerance_meters, max(0.10, tolerance_meters / 2), 0.10):
+        rounded = round(candidate, 3)
+        if rounded not in tolerances:
+            tolerances.append(rounded)
+    attempts: list[dict[str, Any]] = []
+    for candidate in tolerances:
+        simplified = projected.simplify(candidate, preserve_topology=True)
+        valid = (
+            not simplified.is_empty
+            and simplified.is_valid
+            and simplified.geom_type == "Polygon"
+            and simplified.area > 0
         )
-    area_change_percent = abs(float(simplified.area) - raw_area) / max(raw_area, 0.01) * 100
-    if area_change_percent > 2.0:
-        raise UnreliableGeometryError(
-            "SOLAR_ROOF_MASK_SIMPLIFICATION_CONFLICT",
-            "Rooftop-mask simplification changed the measured area beyond the safety limit.",
-            details={
-                "areaChangePercent": round(area_change_percent, 3),
-                "maximumAreaChangePercent": 2.0,
-            },
+        area_change_percent = (
+            abs(float(simplified.area) - raw_area) / max(raw_area, 0.01) * 100
+            if valid
+            else float("inf")
         )
-    return simplified, {
-        "toleranceMeters": round(tolerance_meters, 3),
-        "rawVertexCount": raw_vertices,
-        "simplifiedVertexCount": len(simplified.exterior.coords),
-        "areaChangePercent": round(area_change_percent, 3),
-        "perimeterChangePercent": round(
-            abs(float(simplified.length) - raw_perimeter) / max(raw_perimeter, 0.01) * 100,
-            3,
-        ),
-    }
+        attempts.append(
+            {
+                "toleranceMeters": candidate,
+                "valid": valid,
+                "areaChangePercent": (
+                    round(area_change_percent, 3) if math.isfinite(area_change_percent) else None
+                ),
+            }
+        )
+        if not valid or area_change_percent > 2.0:
+            continue
+        return simplified, {
+            "requestedToleranceMeters": round(tolerance_meters, 3),
+            "toleranceMeters": candidate,
+            "fallbackApplied": candidate != round(tolerance_meters, 3),
+            "rawVertexCount": raw_vertices,
+            "simplifiedVertexCount": len(simplified.exterior.coords),
+            "areaChangePercent": round(area_change_percent, 3),
+            "perimeterChangePercent": round(
+                abs(float(simplified.length) - raw_perimeter) / max(raw_perimeter, 0.01) * 100,
+                3,
+            ),
+            "attempts": attempts,
+        }
+    raise UnreliableGeometryError(
+        "SOLAR_ROOF_MASK_SIMPLIFICATION_CONFLICT",
+        "Rooftop-mask simplification changed the measured area beyond the safety limit at every supported tolerance.",
+        details={"maximumAreaChangePercent": 2.0, "attempts": attempts},
+    )
 
 
 def fetch_google_solar_roofprint(
