@@ -2,13 +2,48 @@ import math
 import unittest
 from pathlib import Path
 
-from app.cityjson_geometry import extract_roof_geometry, load_cityjson_feature
+from app.cityjson_geometry import (
+    EdgeUse,
+    Facet,
+    _facet_side_height_delta,
+    extract_roof_geometry,
+    load_cityjson_feature,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CityJsonGeometryTests(unittest.TestCase):
+    def test_shared_edge_uses_local_interior_side_for_concave_facet(self):
+        vertices = (
+            (0.0, 0.0, 0.0),
+            (4.0, 0.0, 0.0),
+            (4.0, 4.0, 4.0),
+            (3.0, 4.0, 4.0),
+            (3.0, 1.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (1.0, 4.0, 4.0),
+            (0.0, 4.0, 4.0),
+        )
+        facet = Facet(
+            facet_id="F1",
+            vertex_ids=tuple(range(len(vertices))),
+            vertices=vertices,
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=45.0,
+            azimuth_degrees=180.0,
+            centroid=(2.0, 2.25, 2.25),
+            normal=(0.0, -math.sqrt(0.5), math.sqrt(0.5)),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        use = EdgeUse(facet, 4, 5, vertices[4], vertices[5])
+
+        self.assertLess(_facet_side_height_delta(use), -0.9)
+
     def test_simple_gable_uses_actual_3d_edges(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         result = extract_roof_geometry(feature, transform)

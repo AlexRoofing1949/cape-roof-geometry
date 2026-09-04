@@ -107,6 +107,48 @@ def _edge_height_at_xy(
     return start[2] + t * (end[2] - start[2])
 
 
+def _facet_side_height_delta(use: EdgeUse) -> float:
+    """Return the facet's vertical change one metre inward from a shared edge.
+
+    A vertex-average centroid can fall outside a concave roof facet. Using that
+    point can invert one side of a valid ridge, hip, or valley. The projected
+    ring orientation gives the local interior side of each directed edge, so a
+    unit inward probe measures the plane derivative without guessing from a
+    potentially exterior centroid.
+    """
+
+    dx = use.end[0] - use.start[0]
+    dy = use.end[1] - use.start[1]
+    horizontal_length = math.hypot(dx, dy)
+    if horizontal_length <= 1e-12:
+        return 0.0
+    signed_area = sum(
+        current[0] * following[1] - following[0] * current[1]
+        for current, following in zip(
+            use.facet.vertices,
+            use.facet.vertices[1:] + use.facet.vertices[:1],
+        )
+    ) / 2
+    orientation = 1.0 if signed_area >= 0 else -1.0
+    inward_x = orientation * (-dy / horizontal_length)
+    inward_y = orientation * (dx / horizontal_length)
+    midpoint_x = (use.start[0] + use.end[0]) / 2
+    midpoint_y = (use.start[1] + use.end[1]) / 2
+    probe_x = midpoint_x + inward_x
+    probe_y = midpoint_y + inward_y
+    normal_x, normal_y, normal_z = use.facet.normal
+    plane_height = use.start[2] - (
+        normal_x * (probe_x - use.start[0])
+        + normal_y * (probe_y - use.start[1])
+    ) / normal_z
+    edge_height = _edge_height_at_xy(
+        use.start,
+        use.end,
+        (probe_x, probe_y, plane_height),
+    )
+    return plane_height - edge_height
+
+
 def _normal_angle_degrees(first: Facet, second: Facet) -> float:
     cosine = max(-1.0, min(1.0, _dot(first.normal, second.normal)))
     return math.degrees(math.acos(cosine))
@@ -439,8 +481,8 @@ def extract_roof_geometry(
         second = uses[1]
         if _normal_angle_degrees(first.facet, second.facet) <= coplanar_tolerance_degrees:
             continue
-        first_delta = first.facet.centroid[2] - _edge_height_at_xy(first.start, first.end, first.facet.centroid)
-        second_delta = second.facet.centroid[2] - _edge_height_at_xy(first.start, first.end, second.facet.centroid)
+        first_delta = _facet_side_height_delta(first)
+        second_delta = _facet_side_height_delta(second)
         if first_delta > plane_side_tolerance_meters and second_delta > plane_side_tolerance_meters:
             add_edge("valleys", uses)
         elif first_delta < -plane_side_tolerance_meters and second_delta < -plane_side_tolerance_meters:
