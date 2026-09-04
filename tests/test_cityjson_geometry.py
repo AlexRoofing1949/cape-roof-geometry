@@ -4,6 +4,8 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
+from shapely.geometry import Polygon
+
 from app.cityjson_geometry import (
     EdgeUse,
     Facet,
@@ -287,6 +289,26 @@ class CityJsonGeometryTests(unittest.TestCase):
         actual = extract_roof_geometry(reordered, transform)
 
         self.assertEqual(actual, expected)
+
+    def test_exterior_edges_require_roofprint_boundary_corroboration(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        roofprint = Polygon([(0, 0), (10, 0), (10, 6), (0, 6)])
+
+        result = extract_roof_geometry(
+            feature,
+            transform,
+            roofprint_boundary=roofprint.boundary,
+            exterior_boundary_maximum_distance_meters=0.10,
+        )
+
+        self.assertEqual(result["topology"]["unmatchedInteriorBoundaryCount"], 0)
+        self.assertTrue(
+            all(
+                edge["classificationEvidence"]["derivation"]
+                == "ROOFPRINT_CORROBORATED_FACET_BOUNDARY"
+                for edge in result["eaves"] + result["rakes"]
+            )
+        )
 
     def test_coincident_ids_and_t_junction_are_noded_before_edge_classification(self):
         feature = {

@@ -14,6 +14,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from shapely.geometry import Point
+
 from .errors import UnreliableGeometryError
 
 METERS_TO_FEET = 3.280839895013123
@@ -777,6 +779,8 @@ def extract_roof_geometry(
     edge_node_vertical_tolerance_meters: float = EDGE_NODE_VERTICAL_TOLERANCE_METERS,
     plane_intersection_maximum_displacement_meters: float = 0.35,
     shared_edge_maximum_direction_variance_degrees: float = 5.0,
+    roofprint_boundary: Any | None = None,
+    exterior_boundary_maximum_distance_meters: float = 0.50,
     minimum_density: float = 8.0,
     maximum_nodata_fraction: float = 0.10,
     maximum_rmse_meters: float = 0.35,
@@ -805,6 +809,7 @@ def extract_roof_geometry(
     }
     ambiguous: list[dict[str, Any]] = []
     rejected_noded_adjacencies: list[dict[str, Any]] = []
+    unmatched_interior_boundaries: list[dict[str, Any]] = []
     counters: dict[str, int] = defaultdict(int)
     edge_prefixes = {
         "rakes": "RA",
@@ -841,18 +846,54 @@ def extract_roof_geometry(
         use: EdgeUse, classification_evidence: dict[str, Any] | None = None
     ) -> None:
         elevation_change = abs(use.start[2] - use.end[2])
-        if elevation_change > horizontal_edge_tolerance_meters:
-            add_edge("rakes", [use], classification_evidence)
-            return
         edge_height = (use.start[2] + use.end[2]) / 2
-        if edge_height <= use.facet.centroid[2] + plane_side_tolerance_meters:
-            add_edge("eaves", [use], classification_evidence)
-        else:
+        if (
+            elevation_change <= horizontal_edge_tolerance_meters
+            and edge_height > use.facet.centroid[2] + plane_side_tolerance_meters
+        ):
             # A horizontal high-side boundary with only one adjacent roof
             # plane is a measured perimeter/flashing edge, not an eave,
             # rake, ridge, hip, or valley. Keep the category explicit for
             # pricing at every pitch instead of guessing a standard type.
             add_edge("highPerimeters", [use], classification_evidence)
+            return
+
+        boundary_evidence = classification_evidence
+        if roofprint_boundary is not None:
+            midpoint = Point(
+                (use.start[0] + use.end[0]) / 2,
+                (use.start[1] + use.end[1]) / 2,
+            )
+            distance = float(roofprint_boundary.distance(midpoint))
+            if distance > exterior_boundary_maximum_distance_meters:
+                unmatched_interior_boundaries.append(
+                    {
+                        "facetId": use.facet.facet_id,
+                        "lengthFeet": _round(
+                            _edge_length(use.start, use.end) * METERS_TO_FEET
+                        ),
+                        "projectedLengthFeet": _round(
+                            _projected_edge_length(use.start, use.end)
+                            * METERS_TO_FEET
+                        ),
+                        "roofprintDistanceMeters": _round(distance, 3),
+                    }
+                )
+                return
+            boundary_evidence = {
+                **(classification_evidence or {}),
+                "derivation": "ROOFPRINT_CORROBORATED_FACET_BOUNDARY",
+                "adjacentFacetCount": 1,
+                "roofprintDistanceMeters": _round(distance, 3),
+                "maximumRoofprintDistanceMeters": _round(
+                    exterior_boundary_maximum_distance_meters, 3
+                ),
+            }
+
+        if elevation_change > horizontal_edge_tolerance_meters:
+            add_edge("rakes", [use], boundary_evidence)
+        else:
+            add_edge("eaves", [use], boundary_evidence)
 
     for uses in edge_uses.values():
         if len(uses) > 2:
@@ -993,7 +1034,6 @@ def extract_roof_geometry(
         "externalProjectedPerimeterFeet": _round(
             projected_totals["eaves"]
             + projected_totals["rakes"]
-            + projected_totals["highPerimeters"]
         ),
         "internalRoofEdgeFeet": _round(
             totals["ridges"] + totals["hips"] + totals["valleys"]
@@ -1019,6 +1059,14 @@ def extract_roof_geometry(
                     for item in rejected_noded_adjacencies
                 )
             ),
+            "exteriorBoundaryMaximumDistanceMeters": _round(
+                exterior_boundary_maximum_distance_meters, 3
+            ),
+            "unmatchedInteriorBoundaryCount": len(unmatched_interior_boundaries),
+            "unmatchedInteriorBoundaryFeet": _round(
+                sum(item["lengthFeet"] for item in unmatched_interior_boundaries)
+            ),
+            "unmatchedInteriorBoundaries": unmatched_interior_boundaries,
         },
         "flatRoofAreaSqFt": _round(flat_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "roofOpeningCount": sum(facet.opening_count for facet in facets),

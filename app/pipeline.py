@@ -75,6 +75,19 @@ def _enforce_roofprint_perimeter_consistency(
                 "exteriorEdgeCount",
                 "rejectedNodedAdjacencyCount",
                 "suppressedCrossingArtifactFeet",
+                "unmatchedInteriorBoundaryCount",
+                "unmatchedInteriorBoundaryFeet",
+            )
+        },
+        "edgeTotalsFeet": {
+            key: round(float(geometry.get(key) or 0), 2)
+            for key in (
+                "rakesFeet",
+                "eavesFeet",
+                "highPerimeterFeet",
+                "ridgesFeet",
+                "hipsFeet",
+                "valleysFeet",
             )
         },
     }
@@ -685,6 +698,10 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     ),
                     shared_edge_maximum_direction_variance_degrees=(
                         settings.roof_shared_edge_maximum_direction_variance_degrees
+                    ),
+                    roofprint_boundary=projected_footprint.boundary,
+                    exterior_boundary_maximum_distance_meters=(
+                        settings.roof_exterior_boundary_maximum_distance_meters
                     ),
                     minimum_density=settings.minimum_point_density,
                     maximum_nodata_fraction=settings.maximum_nodata_fraction,
