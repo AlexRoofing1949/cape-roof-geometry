@@ -204,6 +204,16 @@ def _normal_angle_degrees(first: Facet, second: Facet) -> float:
     return math.degrees(math.acos(cosine))
 
 
+def _edge_direction_variance_degrees(first: EdgeUse, second: EdgeUse) -> float:
+    first_vector = _vector(first.start, first.end)
+    second_vector = _vector(second.start, second.end)
+    cosine = abs(
+        _dot(first_vector, second_vector)
+        / max(_norm(first_vector) * _norm(second_vector), 1e-12)
+    )
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
 def _distance(
     first: tuple[float, float, float], second: tuple[float, float, float]
 ) -> float:
@@ -316,6 +326,9 @@ def _validated_plane_intersection_edge(
             _round(first_alignment_degrees, 3),
             _round(second_alignment_degrees, 3),
         ],
+        "originalBoundaryDirectionVarianceDegrees": _round(
+            _edge_direction_variance_degrees(first, second), 3
+        ),
         "incidentPlaneAngleDegrees": _round(
             _normal_angle_degrees(first.facet, second.facet), 3
         ),
@@ -763,6 +776,7 @@ def extract_roof_geometry(
     edge_node_tolerance_meters: float = EDGE_NODE_TOLERANCE_METERS,
     edge_node_vertical_tolerance_meters: float = EDGE_NODE_VERTICAL_TOLERANCE_METERS,
     plane_intersection_maximum_displacement_meters: float = 0.35,
+    shared_edge_maximum_direction_variance_degrees: float = 5.0,
     minimum_density: float = 8.0,
     maximum_nodata_fraction: float = 0.10,
     maximum_rmse_meters: float = 0.35,
@@ -790,6 +804,7 @@ def extract_roof_geometry(
         "highPerimeters": [],
     }
     ambiguous: list[dict[str, Any]] = []
+    rejected_noded_adjacencies: list[dict[str, Any]] = []
     counters: dict[str, int] = defaultdict(int)
     edge_prefixes = {
         "rakes": "RA",
@@ -822,6 +837,23 @@ def extract_roof_geometry(
         }
         classified[kind].append(entry)
 
+    def classify_exterior(
+        use: EdgeUse, classification_evidence: dict[str, Any] | None = None
+    ) -> None:
+        elevation_change = abs(use.start[2] - use.end[2])
+        if elevation_change > horizontal_edge_tolerance_meters:
+            add_edge("rakes", [use], classification_evidence)
+            return
+        edge_height = (use.start[2] + use.end[2]) / 2
+        if edge_height <= use.facet.centroid[2] + plane_side_tolerance_meters:
+            add_edge("eaves", [use], classification_evidence)
+        else:
+            # A horizontal high-side boundary with only one adjacent roof
+            # plane is a measured perimeter/flashing edge, not an eave,
+            # rake, ridge, hip, or valley. Keep the category explicit for
+            # pricing at every pitch instead of guessing a standard type.
+            add_edge("highPerimeters", [use], classification_evidence)
+
     for uses in edge_uses.values():
         if len(uses) > 2:
             raise UnreliableGeometryError("NON_MANIFOLD_ROOF_EDGE", "More than two roof facets share a reconstructed edge.")
@@ -829,22 +861,31 @@ def extract_roof_geometry(
         if _edge_length(first.start, first.end) <= 0.10:
             continue
         if len(uses) == 1:
-            elevation_change = abs(first.start[2] - first.end[2])
-            if elevation_change > horizontal_edge_tolerance_meters:
-                add_edge("rakes", uses)
-                continue
-            edge_height = (first.start[2] + first.end[2]) / 2
-            if edge_height <= first.facet.centroid[2] + plane_side_tolerance_meters:
-                add_edge("eaves", uses)
-            else:
-                # A horizontal high-side boundary with only one adjacent roof
-                # plane is a measured perimeter/flashing edge, not an eave,
-                # rake, ridge, hip, or valley. Keep the category explicit for
-                # pricing at every pitch instead of guessing a standard type.
-                add_edge("highPerimeters", uses)
+            classify_exterior(first)
             continue
 
         second = uses[1]
+        direction_variance = _edge_direction_variance_degrees(first, second)
+        if direction_variance > shared_edge_maximum_direction_variance_degrees:
+            evidence = {
+                "derivation": "REJECTED_NODED_ADJACENCY",
+                "facetIds": [first.facet.facet_id, second.facet.facet_id],
+                "directionVarianceDegrees": _round(direction_variance, 3),
+                "maximumDirectionVarianceDegrees": _round(
+                    shared_edge_maximum_direction_variance_degrees, 3
+                ),
+            }
+            rejected_noded_adjacencies.append(evidence)
+            for use in uses:
+                classify_exterior(
+                    use,
+                    {
+                        **evidence,
+                        "adjacentFacetCount": 1,
+                        "boundaryRole": "INDEPENDENT_FACET_BOUNDARY",
+                    },
+                )
+            continue
         if _normal_angle_degrees(first.facet, second.facet) <= coplanar_tolerance_degrees:
             continue
         uses, intersection_evidence = _validated_plane_intersection_edge(
@@ -965,8 +1006,15 @@ def extract_roof_geometry(
                 edge_node_vertical_tolerance_meters, 3
             ),
             "nodedEdgeCount": len(edge_uses),
-            "sharedEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 2),
-            "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1),
+            "sharedEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 2)
+            - len(rejected_noded_adjacencies),
+            "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1)
+            + 2 * len(rejected_noded_adjacencies),
+            "sharedEdgeMaximumDirectionVarianceDegrees": _round(
+                shared_edge_maximum_direction_variance_degrees, 3
+            ),
+            "rejectedNodedAdjacencyCount": len(rejected_noded_adjacencies),
+            "rejectedNodedAdjacencies": rejected_noded_adjacencies,
         },
         "flatRoofAreaSqFt": _round(flat_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "roofOpeningCount": sum(facet.opening_count for facet in facets),

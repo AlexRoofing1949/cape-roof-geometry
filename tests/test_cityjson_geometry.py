@@ -2,10 +2,12 @@ import math
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 from app.cityjson_geometry import (
     EdgeUse,
     Facet,
+    _edge_direction_variance_degrees,
     _facet_side_height_delta,
     _noded_edge_uses,
     _validated_plane_intersection_edge,
@@ -135,6 +137,54 @@ class CityJsonGeometryTests(unittest.TestCase):
                 )
         self.assertGreater(_facet_side_height_delta(corrected[0]), 0)
         self.assertGreater(_facet_side_height_delta(corrected[1]), 0)
+
+    def test_crossing_corner_fragments_are_not_shared_boundaries(self):
+        first_facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=((0.0, 0.0, 0.0), (0.2, 0.0, 0.0), (0.0, 1.0, 1.0)),
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=45.0,
+            azimuth_degrees=180.0,
+            centroid=(0.067, 0.333, 0.333),
+            normal=(0.0, -math.sqrt(0.5), math.sqrt(0.5)),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        second_facet = Facet(
+            **{
+                **first_facet.__dict__,
+                "facet_id": "F2",
+            }
+        )
+        first = EdgeUse(
+            first_facet, 0, 1, (0.0, 0.0, 0.0), (0.2, 0.0, 0.0)
+        )
+        second = EdgeUse(
+            second_facet, 3, 4, (0.2, 0.04, 0.1), (0.0, 0.01, 0.1)
+        )
+
+        self.assertGreater(_edge_direction_variance_degrees(first, second), 5.0)
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        with patch(
+            "app.cityjson_geometry._noded_edge_uses",
+            return_value={(0, 1): [first, second]},
+        ):
+            result = extract_roof_geometry(feature, transform)
+
+        self.assertEqual(result["topology"]["sharedEdgeCount"], 0)
+        self.assertEqual(result["topology"]["exteriorEdgeCount"], 2)
+        self.assertEqual(result["topology"]["rejectedNodedAdjacencyCount"], 1)
+        self.assertEqual(len(result["eaves"]), 2)
+        self.assertTrue(
+            all(
+                edge["classificationEvidence"]["derivation"]
+                == "REJECTED_NODED_ADJACENCY"
+                for edge in result["eaves"]
+            )
+        )
 
     def test_vertically_separated_edges_remain_distinct(self):
         first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))

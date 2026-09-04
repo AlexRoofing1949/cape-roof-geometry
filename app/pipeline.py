@@ -673,6 +673,9 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     plane_intersection_maximum_displacement_meters=(
                         settings.roof_plane_intersection_maximum_displacement_meters
                     ),
+                    shared_edge_maximum_direction_variance_degrees=(
+                        settings.roof_shared_edge_maximum_direction_variance_degrees
+                    ),
                     minimum_density=settings.minimum_point_density,
                     maximum_nodata_fraction=settings.maximum_nodata_fraction,
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
