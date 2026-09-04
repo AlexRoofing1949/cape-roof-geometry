@@ -16,12 +16,6 @@ from shapely.geometry import Polygon
 from .errors import TransientProviderError, UnreliableGeometryError
 
 
-VALIDATION_COPLANAR_KNN = 8
-VALIDATION_NORMAL_KNN = 12
-VALIDATION_MINIMUM_NORMAL_Z = 0.65
-VALIDATION_MAXIMUM_CURVATURE = 0.12
-
-
 def _open3d() -> Any:
     try:
         return importlib.import_module("open3d")
@@ -199,7 +193,7 @@ def validate_roofer_planes(
     workspace: Path,
     settings: Any,
 ) -> dict[str, Any]:
-    """Export exact XYZ values and independently validate every Roofer facet."""
+    """Export normalized roof XYZ values and independently validate every Roofer facet."""
 
     o3d = _open3d()
     if o3d.__version__ != settings.open3d_version:
@@ -216,23 +210,14 @@ def validate_roofer_planes(
                 "pipeline": [
                     str(pointcloud_path),
                     {"type": "filters.expression", "expression": "Classification == 6"},
-                    {
-                        "type": "filters.approximatecoplanar",
-                        "knn": VALIDATION_COPLANAR_KNN,
-                    },
-                    {"type": "filters.expression", "expression": "Coplanar == 1"},
-                    {
-                        "type": "filters.normal",
-                        "knn": VALIDATION_NORMAL_KNN,
-                        "always_up": True,
-                    },
-                    {
-                        "type": "filters.expression",
-                        "expression": (
-                            f"NormalZ >= {VALIDATION_MINIMUM_NORMAL_Z} "
-                            f"&& Curvature <= {VALIDATION_MAXIMUM_CURVATURE}"
-                        ),
-                    },
+                    # Class-1 sources have already passed the production HAG,
+                    # clustering, surface-normal and curvature pipeline before
+                    # being normalized to class 6. Repeating k-neighbour
+                    # filters here can erase legitimate small facets because
+                    # their neighbourhood crosses a hip or valley. Export the
+                    # normalized roof returns unchanged and let Open3D RANSAC,
+                    # inlier-ratio, normal-agreement and RMSE gates perform the
+                    # independent validation on the complete evidence set.
                     {
                         "type": "writers.text",
                         "filename": str(xyz_path),

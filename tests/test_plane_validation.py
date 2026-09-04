@@ -23,7 +23,7 @@ def settings():
 
 
 class PlaneValidationTests(unittest.TestCase):
-    def test_roofer_validator_exports_only_high_precision_xyz(self):
+    def test_roofer_validator_exports_all_normalized_roof_returns_at_high_precision(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             pointcloud = workspace / "roof.laz"
@@ -53,10 +53,8 @@ class PlaneValidationTests(unittest.TestCase):
             writer = pipeline[-1]
             stage_types = [stage["type"] if isinstance(stage, dict) else "reader" for stage in pipeline]
             self.assertEqual(result["validation"], "PASSED")
-            self.assertLess(
-                stage_types.index("filters.approximatecoplanar"),
-                stage_types.index("filters.normal"),
-            )
+            self.assertEqual(stage_types, ["reader", "filters.expression", "writers.text"])
+            self.assertEqual(pipeline[1]["expression"], "Classification == 6")
             self.assertEqual(writer["type"], "writers.text")
             self.assertEqual(writer["order"], "X:8,Y:8,Z:8")
             self.assertFalse(writer["keep_unspecified"])
