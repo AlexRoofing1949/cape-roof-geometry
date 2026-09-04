@@ -175,16 +175,10 @@ class CityJsonGeometryTests(unittest.TestCase):
             result = extract_roof_geometry(feature, transform)
 
         self.assertEqual(result["topology"]["sharedEdgeCount"], 0)
-        self.assertEqual(result["topology"]["exteriorEdgeCount"], 2)
+        self.assertEqual(result["topology"]["exteriorEdgeCount"], 0)
         self.assertEqual(result["topology"]["rejectedNodedAdjacencyCount"], 1)
-        self.assertEqual(len(result["eaves"]), 2)
-        self.assertTrue(
-            all(
-                edge["classificationEvidence"]["derivation"]
-                == "REJECTED_NODED_ADJACENCY"
-                for edge in result["eaves"]
-            )
-        )
+        self.assertEqual(result["topology"]["suppressedCrossingArtifactFeet"], 0.66)
+        self.assertEqual(result["eaves"], [])
 
     def test_vertically_separated_edges_remain_distinct(self):
         first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))

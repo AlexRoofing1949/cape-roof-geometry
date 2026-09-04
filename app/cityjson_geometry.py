@@ -868,23 +868,22 @@ def extract_roof_geometry(
         direction_variance = _edge_direction_variance_degrees(first, second)
         if direction_variance > shared_edge_maximum_direction_variance_degrees:
             evidence = {
-                "derivation": "REJECTED_NODED_ADJACENCY",
+                "derivation": "SUPPRESSED_CROSSING_NODE_ARTIFACT",
                 "facetIds": [first.facet.facet_id, second.facet.facet_id],
                 "directionVarianceDegrees": _round(direction_variance, 3),
                 "maximumDirectionVarianceDegrees": _round(
                     shared_edge_maximum_direction_variance_degrees, 3
                 ),
+                "candidateLengthFeet": _round(
+                    (
+                        _edge_length(first.start, first.end)
+                        + _edge_length(second.start, second.end)
+                    )
+                    / 2
+                    * METERS_TO_FEET
+                ),
             }
             rejected_noded_adjacencies.append(evidence)
-            for use in uses:
-                classify_exterior(
-                    use,
-                    {
-                        **evidence,
-                        "adjacentFacetCount": 1,
-                        "boundaryRole": "INDEPENDENT_FACET_BOUNDARY",
-                    },
-                )
             continue
         if _normal_angle_degrees(first.facet, second.facet) <= coplanar_tolerance_degrees:
             continue
@@ -1008,13 +1007,18 @@ def extract_roof_geometry(
             "nodedEdgeCount": len(edge_uses),
             "sharedEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 2)
             - len(rejected_noded_adjacencies),
-            "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1)
-            + 2 * len(rejected_noded_adjacencies),
+            "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1),
             "sharedEdgeMaximumDirectionVarianceDegrees": _round(
                 shared_edge_maximum_direction_variance_degrees, 3
             ),
             "rejectedNodedAdjacencyCount": len(rejected_noded_adjacencies),
             "rejectedNodedAdjacencies": rejected_noded_adjacencies,
+            "suppressedCrossingArtifactFeet": _round(
+                sum(
+                    item["candidateLengthFeet"]
+                    for item in rejected_noded_adjacencies
+                )
+            ),
         },
         "flatRoofAreaSqFt": _round(flat_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "roofOpeningCount": sum(facet.opening_count for facet in facets),

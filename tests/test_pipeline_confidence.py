@@ -95,6 +95,7 @@ class PipelineConfidenceTests(unittest.TestCase):
 
         self.assertAlmostEqual(result["variancePercent"], 0.0, delta=0.001)
         self.assertEqual(geometry["roofprintPerimeterReconciliation"], result)
+        self.assertEqual(result["topology"]["nodedEdgeCount"], None)
 
     def test_roofprint_perimeter_mismatch_fails_closed(self):
         geometry = {"externalProjectedPerimeterFeet": 145.0}

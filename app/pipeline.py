@@ -67,6 +67,16 @@ def _enforce_roofprint_perimeter_consistency(
         ),
         "variancePercent": round(variance_percent, 3),
         "maximumVariancePercent": round(maximum_variance_percent, 3),
+        "topology": {
+            key: (geometry.get("topology") or {}).get(key)
+            for key in (
+                "nodedEdgeCount",
+                "sharedEdgeCount",
+                "exteriorEdgeCount",
+                "rejectedNodedAdjacencyCount",
+                "suppressedCrossingArtifactFeet",
+            )
+        },
     }
     if variance_percent > maximum_variance_percent:
         raise UnreliableGeometryError(
