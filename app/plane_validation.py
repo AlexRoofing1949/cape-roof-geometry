@@ -85,6 +85,8 @@ def validate_facet_points(
         # does not change a plane normal, so fit in a local centroid frame.
         local_origin = np.mean(selected, axis=0)
         centered = selected - local_origin
+        axis_spans = np.ptp(centered, axis=0)
+        singular_values = np.linalg.svd(centered, compute_uv=False)
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(centered)
         plane_model, inlier_indexes = cloud.segment_plane(
@@ -122,6 +124,14 @@ def validate_facet_points(
                 float(facet.get("pitchDegrees") or 0), 3
             ),
             "fittedPitchDegrees": round(fitted_pitch, 3),
+            "fittedNormal": [round(float(value), 6) for value in fitted_normal],
+            "pointAxisSpanMeters": {
+                axis: round(float(axis_spans[index]), 4)
+                for index, axis in enumerate(("x", "y", "z"))
+            },
+            "pointCloudSingularValues": [
+                round(float(value), 4) for value in singular_values
+            ],
             "supportPoints": int(len(selected)),
             "inlierPoints": int(len(inliers)),
             "inlierRatio": round(inlier_ratio, 4),

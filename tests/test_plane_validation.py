@@ -63,6 +63,9 @@ class PlaneValidationTests(unittest.TestCase):
         self.assertEqual(result["validation"], "PASSED")
         self.assertEqual(result["facetCount"], 1)
         self.assertAlmostEqual(result["facets"][0]["normalVarianceDegrees"], 0, delta=0.01)
+        self.assertEqual(result["facets"][0]["pointAxisSpanMeters"]["x"], 9.8)
+        self.assertEqual(result["facets"][0]["pointAxisSpanMeters"]["y"], 4.8)
+        self.assertEqual(len(result["facets"][0]["pointCloudSingularValues"]), 3)
 
     def test_large_projected_coordinates_are_centered_before_plane_fit(self):
         east = 412_345.0
