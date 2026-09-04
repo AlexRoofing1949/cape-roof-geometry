@@ -396,6 +396,8 @@ def _run_roofer(pointcloud: Path, footprint: Path, output: Path, settings: Setti
     _run(
         [
             "roofer",
+            "--jobs",
+            "1",
             "--id-attribute",
             "request_id",
             "--split-cjseq",

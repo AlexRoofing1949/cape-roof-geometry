@@ -36,6 +36,7 @@ class PlaneValidationTests(unittest.TestCase):
             def fake_run(command, **_kwargs):
                 output.mkdir(parents=True, exist_ok=True)
                 (output / "roof.city.jsonl").write_text("{}\n", encoding="utf-8")
+                self.assertEqual(command[command.index("--jobs") + 1], "1")
                 self.assertEqual(
                     command[command.index("--plane-detect-epsilon") + 1], "0.15"
                 )
