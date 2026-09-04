@@ -1,10 +1,13 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
-from app.plane_validation import _open3d, validate_facet_points
+from app.plane_validation import _open3d, validate_facet_points, validate_roofer_planes
 from app.pipeline import runtime_dependencies
 
 
@@ -20,6 +23,39 @@ def settings():
 
 
 class PlaneValidationTests(unittest.TestCase):
+    def test_roofer_validator_exports_only_high_precision_xyz(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            pointcloud = workspace / "roof.laz"
+            pointcloud.write_bytes(b"test")
+            runtime = SimpleNamespace(__version__="0.19.0")
+            configured = SimpleNamespace(
+                open3d_version="0.19.0",
+                command_timeout_seconds=30,
+            )
+            with (
+                patch("app.plane_validation._open3d", return_value=runtime),
+                patch("app.plane_validation.subprocess.run"),
+                patch(
+                    "app.plane_validation.np.loadtxt",
+                    return_value=np.asarray([[0, 0, 0], [1, 1, 1]], dtype=float),
+                ),
+                patch(
+                    "app.plane_validation.validate_facet_points",
+                    return_value={"validation": "PASSED"},
+                ),
+            ):
+                result = validate_roofer_planes(pointcloud, [], workspace, configured)
+
+            pipeline = json.loads(
+                (workspace / "open3d-points-pipeline.json").read_text(encoding="utf-8")
+            )["pipeline"]
+            writer = pipeline[-1]
+            self.assertEqual(result["validation"], "PASSED")
+            self.assertEqual(writer["type"], "writers.text")
+            self.assertEqual(writer["order"], "X:8,Y:8,Z:8")
+            self.assertFalse(writer["keep_unspecified"])
+
     def test_open3d_native_library_failure_fails_closed(self):
         with patch(
             "app.plane_validation.importlib.import_module",

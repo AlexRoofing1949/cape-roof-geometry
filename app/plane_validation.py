@@ -163,7 +163,7 @@ def validate_roofer_planes(
     workspace: Path,
     settings: Any,
 ) -> dict[str, Any]:
-    """Convert normalized roof returns to PLY and validate every Roofer facet."""
+    """Export exact XYZ values and independently validate every Roofer facet."""
 
     o3d = _open3d()
     if o3d.__version__ != settings.open3d_version:
@@ -172,7 +172,7 @@ def validate_roofer_planes(
             "The installed independent plane validator does not match the pinned production version.",
             details={"configuredVersion": settings.open3d_version, "installedVersion": o3d.__version__},
         )
-    ply_path = workspace / "open3d-roof-points.ply"
+    xyz_path = workspace / "open3d-roof-points.csv"
     pipeline_path = workspace / "open3d-points-pipeline.json"
     pipeline_path.write_text(
         json.dumps(
@@ -180,7 +180,14 @@ def validate_roofer_planes(
                 "pipeline": [
                     str(pointcloud_path),
                     {"type": "filters.expression", "expression": "Classification == 6"},
-                    {"type": "writers.ply", "filename": str(ply_path)},
+                    {
+                        "type": "writers.text",
+                        "filename": str(xyz_path),
+                        "format": "csv",
+                        "order": "X:8,Y:8,Z:8",
+                        "keep_unspecified": False,
+                        "write_header": True,
+                    },
                 ]
             },
             separators=(",", ":"),
@@ -200,8 +207,15 @@ def validate_roofer_planes(
             "OPEN3D_POINT_EXPORT_FAILED",
             "The independent roof-plane validation input could not be prepared.",
         ) from error
-    cloud = o3d.io.read_point_cloud(str(ply_path))
-    points = np.asarray(cloud.points, dtype=float)
+    try:
+        points = np.loadtxt(xyz_path, delimiter=",", skiprows=1, dtype=float)
+    except (OSError, ValueError) as error:
+        raise UnreliableGeometryError(
+            "OPEN3D_POINT_CLOUD_INVALID",
+            "The independent plane validator could not read exact XYZ roof returns.",
+        ) from error
+    if points.ndim == 1 and points.size == 3:
+        points = points.reshape(1, 3)
     if len(points) == 0:
         raise UnreliableGeometryError(
             "OPEN3D_POINT_CLOUD_EMPTY", "No normalized roof returns were available for independent validation."
