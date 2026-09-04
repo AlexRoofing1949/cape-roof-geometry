@@ -139,6 +139,36 @@ class PlaneValidationTests(unittest.TestCase):
         self.assertEqual(result["validation"], "PASSED")
         self.assertAlmostEqual(result["facets"][0]["normalVarianceDegrees"], 0, delta=0.01)
 
+    def test_overlapping_plan_view_facets_use_nearest_3d_plane(self):
+        lower = np.asarray(
+            [[x, y, 3 + 0.5 * y] for x in np.linspace(0.1, 9.9, 12) for y in np.linspace(0.1, 4.9, 8)],
+            dtype=float,
+        )
+        upper = np.asarray(
+            [[x, y, 8 - 0.5 * y] for x in np.linspace(0.1, 9.9, 12) for y in np.linspace(0.1, 4.9, 8)],
+            dtype=float,
+        )
+        facets = [
+            {
+                "facetId": "F1",
+                "verticesMeters": [[0, 0, 3], [10, 0, 3], [10, 5, 5.5], [0, 5, 5.5]],
+                "normal": [0, -0.5, 1],
+            },
+            {
+                "facetId": "F2",
+                "verticesMeters": [[0, 0, 8], [0, 5, 5.5], [10, 5, 5.5], [10, 0, 8]],
+                "normal": [0, 0.5, 1],
+            },
+        ]
+
+        result = validate_facet_points(np.vstack([lower, upper]), facets, settings())
+
+        self.assertEqual(result["validation"], "PASSED")
+        self.assertEqual(result["facetCount"], 2)
+        self.assertEqual(result["facets"][0]["planViewCandidatePoints"], 192)
+        self.assertEqual(result["facets"][0]["supportPoints"], 96)
+        self.assertEqual(result["facets"][1]["supportPoints"], 96)
+
     def test_disagreeing_plane_fails_closed(self):
         points = np.asarray(
             [[x, y, 3 + 0.5 * y] for x in np.linspace(0.1, 9.9, 12) for y in np.linspace(0.1, 4.9, 8)],

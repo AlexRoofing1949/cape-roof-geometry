@@ -53,6 +53,7 @@ def validate_facet_points(
     results: list[dict[str, Any]] = []
     o3d = _open3d()
     o3d.utility.random.seed(1949)
+    prepared_facets: list[dict[str, Any]] = []
     for facet in facet_models:
         facet_id = str(facet.get("facetId") or "")
         vertices = facet.get("verticesMeters") or []
@@ -63,11 +64,38 @@ def validate_facet_points(
                 "A Roofer facet cannot be independently validated in plan view.",
                 details={"facetId": facet_id},
             )
+        roofer_normal = _unit(np.asarray(facet.get("normal") or [], dtype=float))
+        prepared_facets.append(
+            {
+                "facet": facet,
+                "facetId": facet_id,
+                "polygon": polygon.buffer(0.02),
+                "normal": roofer_normal,
+                "origin": np.asarray(vertices[0], dtype=float),
+            }
+        )
+
+    # LoD2.2 building parts can contain roof faces that overlap in plan view.
+    # Assign each return to the eligible 3D facet plane it is nearest to before
+    # RANSAC; otherwise an upper face can make a lower face appear to slope in
+    # the opposite direction even though both planes have valid support.
+    candidate_distances = np.full((len(prepared_facets), len(points)), np.inf, dtype=float)
+    plan_view_candidate_counts: list[int] = []
+    for index, prepared in enumerate(prepared_facets):
+        mask = contains_xy(prepared["polygon"], points[:, 0], points[:, 1])
+        plan_view_candidate_counts.append(int(np.count_nonzero(mask)))
+        candidate_distances[index, mask] = np.abs(
+            (points[mask] - prepared["origin"]) @ prepared["normal"]
+        )
+    closest_facets = np.argmin(candidate_distances, axis=0)
+    has_candidate = np.isfinite(np.min(candidate_distances, axis=0))
+
+    for facet_index, prepared in enumerate(prepared_facets):
+        facet = prepared["facet"]
+        facet_id = prepared["facetId"]
         # Include points on reconstructed boundaries without allowing material
-        # spillover from an adjacent roof plane.
-        selection_polygon = polygon.buffer(0.02)
-        mask = contains_xy(selection_polygon, points[:, 0], points[:, 1])
-        selected = points[mask]
+        # spillover from an adjacent or vertically overlapping roof plane.
+        selected = points[has_candidate & (closest_facets == facet_index)]
         if len(selected) < settings.open3d_minimum_facet_points:
             raise UnreliableGeometryError(
                 "OPEN3D_FACET_SUPPORT_INSUFFICIENT",
@@ -78,6 +106,7 @@ def validate_facet_points(
                     "reconstructedPitchDegrees": round(
                         float(facet.get("pitchDegrees") or 0), 3
                     ),
+                    "planViewCandidatePoints": plan_view_candidate_counts[facet_index],
                     "supportPoints": int(len(selected)),
                     "minimumSupportPoints": settings.open3d_minimum_facet_points,
                 },
@@ -103,7 +132,7 @@ def validate_facet_points(
         )
         coefficients = np.asarray(plane_model, dtype=float)
         fitted_normal = _unit(coefficients[:3])
-        roofer_normal = _unit(np.asarray(facet.get("normal") or [], dtype=float))
+        roofer_normal = prepared["normal"]
         normal_angle = math.degrees(
             math.acos(float(np.clip(np.dot(fitted_normal, roofer_normal), -1.0, 1.0)))
         )
@@ -138,6 +167,7 @@ def validate_facet_points(
             "pointCloudSingularValues": [
                 round(float(value), 4) for value in singular_values
             ],
+            "planViewCandidatePoints": plan_view_candidate_counts[facet_index],
             "supportPoints": int(len(selected)),
             "inlierPoints": int(len(inliers)),
             "inlierRatio": round(inlier_ratio, 4),
