@@ -748,6 +748,47 @@ def _polygonize_google_solar_mask(mask_path: Path) -> list[BaseGeometry]:
         ) from error
 
 
+def _simplify_google_solar_mask(
+    projected: BaseGeometry, tolerance_meters: float
+) -> tuple[BaseGeometry, dict[str, float | int]]:
+    """Remove raster stair steps without materially changing rooftop area."""
+
+    raw_area = float(projected.area)
+    raw_perimeter = float(projected.length)
+    raw_vertices = len(getattr(projected.exterior, "coords", []))
+    simplified = projected.simplify(tolerance_meters, preserve_topology=True)
+    if (
+        simplified.is_empty
+        or not simplified.is_valid
+        or simplified.geom_type != "Polygon"
+        or simplified.area <= 0
+    ):
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_SIMPLIFICATION_INVALID",
+            "The Google Solar rooftop mask could not be safely simplified.",
+        )
+    area_change_percent = abs(float(simplified.area) - raw_area) / max(raw_area, 0.01) * 100
+    if area_change_percent > 2.0:
+        raise UnreliableGeometryError(
+            "SOLAR_ROOF_MASK_SIMPLIFICATION_CONFLICT",
+            "Rooftop-mask simplification changed the measured area beyond the safety limit.",
+            details={
+                "areaChangePercent": round(area_change_percent, 3),
+                "maximumAreaChangePercent": 2.0,
+            },
+        )
+    return simplified, {
+        "toleranceMeters": round(tolerance_meters, 3),
+        "rawVertexCount": raw_vertices,
+        "simplifiedVertexCount": len(simplified.exterior.coords),
+        "areaChangePercent": round(area_change_percent, 3),
+        "perimeterChangePercent": round(
+            abs(float(simplified.length) - raw_perimeter) / max(raw_perimeter, 0.01) * 100,
+            3,
+        ),
+    }
+
+
 def fetch_google_solar_roofprint(
     building_footprint: FootprintResult,
     longitude: float,
@@ -863,7 +904,17 @@ def fetch_google_solar_roofprint(
             "Google Solar rooftop facets did not provide a usable ground-area reference.",
         )
     epsg = utm_epsg(longitude, latitude)
-    roofprint_m = transform_geometry(roofprint.geometry_wgs84, "EPSG:4326", f"EPSG:{epsg}")
+    raw_roofprint_m = transform_geometry(
+        roofprint.geometry_wgs84, "EPSG:4326", f"EPSG:{epsg}"
+    )
+    roofprint_m, simplification_audit = _simplify_google_solar_mask(
+        raw_roofprint_m,
+        settings.solar_mask_simplification_tolerance_meters,
+    )
+    roofprint = replace(
+        roofprint,
+        geometry_wgs84=transform_geometry(roofprint_m, f"EPSG:{epsg}", "EPSG:4326"),
+    )
     roofprint_area_sqft = float(roofprint_m.area) * 10.763910416709722
     ground_area_variance = (
         abs(roofprint_area_sqft - reference_ground_area) / reference_ground_area * 100
@@ -905,6 +956,7 @@ def fetch_google_solar_roofprint(
             "maskAreaSqFt": round(roofprint_area_sqft, 2),
             "facetGroundAreaSqFt": round(reference_ground_area, 2),
             "groundAreaVariancePercent": round(ground_area_variance, 3),
+            "maskSimplification": simplification_audit,
             "intersectionOverUnion": round(comparison["intersectionOverUnion"], 4),
             "centroidSeparationMeters": round(comparison["centroidSeparationMeters"], 3),
             "areaDifferencePercent": round(comparison["areaDifferencePercent"], 3),
@@ -919,6 +971,7 @@ def fetch_google_solar_roofprint(
                 "imageryDate": imagery_date,
                 "imageryQuality": imagery_quality,
                 "pixelSizeMeters": 0.1,
+                "maskSimplification": simplification_audit,
             }
         ],
         consensus_status="ROOF_MASK_CORROBORATED",

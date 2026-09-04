@@ -24,6 +24,7 @@ try:
     from app.providers import (
         FootprintResult,
         _bing_quadkey,
+        _simplify_google_solar_mask,
         fetch_best_footprint,
         fetch_google_solar_roofprint,
         fetch_overture_footprint,
@@ -237,6 +238,7 @@ sources:
             solar_data_layer_radius_meters=35,
             solar_mask_maximum_bytes=20_000_000,
             solar_mask_maximum_ground_area_variance_percent=5,
+            solar_mask_simplification_tolerance_meters=0.25,
             provider_timeout_seconds=30,
             footprint_max_distance_meters=20,
             footprint_ambiguity_meters=2,
@@ -260,7 +262,30 @@ sources:
             "ROOFTOP_MASK_SELECTED_FOR_RECONSTRUCTION",
         )
         self.assertLess(result.consensus_records[-1]["groundAreaVariancePercent"], 0.01)
+        self.assertIn("maskSimplification", result.consensus_records[-1])
         download.assert_called_once()
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    def test_google_solar_mask_stair_steps_are_safely_simplified(self):
+        stair_step = Polygon(
+            [
+                (0, 0),
+                (10, 0),
+                (10, 10),
+                (8, 10.1),
+                (6, 9.9),
+                (4, 10.1),
+                (2, 9.9),
+                (0, 10),
+            ]
+        )
+
+        simplified, audit = _simplify_google_solar_mask(stair_step, 0.25)
+
+        self.assertTrue(simplified.is_valid)
+        self.assertLess(audit["simplifiedVertexCount"], audit["rawVertexCount"])
+        self.assertLessEqual(audit["areaChangePercent"], 2.0)
+        self.assertEqual(audit["toleranceMeters"], 0.25)
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.fetch_county_footprint")
