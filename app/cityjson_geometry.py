@@ -164,6 +164,152 @@ def _normal_angle_degrees(first: Facet, second: Facet) -> float:
     return math.degrees(math.acos(cosine))
 
 
+def _distance(
+    first: tuple[float, float, float], second: tuple[float, float, float]
+) -> float:
+    return _norm(_vector(first, second))
+
+
+def _project_to_line(
+    point: tuple[float, float, float],
+    origin: tuple[float, float, float],
+    direction: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    denominator = _dot(direction, direction)
+    parameter = _dot(_vector(origin, point), direction) / denominator
+    return tuple(
+        origin[index] + parameter * direction[index] for index in range(3)
+    )  # type: ignore[return-value]
+
+
+def _validated_plane_intersection_edge(
+    uses: list[EdgeUse], maximum_displacement_meters: float
+) -> tuple[list[EdgeUse], dict[str, Any]]:
+    """Snap one shared edge to the independently derived facet-plane line.
+
+    Roofer can return each side of a shared boundary with a small, independent
+    XY/Z residual.  The two fitted planes are the measurement authority; their
+    3D intersection supplies a common line while the original edge endpoints
+    supply only the supported clipping limits.
+    """
+
+    if len(uses) != 2:
+        raise ValueError("Exactly two edge uses are required.")
+    first, second = uses
+    direction = _cross(first.facet.normal, second.facet.normal)
+    direction_squared = _dot(direction, direction)
+    if direction_squared <= 1e-12:
+        raise UnreliableGeometryError(
+            "ROOF_PLANE_INTERSECTION_UNDEFINED",
+            "Adjacent noncoplanar roof facets did not produce a stable plane intersection.",
+        )
+    # Roofer coordinates are usually in a projected CRS with northings in the
+    # millions of metres.  Solve in a local frame around this edge to avoid
+    # cancellation when the two plane constants are combined.
+    local_anchor = tuple(
+        (
+            first.start[index]
+            + first.end[index]
+            + second.start[index]
+            + second.end[index]
+        )
+        / 4
+        for index in range(3)
+    )
+    first_plane_point = _vector(local_anchor, first.facet.vertices[0])
+    second_plane_point = _vector(local_anchor, second.facet.vertices[0])
+    first_constant = _dot(first.facet.normal, first_plane_point)
+    second_constant = _dot(second.facet.normal, second_plane_point)
+    first_term = _cross(second.facet.normal, direction)
+    second_term = _cross(direction, first.facet.normal)
+    local_origin = tuple(
+        (
+            first_constant * first_term[index]
+            + second_constant * second_term[index]
+        )
+        / direction_squared
+        for index in range(3)
+    )
+    origin = tuple(
+        local_anchor[index] + local_origin[index] for index in range(3)
+    )
+
+    same_order_distance = _distance(first.start, second.start) + _distance(
+        first.end, second.end
+    )
+    reverse_order_distance = _distance(first.start, second.end) + _distance(
+        first.end, second.start
+    )
+    second_reversed = reverse_order_distance < same_order_distance
+    second_start = second.end if second_reversed else second.start
+    second_end = second.start if second_reversed else second.end
+    supported_start = tuple(
+        (first.start[index] + second_start[index]) / 2 for index in range(3)
+    )
+    supported_end = tuple(
+        (first.end[index] + second_end[index]) / 2 for index in range(3)
+    )
+    corrected_start = _project_to_line(supported_start, origin, direction)
+    corrected_end = _project_to_line(supported_end, origin, direction)
+    if _distance(corrected_start, corrected_end) <= 0.10:
+        raise UnreliableGeometryError(
+            "ROOF_PLANE_INTERSECTION_DEGENERATE",
+            "The validated roof-plane intersection is too short to measure safely.",
+        )
+    displacements = (
+        _distance(first.start, corrected_start),
+        _distance(first.end, corrected_end),
+        _distance(second_start, corrected_start),
+        _distance(second_end, corrected_end),
+    )
+    maximum_displacement = max(displacements)
+    if maximum_displacement > maximum_displacement_meters:
+        raise UnreliableGeometryError(
+            "ROOF_PLANE_INTERSECTION_DISPLACEMENT_EXCEEDED",
+            "A reconstructed shared boundary is too far from the incident roof-plane intersection.",
+            details={
+                "facetIds": [first.facet.facet_id, second.facet.facet_id],
+                "maximumDisplacementMeters": _round(maximum_displacement, 3),
+                "allowedDisplacementMeters": _round(
+                    maximum_displacement_meters, 3
+                ),
+            },
+        )
+
+    first_vector = _vector(first.start, first.end)
+    alignment_cosine = abs(
+        _dot(first_vector, direction)
+        / max(_norm(first_vector) * _norm(direction), 1e-12)
+    )
+    alignment_degrees = math.degrees(
+        math.acos(max(-1.0, min(1.0, alignment_cosine)))
+    )
+    corrected_second_start = corrected_end if second_reversed else corrected_start
+    corrected_second_end = corrected_start if second_reversed else corrected_end
+    corrected = [
+        EdgeUse(
+            first.facet,
+            first.start_id,
+            first.end_id,
+            corrected_start,
+            corrected_end,
+        ),
+        EdgeUse(
+            second.facet,
+            second.start_id,
+            second.end_id,
+            corrected_second_start,
+            corrected_second_end,
+        ),
+    ]
+    return corrected, {
+        "derivation": "PLANE_PLANE_BOUNDARY_INTERSECTION",
+        "maximumCorrectionMeters": _round(maximum_displacement, 3),
+        "allowedCorrectionMeters": _round(maximum_displacement_meters, 3),
+        "originalBoundaryAlignmentDegrees": _round(alignment_degrees, 3),
+    }
+
+
 def _round(value: float, digits: int = 2) -> float:
     return round(float(value), digits)
 
@@ -538,6 +684,7 @@ def extract_roof_geometry(
     coplanar_tolerance_degrees: float = 2.0,
     edge_node_tolerance_meters: float = EDGE_NODE_TOLERANCE_METERS,
     edge_node_vertical_tolerance_meters: float = EDGE_NODE_VERTICAL_TOLERANCE_METERS,
+    plane_intersection_maximum_displacement_meters: float = 0.35,
     minimum_density: float = 8.0,
     maximum_nodata_fraction: float = 0.10,
     maximum_rmse_meters: float = 0.35,
@@ -575,7 +722,11 @@ def extract_roof_geometry(
         "highPerimeters": "HP",
     }
 
-    def add_edge(kind: str, uses: list[EdgeUse]) -> None:
+    def add_edge(
+        kind: str,
+        uses: list[EdgeUse],
+        classification_evidence: dict[str, Any] | None = None,
+    ) -> None:
         counters[kind] += 1
         first = uses[0]
         entry = {
@@ -585,6 +736,11 @@ def extract_roof_geometry(
                 _projected_edge_length(first.start, first.end) * METERS_TO_FEET
             ),
             "facetIds": [use.facet.facet_id for use in uses],
+            "classificationEvidence": classification_evidence
+            or {
+                "derivation": "RECONSTRUCTED_FACET_BOUNDARY",
+                "adjacentFacetCount": len(uses),
+            },
         }
         classified[kind].append(entry)
 
@@ -613,6 +769,11 @@ def extract_roof_geometry(
         second = uses[1]
         if _normal_angle_degrees(first.facet, second.facet) <= coplanar_tolerance_degrees:
             continue
+        uses, intersection_evidence = _validated_plane_intersection_edge(
+            uses, plane_intersection_maximum_displacement_meters
+        )
+        first, second = uses
+        intersection_evidence["adjacentFacetCount"] = 2
         first_delta = _facet_side_height_delta(first)
         second_delta = _facet_side_height_delta(second)
         first_decisive = abs(first_delta) > plane_side_tolerance_meters
@@ -633,18 +794,21 @@ def extract_roof_geometry(
             if decisive
         ]
         if decisive_deltas and all(delta > 0 for delta in decisive_deltas):
-            add_edge("valleys", uses)
+            intersection_evidence["junctionShape"] = "CONCAVE"
+            add_edge("valleys", uses, intersection_evidence)
         elif decisive_deltas and all(delta < 0 for delta in decisive_deltas):
+            intersection_evidence["junctionShape"] = "CONVEX"
             if abs(first.start[2] - first.end[2]) <= horizontal_edge_tolerance_meters:
-                add_edge("ridges", uses)
+                add_edge("ridges", uses, intersection_evidence)
             else:
-                add_edge("hips", uses)
+                add_edge("hips", uses, intersection_evidence)
         else:
             ambiguous.append(
                 {
                     "reason": "UNCLASSIFIED_SHARED_EDGE",
                     "facetIds": [first.facet.facet_id, second.facet.facet_id],
                     "sideHeightsMeters": [_round(first_delta, 3), _round(second_delta, 3)],
+                    "planeIntersection": intersection_evidence,
                 }
             )
 

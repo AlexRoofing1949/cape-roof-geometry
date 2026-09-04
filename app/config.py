@@ -61,6 +61,7 @@ class Settings:
     solar_mask_simplification_tolerance_meters: float
     roof_edge_node_tolerance_meters: float
     roof_edge_vertical_node_tolerance_meters: float
+    roof_plane_intersection_maximum_displacement_meters: float
     maximum_roofprint_perimeter_variance_percent: float
     usgs_catalog_url: str
     county_boundaries_url: str
@@ -164,6 +165,9 @@ class Settings:
             ),
             roof_edge_vertical_node_tolerance_meters=_float(
                 "ROOF_EDGE_VERTICAL_NODE_TOLERANCE_METERS", 0.30
+            ),
+            roof_plane_intersection_maximum_displacement_meters=_float(
+                "ROOF_PLANE_INTERSECTION_MAXIMUM_DISPLACEMENT_METERS", 0.35
             ),
             maximum_roofprint_perimeter_variance_percent=_float(
                 "MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT", 10.0
@@ -292,6 +296,9 @@ class Settings:
             and 0.10 <= self.solar_mask_simplification_tolerance_meters <= 0.50
             and 0.02 <= self.roof_edge_node_tolerance_meters <= 0.15
             and 0.10 <= self.roof_edge_vertical_node_tolerance_meters <= 0.40
+            and 0.10
+            <= self.roof_plane_intersection_maximum_displacement_meters
+            <= 0.50
         ):
             raise ConfigurationError(
                 "SOLAR_ROOFPRINT_CONFIG_INVALID",

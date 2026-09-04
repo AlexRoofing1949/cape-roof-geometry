@@ -7,6 +7,7 @@ from app.cityjson_geometry import (
     Facet,
     _facet_side_height_delta,
     _noded_edge_uses,
+    _validated_plane_intersection_edge,
     extract_roof_geometry,
     load_cityjson_feature,
 )
@@ -70,6 +71,67 @@ class CityJsonGeometryTests(unittest.TestCase):
         )
 
         self.assertTrue(any(len(uses) == 2 for uses in edge_uses.values()))
+
+    def test_shared_edge_is_corrected_to_facet_plane_intersection(self):
+        root_half = math.sqrt(0.5)
+        first_vertices = (
+            (0.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0),
+            (10.0, 5.0, 5.0),
+        )
+        second_vertices = (
+            (10.0, 0.04, 0.24),
+            (0.0, 0.04, 0.24),
+            (0.0, -5.0, 5.28),
+        )
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[i] for point in vertices) / 3 for i in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first = facet("F1", first_vertices, (0.0, -root_half, root_half))
+        second = facet("F2", second_vertices, (0.0, root_half, root_half))
+        uses = [
+            EdgeUse(first, 0, 1, first_vertices[0], first_vertices[1]),
+            EdgeUse(second, 0, 1, second_vertices[0], second_vertices[1]),
+        ]
+
+        corrected, evidence = _validated_plane_intersection_edge(uses, 0.35)
+
+        self.assertEqual(evidence["derivation"], "PLANE_PLANE_BOUNDARY_INTERSECTION")
+        self.assertLessEqual(evidence["maximumCorrectionMeters"], 0.35)
+        self.assertAlmostEqual(corrected[0].start[1], 0.14, delta=0.001)
+        self.assertAlmostEqual(corrected[0].start[2], 0.14, delta=0.001)
+        self.assertEqual(corrected[0].start, corrected[1].end)
+        self.assertEqual(corrected[0].end, corrected[1].start)
+        for use in corrected:
+            plane_origin = use.facet.vertices[0]
+            for point in (use.start, use.end):
+                self.assertAlmostEqual(
+                    sum(
+                        use.facet.normal[index]
+                        * (point[index] - plane_origin[index])
+                        for index in range(3)
+                    ),
+                    0.0,
+                    delta=1e-9,
+                )
+        self.assertGreater(_facet_side_height_delta(corrected[0]), 0)
+        self.assertGreater(_facet_side_height_delta(corrected[1]), 0)
 
     def test_vertically_separated_edges_remain_distinct(self):
         first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
