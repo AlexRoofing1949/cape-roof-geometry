@@ -207,13 +207,41 @@ def _normal_angle_degrees(first: Facet, second: Facet) -> float:
 
 
 def _edge_direction_variance_degrees(first: EdgeUse, second: EdgeUse) -> float:
-    first_vector = _vector(first.start, first.end)
-    second_vector = _vector(second.start, second.end)
+    return _vector_alignment_degrees(
+        _vector(first.start, first.end),
+        _vector(second.start, second.end),
+    )
+
+
+def _vector_alignment_degrees(
+    first_vector: tuple[float, float, float],
+    second_vector: tuple[float, float, float],
+) -> float:
+    """Return the unsigned angle between two undirected 3D lines."""
+
     cosine = abs(
         _dot(first_vector, second_vector)
         / max(_norm(first_vector) * _norm(second_vector), 1e-12)
     )
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def _edge_downslope_alignment_degrees(use: EdgeUse) -> float | None:
+    """Return plan-angle from an exterior edge to its facet's downslope axis."""
+
+    edge_direction = (
+        use.end[0] - use.start[0],
+        use.end[1] - use.start[1],
+        0.0,
+    )
+    downslope_direction = (
+        use.facet.normal[0] / use.facet.normal[2],
+        use.facet.normal[1] / use.facet.normal[2],
+        0.0,
+    )
+    if _norm(edge_direction) <= 1e-12 or _norm(downslope_direction) <= 1e-12:
+        return None
+    return _vector_alignment_degrees(edge_direction, downslope_direction)
 
 
 def _distance(
@@ -774,7 +802,7 @@ def extract_roof_geometry(
     flat_pitch_degrees: float = 5.0,
     horizontal_edge_tolerance_meters: float = 0.15,
     plane_side_tolerance_meters: float = 0.08,
-    coplanar_tolerance_degrees: float = 2.0,
+    coplanar_tolerance_degrees: float = 3.0,
     edge_node_tolerance_meters: float = EDGE_NODE_TOLERANCE_METERS,
     edge_node_vertical_tolerance_meters: float = EDGE_NODE_VERTICAL_TOLERANCE_METERS,
     plane_intersection_maximum_displacement_meters: float = 0.35,
@@ -890,7 +918,19 @@ def extract_roof_geometry(
                 ),
             }
 
-        if elevation_change > horizontal_edge_tolerance_meters:
+        downslope_alignment = _edge_downslope_alignment_degrees(use)
+        if downslope_alignment is not None:
+            boundary_evidence = {
+                **(boundary_evidence or {}),
+                "edgeDirectionToDownslopeDegrees": _round(
+                    downslope_alignment, 3
+                ),
+                "classificationRule": "FACET_SLOPE_DIRECTION",
+            }
+        # A true rake travels substantially across the facet contours.  Small
+        # vertical changes along a raster-derived eave are expected plane-fit
+        # residuals and must not turn a hip-roof perimeter into rakes.
+        if downslope_alignment is not None and downslope_alignment <= 45.0:
             add_edge("rakes", [use], boundary_evidence)
         else:
             add_edge("eaves", [use], boundary_evidence)
@@ -927,6 +967,43 @@ def extract_roof_geometry(
             rejected_noded_adjacencies.append(evidence)
             continue
         if _normal_angle_degrees(first.facet, second.facet) <= coplanar_tolerance_degrees:
+            continue
+        plane_intersection_direction = _cross(
+            first.facet.normal, second.facet.normal
+        )
+        boundary_alignments = [
+            _vector_alignment_degrees(
+                _vector(use.start, use.end), plane_intersection_direction
+            )
+            for use in uses
+        ]
+        if any(
+            alignment > shared_edge_maximum_direction_variance_degrees
+            for alignment in boundary_alignments
+        ):
+            evidence = {
+                "derivation": "SUPPRESSED_PLANE_INTERSECTION_MISALIGNMENT",
+                "facetIds": [first.facet.facet_id, second.facet.facet_id],
+                "directionVarianceDegrees": _round(direction_variance, 3),
+                "originalBoundaryAlignmentDegrees": [
+                    _round(alignment, 3) for alignment in boundary_alignments
+                ],
+                "maximumDirectionVarianceDegrees": _round(
+                    shared_edge_maximum_direction_variance_degrees, 3
+                ),
+                "incidentPlaneAngleDegrees": _round(
+                    _normal_angle_degrees(first.facet, second.facet), 3
+                ),
+                "candidateLengthFeet": _round(
+                    (
+                        _edge_length(first.start, first.end)
+                        + _edge_length(second.start, second.end)
+                    )
+                    / 2
+                    * METERS_TO_FEET
+                ),
+            }
+            rejected_noded_adjacencies.append(evidence)
             continue
         uses, intersection_evidence = _validated_plane_intersection_edge(
             uses, plane_intersection_maximum_displacement_meters

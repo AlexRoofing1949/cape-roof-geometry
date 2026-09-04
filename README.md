@@ -82,6 +82,9 @@ match the selected roofprint perimeter.  Set
 range is 2–15 percent.  This gate only detects broken exterior topology.  It
 never derives roof lines from a parcel, appraiser sketch, or footprint and a
 mismatch returns `INSPECTION_REQUIRED` through the customer-safe workflow.
+Google Solar's 0.1 m roof mask is simplified at a bounded 0.15 m tolerance.
+Larger tolerances are rejected because they can erase real eave transitions
+while preserving nearly the same polygon area.
 Facet-edge noding uses independent horizontal and vertical agreement limits;
 `ROOF_EDGE_VERTICAL_NODE_TOLERANCE_METERS=0.30` permits bounded plane-fit
 height residuals but does not merge vertically separated roof boundaries.

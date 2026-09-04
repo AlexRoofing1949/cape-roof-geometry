@@ -160,7 +160,7 @@ class Settings:
                 "SOLAR_MASK_MAXIMUM_GROUND_AREA_VARIANCE_PERCENT", 8
             ),
             solar_mask_simplification_tolerance_meters=_float(
-                "SOLAR_MASK_SIMPLIFICATION_TOLERANCE_METERS", 0.25
+                "SOLAR_MASK_SIMPLIFICATION_TOLERANCE_METERS", 0.15
             ),
             roof_edge_node_tolerance_meters=_float(
                 "ROOF_EDGE_NODE_TOLERANCE_METERS", 0.10
@@ -301,7 +301,7 @@ class Settings:
             10 <= self.solar_data_layer_radius_meters <= 100
             and 1_000_000 <= self.solar_mask_maximum_bytes <= 50_000_000
             and 1 <= self.solar_mask_maximum_ground_area_variance_percent <= 10
-            and 0.10 <= self.solar_mask_simplification_tolerance_meters <= 0.50
+            and 0.10 <= self.solar_mask_simplification_tolerance_meters <= 0.20
             and 0.02 <= self.roof_edge_node_tolerance_meters <= 0.15
             and 0.10 <= self.roof_edge_vertical_node_tolerance_meters <= 0.40
             and 0.10

@@ -182,6 +182,89 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertEqual(result["topology"]["suppressedCrossingArtifactFeet"], 0.66)
         self.assertEqual(result["eaves"], [])
 
+    def test_parallel_fragments_misaligned_with_plane_intersection_are_suppressed(self):
+        root_three_over_two = math.sqrt(3) / 2
+        first_facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, -0.577)),
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=30.0,
+            azimuth_degrees=90.0,
+            centroid=(0.333, 0.333, -0.192),
+            normal=(0.5, 0.0, root_three_over_two),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        second_facet = Facet(
+            **{
+                **first_facet.__dict__,
+                "facet_id": "F2",
+                "normal": (-0.5, 0.0, root_three_over_two),
+            }
+        )
+        first = EdgeUse(first_facet, 0, 1, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        second = EdgeUse(second_facet, 2, 3, (1.0, 0.04, 0.02), (0.0, 0.04, 0.02))
+
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        with patch(
+            "app.cityjson_geometry._noded_edge_uses",
+            return_value={(0, 1): [first, second]},
+        ):
+            result = extract_roof_geometry(feature, transform)
+
+        rejected = result["topology"]["rejectedNodedAdjacencies"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(
+            rejected[0]["derivation"],
+            "SUPPRESSED_PLANE_INTERSECTION_MISALIGNMENT",
+        )
+        self.assertGreater(min(rejected[0]["originalBoundaryAlignmentDegrees"]), 80)
+
+    def test_exterior_classification_uses_facet_slope_direction(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "JITTERED-EAVE",
+            "vertices": [[0, 0, 0], [1, 10, 1], [10, 10, 10], [10, 0, 10]],
+            "CityObjects": {
+                "JITTERED-EAVE": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [
+                        {
+                            "type": "MultiSurface",
+                            "lod": "2.2",
+                            "boundaries": [[[0, 1, 2, 3]]],
+                            "semantics": {
+                                "surfaces": [{"type": "RoofSurface", "rf_slope": 45}],
+                                "values": [0],
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        long_eave = max(result["eaves"], key=lambda edge: edge["lengthFeet"])
+        self.assertGreater(
+            long_eave["classificationEvidence"]["edgeDirectionToDownslopeDegrees"],
+            80,
+        )
+        self.assertEqual(
+            long_eave["classificationEvidence"]["classificationRule"],
+            "FACET_SLOPE_DIRECTION",
+        )
+
     def test_vertically_separated_edges_remain_distinct(self):
         first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
         second_vertices = ((10.0, 0.04, 0.80), (0.0, 0.04, 0.80), (0.0, -5.0, 5.0))
