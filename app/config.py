@@ -86,6 +86,7 @@ class Settings:
     maximum_nodata_fraction: float
     maximum_roofer_rmse_meters: float
     roofer_plane_detect_epsilon_meters: float
+    roofer_complexity_factor: float
     flat_pitch_degrees: float
     minimum_service_confidence: float
     maximum_solar_area_variance_percent: float
@@ -149,7 +150,7 @@ class Settings:
             solar_data_layer_radius_meters=_float("SOLAR_DATA_LAYER_RADIUS_METERS", 35),
             solar_mask_maximum_bytes=_int("SOLAR_MASK_MAXIMUM_BYTES", 20_000_000),
             solar_mask_maximum_ground_area_variance_percent=_float(
-                "SOLAR_MASK_MAXIMUM_GROUND_AREA_VARIANCE_PERCENT", 5
+                "SOLAR_MASK_MAXIMUM_GROUND_AREA_VARIANCE_PERCENT", 8
             ),
             usgs_catalog_url=os.getenv(
                 "USGS_3DEP_CATALOG_URL", "https://usgs.entwine.io/boundaries/resources.geojson"
@@ -198,6 +199,7 @@ class Settings:
             roofer_plane_detect_epsilon_meters=_float(
                 "ROOFER_PLANE_DETECT_EPSILON_METERS", 0.15
             ),
+            roofer_complexity_factor=_float("ROOFER_COMPLEXITY_FACTOR", 1.0),
             flat_pitch_degrees=_float("FLAT_PITCH_DEGREES", 5),
             minimum_service_confidence=_float("MINIMUM_SERVICE_CONFIDENCE", 0.80),
             maximum_solar_area_variance_percent=_float("MAXIMUM_SOLAR_AREA_VARIANCE_PERCENT", 15),
@@ -332,6 +334,11 @@ class Settings:
             raise ConfigurationError(
                 "ROOFER_PLANE_EPSILON_INVALID",
                 "ROOFER_PLANE_DETECT_EPSILON_METERS must be between 0.05 and 0.30.",
+            )
+        if not 0.50 <= self.roofer_complexity_factor <= 1.0:
+            raise ConfigurationError(
+                "ROOFER_COMPLEXITY_FACTOR_INVALID",
+                "ROOFER_COMPLEXITY_FACTOR must be between 0.50 and 1.0.",
             )
         if not date(2018, 1, 1) <= self.minimum_lidar_acquisition_date <= date.today():
             raise ConfigurationError(

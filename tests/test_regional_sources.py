@@ -440,7 +440,7 @@ sources:
             next(
                 source
                 for source in self.registries.lidar_sources
-                if source.id == "usgs_florida_peninsular_2018_2020"
+                if source.id == "usgs_southwest_2018_2019"
             ),
             acquired_start=date(2017, 1, 1),
             acquired_end=date(2017, 12, 31),
@@ -449,7 +449,7 @@ sources:
             self.registries,
             lidar_sources=tuple(
                 old_fallback
-                if source.id == "usgs_florida_peninsular_2018_2020"
+                if source.id == "usgs_southwest_2018_2019"
                 else source
                 for source in self.registries.lidar_sources
             ),
@@ -529,7 +529,52 @@ sources:
         _, candidates, _ = select_regional_lidar(
             footprint(), -81.9509, 26.6211, settings(), self.registries
         )
-        self.assertIn("usgs_florida_peninsular_2018_2020", [item.source_id for item in candidates])
+        self.assertIn("usgs_southwest_2018_2019", [item.source_id for item in candidates])
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers.resolve_service_county", return_value="Collier")
+    @patch("app.providers._catalog_features")
+    @patch("app.providers._ept_coverage")
+    def test_collier_includes_southwest_b_2018_catalog_project(
+        self, ept_coverage, catalog, _county
+    ):
+        ept_coverage.return_value = (
+            Polygon([(-83, 25), (-80, 25), (-80, 28), (-83, 28)]),
+            1_000_000,
+        )
+        catalog.return_value = iter(
+            [
+                {
+                    "type": "Feature",
+                    "geometry": mapping(
+                        Polygon([(-83, 25), (-80, 25), (-80, 28), (-83, 28)])
+                    ),
+                    "properties": {
+                        "name": "USGS_LPC_FL_Southwest_B_2018_LAS_2019",
+                        "url": "https://s3-us-west-2.amazonaws.com/usgs-lidar-public/USGS_LPC_FL_Southwest_B_2018_LAS_2019/ept.json",
+                        "count": 500000,
+                    },
+                }
+            ]
+        )
+
+        county, candidates, audit = select_regional_lidar(
+            footprint(), -81.7020683, 26.2587423, settings(), self.registries
+        )
+
+        self.assertEqual(county, "Collier")
+        candidate = next(
+            item for item in candidates if item.source_id == "usgs_southwest_2018_2019"
+        )
+        self.assertEqual(candidate.acquired_start, "2018-05-08")
+        self.assertEqual(candidate.acquired_end, "2019-03-01")
+        self.assertTrue(
+            any(
+                item["sourceId"] == "usgs_southwest_2018_2019"
+                and item["decision"] == "CANDIDATE"
+                for item in audit
+            )
+        )
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.resolve_service_county", return_value="Manatee")

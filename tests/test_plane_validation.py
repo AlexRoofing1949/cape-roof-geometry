@@ -39,10 +39,14 @@ class PlaneValidationTests(unittest.TestCase):
                 self.assertEqual(
                     command[command.index("--plane-detect-epsilon") + 1], "0.15"
                 )
+                self.assertEqual(
+                    command[command.index("--complexity-factor") + 1], "1.0"
+                )
 
             configured = SimpleNamespace(
                 command_timeout_seconds=30,
                 roofer_plane_detect_epsilon_meters=0.15,
+                roofer_complexity_factor=1.0,
             )
             with patch("app.pipeline._run", side_effect=fake_run):
                 feature, metadata = _run_roofer(

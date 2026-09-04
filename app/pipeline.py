@@ -358,6 +358,8 @@ def _run_roofer(pointcloud: Path, footprint: Path, output: Path, settings: Setti
             "--lod22",
             "--plane-detect-epsilon",
             str(settings.roofer_plane_detect_epsilon_meters),
+            "--complexity-factor",
+            str(settings.roofer_complexity_factor),
             str(pointcloud),
             str(footprint),
             str(output),
@@ -444,6 +446,68 @@ def _combined_confidence(
         + components["solarReconciliation"] * 0.25
     )
     return round(score, 3), {key: round(value, 3) for key, value in components.items()}
+
+
+def _confidence_diagnostics(
+    geometry: dict[str, Any],
+    reconciliation: dict[str, Any],
+    imagery_decision: dict[str, Any],
+    lidar: LidarResource,
+    point_audit: dict[str, Any],
+    point_density: float,
+) -> dict[str, Any]:
+    """Return calibration-safe failure evidence without vertices or credentials."""
+
+    current_imagery = imagery_decision.get("currentImagery") or {}
+    return {
+        "geometry": {
+            key: geometry.get(key)
+            for key in (
+                "roofAreaSqFt",
+                "averagePitchDegrees",
+                "maximumPitchDegrees",
+                "rakesFeet",
+                "eavesFeet",
+                "valleysFeet",
+                "ridgesFeet",
+                "hipsFeet",
+                "highPerimeterFeet",
+                "flatRoofAreaSqFt",
+                "externalPerimeterFeet",
+                "internalRoofEdgeFeet",
+            )
+        }
+        | {
+            "facetCount": len(geometry.get("facets") or []),
+            "quality": geometry.get("quality") or {},
+            "independentPlaneValidation": (
+                (geometry.get("independentPlaneValidation") or {}).get("validation")
+            ),
+        },
+        "reconciliation": reconciliation,
+        "currentStructure": {
+            "verificationStatus": imagery_decision.get("verificationStatus"),
+            "pricingAllowed": bool(imagery_decision.get("pricingAllowed")),
+            "status": imagery_decision.get("status"),
+            "currentImagery": {
+                key: current_imagery.get(key)
+                for key in (
+                    "sourceId",
+                    "captureDate",
+                    "validation",
+                    "unchanged",
+                    "method",
+                    "failureReasons",
+                )
+            },
+            "warnings": imagery_decision.get("warnings") or [],
+        },
+        "pointCloud": {
+            "sourceId": lidar.source_id,
+            "tileAcquisitionDate": point_audit.get("tileAcquisitionDate") or "",
+            "pointDensityPpsm": round(point_density, 3),
+        },
+    }
 
 
 def _enforce_lidar_acquisition_floor(
@@ -583,10 +647,22 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     current_structure_validated=current_structure_validated,
                 )
                 if confidence < settings.minimum_service_confidence:
+                    diagnostics = _confidence_diagnostics(
+                        geometry,
+                        reconciliation,
+                        imagery_decision,
+                        lidar,
+                        point_audit,
+                        point_density,
+                    )
                     raise UnreliableGeometryError(
                         "GEOMETRY_CONFIDENCE_TOO_LOW",
                         "The open-source roof model did not meet the automatic measurement confidence threshold.",
-                        details={"confidence": confidence, "components": confidence_components},
+                        details={
+                            "confidence": confidence,
+                            "components": confidence_components,
+                            **diagnostics,
+                        },
                     )
                 geometry["confidence"] = confidence
                 geometry["confidenceComponents"] = confidence_components
@@ -727,6 +803,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "rooferPlaneDetectEpsilonMeters": (
                         settings.roofer_plane_detect_epsilon_meters
                     ),
+                    "rooferComplexityFactor": settings.roofer_complexity_factor,
                     "minimumServiceConfidence": settings.minimum_service_confidence,
                 },
                 "warnings": imagery_decision["warnings"],

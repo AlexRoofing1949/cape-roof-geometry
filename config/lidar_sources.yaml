@@ -76,7 +76,7 @@ sources:
   - id: usgs_florida_peninsular_2018_2020
     dataset_name: USGS Florida Peninsular LiDAR 2018-2020
     priority: 50
-    counties: [Sarasota, DeSoto, Charlotte, Lee, Collier, Glades, Hendry]
+    counties: [Sarasota, DeSoto, Charlotte, Glades, Hendry]
     acquired_start: "2018-01-01"
     acquired_end: "2020-12-31"
     access: usgs_tnm
@@ -94,4 +94,23 @@ sources:
     provider: USGS 3DEP
     license: US-GOVERNMENT-PUBLIC-DOMAIN
     metadata_url: https://www.fisheries.noaa.gov/inport/item/75872
+    enabled: true
+
+  - id: usgs_southwest_2018_2019
+    dataset_name: 2018 USGS/NRCS LiDAR Southwest Florida
+    priority: 55
+    counties: [Lee, Collier]
+    acquired_start: "2018-05-08"
+    acquired_end: "2019-03-01"
+    access: usgs_tnm
+    endpoint: null
+    catalog_name_patterns:
+      - "(?i)^USGS_LPC_FL_Southwest_(?:A|B|B_TL)_2018_LAS_2019$"
+    data_kind: classified_point_cloud
+    minimum_density_ppsm: 8.0
+    allowed_classes: [1, 2, 6]
+    roof_classes: [1, 6]
+    provider: USGS 3DEP
+    license: US-GOVERNMENT-PUBLIC-DOMAIN
+    metadata_url: https://www.fisheries.noaa.gov/inport/item/59066
     enabled: true
