@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -102,6 +102,46 @@ def _horizontal_ring_area(points: Iterable[tuple[float, float, float]]) -> float
             for current, following in zip(values, values[1:] + values[:1])
         )
     ) / 2
+
+
+def _canonical_ring(
+    vertex_ids: tuple[int, ...],
+    points: tuple[tuple[float, float, float], ...],
+) -> tuple[tuple[int, ...], tuple[tuple[float, float, float], ...]]:
+    """Return a stable CCW ring whose first vertex is coordinate-canonical."""
+
+    pairs = list(zip(vertex_ids, points))
+    signed_area = sum(
+        current[1][0] * following[1][1]
+        - following[1][0] * current[1][1]
+        for current, following in zip(pairs, pairs[1:] + pairs[:1])
+    ) / 2
+    if signed_area < 0:
+        pairs.reverse()
+    start_index = min(
+        range(len(pairs)),
+        key=lambda index: tuple(round(value, 8) for value in pairs[index][1]),
+    )
+    pairs = pairs[start_index:] + pairs[:start_index]
+    return (
+        tuple(pair[0] for pair in pairs),
+        tuple(pair[1] for pair in pairs),
+    )
+
+
+def _facet_sort_key(facet: Facet) -> tuple[Any, ...]:
+    """Identify a facet from geometry instead of Roofer array position."""
+
+    return (
+        tuple(round(value, 6) for value in facet.centroid),
+        round(facet.horizontal_area_square_meters, 6),
+        round(facet.area_square_meters, 6),
+        tuple(
+            round(value, 6)
+            for point in facet.vertices
+            for value in point
+        ),
+    )
 
 
 def _edge_height_at_xy(
@@ -588,7 +628,12 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
                 raise UnreliableGeometryError(
                     "ROOF_FACET_INVALID", "Roofer returned an invalid roof facet boundary."
                 )
-            decoded_rings.append((ring_ids, tuple(vertices[value] for value in ring_ids)))
+            decoded_rings.append(
+                _canonical_ring(
+                    ring_ids,
+                    tuple(vertices[value] for value in ring_ids),
+                )
+            )
         if not decoded_rings:
             raise UnreliableGeometryError(
                 "ROOF_FACET_INVALID", "Roofer returned a roof facet without a boundary."
@@ -655,6 +700,11 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
                 semantic_attributes=dict(semantic),
             )
         )
+    facets.sort(key=_facet_sort_key)
+    facets = [
+        replace(facet, facet_id=f"F{index}")
+        for index, facet in enumerate(facets, start=1)
+    ]
     return facets, parent_attributes
 
 

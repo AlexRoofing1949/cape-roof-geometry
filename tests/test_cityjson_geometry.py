@@ -1,5 +1,6 @@
 import math
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from app.cityjson_geometry import (
@@ -227,6 +228,21 @@ class CityJsonGeometryTests(unittest.TestCase):
         for facet in result["facets"]:
             self.assertAlmostEqual(facet["areaSqFt"], facet["slopeAreaFormulaSqFt"], delta=0.02)
             self.assertAlmostEqual(facet["pitchRisePer12"], 12, delta=0.01)
+
+    def test_facet_ids_and_edges_are_independent_of_roofer_surface_order(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        expected = extract_roof_geometry(feature, transform)
+        reordered = deepcopy(feature)
+        geometry = reordered["CityObjects"]["TEST-GABLE-0"]["geometry"][0]
+        geometry["boundaries"][0].reverse()
+        geometry["semantics"]["values"][0].reverse()
+        for surface in geometry["boundaries"][0]:
+            ring = surface[0]
+            surface[0] = list(reversed(ring[1:] + ring[:1]))
+
+        actual = extract_roof_geometry(reordered, transform)
+
+        self.assertEqual(actual, expected)
 
     def test_coincident_ids_and_t_junction_are_noded_before_edge_classification(self):
         feature = {
