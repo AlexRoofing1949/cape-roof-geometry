@@ -114,6 +114,8 @@ class CityJsonGeometryTests(unittest.TestCase):
 
         self.assertEqual(evidence["derivation"], "PLANE_PLANE_BOUNDARY_INTERSECTION")
         self.assertLessEqual(evidence["maximumCorrectionMeters"], 0.35)
+        self.assertEqual(evidence["originalBoundaryAlignmentDegrees"], [0.0, 0.0])
+        self.assertAlmostEqual(evidence["incidentPlaneAngleDegrees"], 90.0)
         self.assertAlmostEqual(corrected[0].start[1], 0.14, delta=0.001)
         self.assertAlmostEqual(corrected[0].start[2], 0.14, delta=0.001)
         self.assertEqual(corrected[0].start, corrected[1].end)

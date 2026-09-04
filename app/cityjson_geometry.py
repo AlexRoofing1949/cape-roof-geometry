@@ -251,10 +251,40 @@ def _validated_plane_intersection_edge(
     )
     corrected_start = _project_to_line(supported_start, origin, direction)
     corrected_end = _project_to_line(supported_end, origin, direction)
-    if _distance(corrected_start, corrected_end) <= 0.10:
+
+    def alignment_degrees(use: EdgeUse) -> float:
+        edge_vector = _vector(use.start, use.end)
+        alignment_cosine = abs(
+            _dot(edge_vector, direction)
+            / max(_norm(edge_vector) * _norm(direction), 1e-12)
+        )
+        return math.degrees(
+            math.acos(max(-1.0, min(1.0, alignment_cosine)))
+        )
+
+    first_alignment_degrees = alignment_degrees(first)
+    second_alignment_degrees = alignment_degrees(second)
+    corrected_length = _distance(corrected_start, corrected_end)
+    diagnostic_evidence = {
+        "facetIds": [first.facet.facet_id, second.facet.facet_id],
+        "correctedLengthMeters": _round(corrected_length, 3),
+        "originalEdgeLengthsMeters": [
+            _round(_distance(first.start, first.end), 3),
+            _round(_distance(second.start, second.end), 3),
+        ],
+        "originalBoundaryAlignmentDegrees": [
+            _round(first_alignment_degrees, 3),
+            _round(second_alignment_degrees, 3),
+        ],
+        "incidentPlaneAngleDegrees": _round(
+            _normal_angle_degrees(first.facet, second.facet), 3
+        ),
+    }
+    if corrected_length <= 0.10:
         raise UnreliableGeometryError(
             "ROOF_PLANE_INTERSECTION_DEGENERATE",
             "The validated roof-plane intersection is too short to measure safely.",
+            details=diagnostic_evidence,
         )
     displacements = (
         _distance(first.start, corrected_start),
@@ -268,7 +298,7 @@ def _validated_plane_intersection_edge(
             "ROOF_PLANE_INTERSECTION_DISPLACEMENT_EXCEEDED",
             "A reconstructed shared boundary is too far from the incident roof-plane intersection.",
             details={
-                "facetIds": [first.facet.facet_id, second.facet.facet_id],
+                **diagnostic_evidence,
                 "maximumDisplacementMeters": _round(maximum_displacement, 3),
                 "allowedDisplacementMeters": _round(
                     maximum_displacement_meters, 3
@@ -276,14 +306,6 @@ def _validated_plane_intersection_edge(
             },
         )
 
-    first_vector = _vector(first.start, first.end)
-    alignment_cosine = abs(
-        _dot(first_vector, direction)
-        / max(_norm(first_vector) * _norm(direction), 1e-12)
-    )
-    alignment_degrees = math.degrees(
-        math.acos(max(-1.0, min(1.0, alignment_cosine)))
-    )
     corrected_second_start = corrected_end if second_reversed else corrected_start
     corrected_second_end = corrected_start if second_reversed else corrected_end
     corrected = [
@@ -306,7 +328,13 @@ def _validated_plane_intersection_edge(
         "derivation": "PLANE_PLANE_BOUNDARY_INTERSECTION",
         "maximumCorrectionMeters": _round(maximum_displacement, 3),
         "allowedCorrectionMeters": _round(maximum_displacement_meters, 3),
-        "originalBoundaryAlignmentDegrees": _round(alignment_degrees, 3),
+        "originalBoundaryAlignmentDegrees": [
+            _round(first_alignment_degrees, 3),
+            _round(second_alignment_degrees, 3),
+        ],
+        "incidentPlaneAngleDegrees": diagnostic_evidence[
+            "incidentPlaneAngleDegrees"
+        ],
     }
 
 
