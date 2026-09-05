@@ -14,6 +14,7 @@ from app.cityjson_geometry import (
     _noded_edge_uses,
     _reconcile_offset_shared_boundaries,
     _roof_facets,
+    _validated_coplanar_boundary_overlap,
     _validated_plane_intersection_edge,
     _validated_plane_supported_overlap,
     extract_roof_geometry,
@@ -25,6 +26,76 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CityJsonGeometryTests(unittest.TestCase):
+    def test_coplanar_offset_fragments_are_validated_for_suppression(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=(0.0, -root_half, root_half),
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first_vertices = (
+            (0.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 1.0, 1.0),
+        )
+        second_vertices = (
+            (2.0, 0.16, 0.16),
+            (0.0, 0.16, 0.16),
+            (0.0, 1.0, 1.0),
+        )
+        first = EdgeUse(
+            facet("F1", first_vertices),
+            0,
+            1,
+            first_vertices[0],
+            first_vertices[1],
+        )
+        second = EdgeUse(
+            facet("F2", second_vertices),
+            0,
+            1,
+            second_vertices[0],
+            second_vertices[1],
+        )
+
+        evidence = _validated_coplanar_boundary_overlap(
+            first, second, 0.35, 0.80
+        )
+
+        self.assertEqual(
+            evidence["pairingDerivation"],
+            "MUTUAL_UNIQUE_COPLANAR_BOUNDARY_PAIR",
+        )
+        self.assertEqual(evidence["overlapRatio"], 1.0)
+        reconciled, repaired, audit = _reconcile_offset_shared_boundaries(
+            {(0, 1): [first], (2, 3): [second]},
+            roofprint_boundary=Polygon(
+                [(-1, -2), (3, -2), (3, 2), (-1, 2)]
+            ).boundary,
+            exterior_boundary_maximum_distance_meters=0.5,
+            maximum_displacement_meters=0.35,
+            coplanar_tolerance_degrees=3.0,
+        )
+        self.assertEqual(reconciled, {})
+        self.assertEqual(repaired, {})
+        self.assertEqual(audit["suppressedCoplanarBoundaryCount"], 1)
+        self.assertGreater(audit["suppressedCoplanarBoundaryFeet"], 6.5)
+
     def test_fragmented_boundaries_use_common_plane_support_not_raw_angle(self):
         root_half = math.sqrt(0.5)
 
@@ -195,14 +266,12 @@ class CityJsonGeometryTests(unittest.TestCase):
 
         self.assertEqual(reconciled, edge_uses)
         self.assertEqual(evidence, {})
-        self.assertEqual(audit["offsetBoundaryCandidateCount"], 2)
+        self.assertEqual(audit["offsetBoundaryCandidateCount"], 3)
         self.assertEqual(audit["repairedSharedBoundaryCount"], 0)
-        self.assertEqual(audit["ambiguousOffsetBoundaryCount"], 1)
+        self.assertEqual(audit["suppressedCoplanarBoundaryCount"], 0)
+        self.assertEqual(audit["ambiguousOffsetBoundaryCount"], 3)
         self.assertEqual(audit["unpairedInteriorBoundaryCount"], 3)
-        self.assertEqual(
-            audit["offsetBoundaryRejectionCounts"],
-            {"INCIDENT_PLANES_COPLANAR": 1},
-        )
+        self.assertEqual(audit["offsetBoundaryRejectionCounts"], {})
 
     def test_offset_boundaries_on_roofprint_remain_exterior(self):
         feature, transform = load_cityjson_feature(

@@ -667,6 +667,8 @@ def _enforce_shared_boundary_completeness(
         "offsetBoundaryCandidateCount",
         "repairedSharedBoundaryCount",
         "repairedSharedBoundaryFeet",
+        "suppressedCoplanarBoundaryCount",
+        "suppressedCoplanarBoundaryFeet",
         "ambiguousOffsetBoundaryCount",
         "unpairedInteriorBoundaryCount",
         "minimumBoundaryOverlapRatio",

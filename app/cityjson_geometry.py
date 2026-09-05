@@ -523,6 +523,100 @@ def _validated_plane_supported_overlap(
     }
 
 
+def _validated_coplanar_boundary_overlap(
+    first: EdgeUse,
+    second: EdgeUse,
+    maximum_displacement_meters: float,
+    minimum_overlap_ratio: float,
+    minimum_overlap_meters: float = 0.20,
+) -> dict[str, Any]:
+    """Validate one redundant boundary between two nearly coplanar facets."""
+
+    first_direction = _vector(first.start, first.end)
+    second_direction = _vector(second.start, second.end)
+    first_length = _norm(first_direction)
+    second_length = _norm(second_direction)
+    if min(first_length, second_length) <= 1e-12:
+        raise UnreliableGeometryError(
+            "ROOF_COPLANAR_BOUNDARY_DEGENERATE",
+            "A coplanar boundary fragment is too short to validate.",
+        )
+    first_unit = tuple(value / first_length for value in first_direction)
+    second_unit = tuple(value / second_length for value in second_direction)
+
+    def line_distance(
+        point: tuple[float, float, float],
+        origin: tuple[float, float, float],
+        direction: tuple[float, float, float],
+    ) -> float:
+        projected = _project_to_line(point, origin, direction)
+        return _distance(point, projected)
+
+    boundary_displacements = [
+        line_distance(point, first.start, first_unit)
+        for point in (second.start, second.end)
+    ] + [
+        line_distance(point, second.start, second_unit)
+        for point in (first.start, first.end)
+    ]
+
+    def plane_distance(facet: Facet, point: tuple[float, float, float]) -> float:
+        return abs(_dot(facet.normal, _vector(facet.vertices[0], point)))
+
+    plane_displacements = [
+        plane_distance(first.facet, point)
+        for point in (second.start, second.end)
+    ] + [
+        plane_distance(second.facet, point)
+        for point in (first.start, first.end)
+    ]
+    maximum_distance = max(boundary_displacements + plane_displacements)
+    if maximum_distance > maximum_displacement_meters:
+        raise UnreliableGeometryError(
+            "ROOF_COPLANAR_BOUNDARY_DISPLACEMENT_EXCEEDED",
+            "Coplanar facet fragments are too far apart to suppress safely.",
+            details={
+                "maximumDisplacementMeters": _round(maximum_distance, 3),
+                "allowedDisplacementMeters": _round(
+                    maximum_displacement_meters, 3
+                ),
+            },
+        )
+    second_parameters = [
+        _dot(_vector(first.start, point), first_unit)
+        for point in (second.start, second.end)
+    ]
+    overlap_start = max(0.0, min(second_parameters))
+    overlap_end = min(first_length, max(second_parameters))
+    overlap_length = overlap_end - overlap_start
+    if overlap_length < minimum_overlap_meters:
+        raise UnreliableGeometryError(
+            "ROOF_COPLANAR_BOUNDARY_NO_OVERLAP",
+            "Coplanar facet fragments do not share enough boundary support.",
+        )
+    overlap_ratio = overlap_length / max(min(first_length, second_length), 1e-12)
+    if overlap_ratio < minimum_overlap_ratio:
+        raise UnreliableGeometryError(
+            "ROOF_COPLANAR_BOUNDARY_OVERLAP_TOO_LOW",
+            "Coplanar facet fragments have insufficient mutual boundary support.",
+            details={
+                "overlapRatio": _round(overlap_ratio, 4),
+                "minimumOverlapRatio": _round(minimum_overlap_ratio, 4),
+            },
+        )
+    return {
+        "pairingDerivation": "MUTUAL_UNIQUE_COPLANAR_BOUNDARY_PAIR",
+        "suppressedLengthMeters": _round(overlap_length, 3),
+        "maximumCorrectionMeters": _round(maximum_distance, 3),
+        "allowedCorrectionMeters": _round(maximum_displacement_meters, 3),
+        "overlapRatio": _round(overlap_ratio, 4),
+        "minimumOverlapRatio": _round(minimum_overlap_ratio, 4),
+        "incidentPlaneAngleDegrees": _round(
+            _normal_angle_degrees(first.facet, second.facet), 3
+        ),
+    }
+
+
 def _round(value: float, digits: int = 2) -> float:
     return round(float(value), digits)
 
@@ -761,6 +855,8 @@ def _reconcile_offset_shared_boundaries(
             "offsetBoundaryCandidateCount": 0,
             "repairedSharedBoundaryCount": 0,
             "repairedSharedBoundaryFeet": 0.0,
+            "suppressedCoplanarBoundaryCount": 0,
+            "suppressedCoplanarBoundaryFeet": 0.0,
             "ambiguousOffsetBoundaryCount": 0,
             "unpairedInteriorBoundaryCount": 0,
             "minimumBoundaryOverlapRatio": _round(
@@ -786,7 +882,7 @@ def _reconcile_offset_shared_boundaries(
         tuple[
             tuple[int, int],
             tuple[int, int],
-            list[EdgeUse],
+            list[EdgeUse] | None,
             dict[str, Any],
         ]
     ] = []
@@ -807,31 +903,49 @@ def _reconcile_offset_shared_boundaries(
             )
             plane_angle = _normal_angle_degrees(first.facet, second.facet)
             if plane_angle <= coplanar_tolerance_degrees:
-                rejection_counts["INCIDENT_PLANES_COPLANAR"] += 1
-                continue
-            try:
-                corrected, intersection = _validated_plane_supported_overlap(
-                    first,
-                    second,
-                    maximum_displacement_meters,
-                    minimum_overlap_ratio,
-                )
-            except UnreliableGeometryError as error:
-                rejection_counts[error.code] += 1
-                continue
-            evidence = {
-                "pairingDerivation": "MUTUAL_UNIQUE_PLANE_SUPPORTED_BOUNDARY_PAIR",
-                "facetIds": sorted(
-                    [first.facet.facet_id, second.facet.facet_id]
-                ),
-                "lengthAgreementRatio": _round(length_agreement, 4),
-                "maximumAllowedCorrectionMeters": _round(
-                    maximum_displacement_meters, 3
-                ),
-                "directionVarianceDegrees": _round(direction_variance, 3),
-                "incidentPlaneAngleDegrees": _round(plane_angle, 3),
-                "planeIntersection": intersection,
-            }
+                try:
+                    coplanar_evidence = _validated_coplanar_boundary_overlap(
+                        first,
+                        second,
+                        maximum_displacement_meters,
+                        minimum_overlap_ratio,
+                    )
+                except UnreliableGeometryError as error:
+                    rejection_counts[error.code] += 1
+                    continue
+                corrected = None
+                evidence = {
+                    **coplanar_evidence,
+                    "facetIds": sorted(
+                        [first.facet.facet_id, second.facet.facet_id]
+                    ),
+                    "lengthAgreementRatio": _round(length_agreement, 4),
+                    "directionVarianceDegrees": _round(direction_variance, 3),
+                }
+            else:
+                try:
+                    corrected, intersection = _validated_plane_supported_overlap(
+                        first,
+                        second,
+                        maximum_displacement_meters,
+                        minimum_overlap_ratio,
+                    )
+                except UnreliableGeometryError as error:
+                    rejection_counts[error.code] += 1
+                    continue
+                evidence = {
+                    "pairingDerivation": "MUTUAL_UNIQUE_PLANE_SUPPORTED_BOUNDARY_PAIR",
+                    "facetIds": sorted(
+                        [first.facet.facet_id, second.facet.facet_id]
+                    ),
+                    "lengthAgreementRatio": _round(length_agreement, 4),
+                    "maximumAllowedCorrectionMeters": _round(
+                        maximum_displacement_meters, 3
+                    ),
+                    "directionVarianceDegrees": _round(direction_variance, 3),
+                    "incidentPlaneAngleDegrees": _round(plane_angle, 3),
+                    "planeIntersection": intersection,
+                }
             candidate_index = len(candidates)
             candidates.append(
                 (first_key, second_key, corrected, evidence)
@@ -842,6 +956,7 @@ def _reconcile_offset_shared_boundaries(
     reconciled = dict(edge_uses)
     repaired_evidence: dict[tuple[int, int], dict[str, Any]] = {}
     repaired_lengths: list[float] = []
+    suppressed_coplanar_lengths: list[float] = []
     next_node = max(
         (node for key in edge_uses for node in key), default=-1
     ) + 1
@@ -855,11 +970,18 @@ def _reconcile_offset_shared_boundaries(
             continue
         reconciled.pop(first_key, None)
         reconciled.pop(second_key, None)
-        repaired_key = (next_node, next_node + 1)
-        next_node += 2
-        reconciled[repaired_key] = corrected
-        repaired_evidence[repaired_key] = evidence
-        repaired_lengths.append(_edge_length(corrected[0].start, corrected[0].end))
+        if corrected is None:
+            suppressed_coplanar_lengths.append(
+                float(evidence["suppressedLengthMeters"])
+            )
+        else:
+            repaired_key = (next_node, next_node + 1)
+            next_node += 2
+            reconciled[repaired_key] = corrected
+            repaired_evidence[repaired_key] = evidence
+            repaired_lengths.append(
+                _edge_length(corrected[0].start, corrected[0].end)
+            )
         consumed.update((first_key, second_key))
 
     ambiguous_keys = {
@@ -873,6 +995,10 @@ def _reconcile_offset_shared_boundaries(
         "repairedSharedBoundaryCount": len(repaired_evidence),
         "repairedSharedBoundaryFeet": _round(
             sum(repaired_lengths) * METERS_TO_FEET
+        ),
+        "suppressedCoplanarBoundaryCount": len(suppressed_coplanar_lengths),
+        "suppressedCoplanarBoundaryFeet": _round(
+            sum(suppressed_coplanar_lengths) * METERS_TO_FEET
         ),
         "ambiguousOffsetBoundaryCount": len(ambiguous_keys),
         "unpairedInteriorBoundaryCount": len(eligible) - len(consumed),
