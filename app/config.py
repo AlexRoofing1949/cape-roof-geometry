@@ -65,6 +65,7 @@ class Settings:
     roof_shared_edge_maximum_direction_variance_degrees: float
     roof_exterior_boundary_maximum_distance_meters: float
     maximum_roofprint_perimeter_variance_percent: float
+    maximum_unmatched_interior_boundary_feet: float
     usgs_catalog_url: str
     county_boundaries_url: str
     lidar_registry_path: Path
@@ -181,6 +182,9 @@ class Settings:
             ),
             maximum_roofprint_perimeter_variance_percent=_float(
                 "MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT", 10.0
+            ),
+            maximum_unmatched_interior_boundary_feet=_float(
+                "MAXIMUM_UNMATCHED_INTERIOR_BOUNDARY_FEET", 5.0
             ),
             usgs_catalog_url=os.getenv(
                 "USGS_3DEP_CATALOG_URL", "https://usgs.entwine.io/boundaries/resources.geojson"
@@ -326,6 +330,11 @@ class Settings:
             raise ConfigurationError(
                 "ROOFPRINT_PERIMETER_THRESHOLD_INVALID",
                 "MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT must be between 2 and 15.",
+            )
+        if not 0 <= self.maximum_unmatched_interior_boundary_feet <= 10:
+            raise ConfigurationError(
+                "ROOF_TOPOLOGY_COMPLETENESS_THRESHOLD_INVALID",
+                "MAXIMUM_UNMATCHED_INTERIOR_BOUNDARY_FEET must be between 0 and 10.",
             )
         if self.microsoft_bfp_zoom != 9 or self.microsoft_bfp_maximum_tile_bytes < 25_000_000:
             raise ConfigurationError(

@@ -6,6 +6,7 @@ from app.pipeline import (
     _combined_confidence,
     _confidence_diagnostics,
     _enforce_roofprint_perimeter_consistency,
+    _enforce_shared_boundary_completeness,
 )
 
 
@@ -132,6 +133,38 @@ class PipelineConfidenceTests(unittest.TestCase):
         self.assertEqual(context.exception.code, "ROOF_TOPOLOGY_PERIMETER_MISMATCH")
         self.assertEqual(context.exception.details["variancePercent"], 45.0)
         self.assertNotIn("roofprintPerimeterReconciliation", geometry)
+
+    def test_small_unmatched_boundary_is_audited_without_inventing_an_edge(self):
+        geometry = {
+            "topology": {
+                "unmatchedInteriorBoundaryCount": 1,
+                "unmatchedInteriorBoundaryFeet": 3.25,
+            }
+        }
+
+        result = _enforce_shared_boundary_completeness(geometry, 5.0)
+
+        self.assertEqual(result["unmatchedInteriorBoundaryFeet"], 3.25)
+        self.assertEqual(geometry["sharedBoundaryCompleteness"], result)
+
+    def test_material_unmatched_boundaries_fail_closed(self):
+        geometry = {
+            "topology": {
+                "unmatchedInteriorBoundaryCount": 4,
+                "unmatchedInteriorBoundaryFeet": 18.75,
+            }
+        }
+
+        with self.assertRaises(UnreliableGeometryError) as context:
+            _enforce_shared_boundary_completeness(geometry, 5.0)
+
+        self.assertEqual(
+            context.exception.code,
+            "ROOF_TOPOLOGY_SHARED_BOUNDARY_INCOMPLETE",
+        )
+        self.assertEqual(
+            context.exception.details["unmatchedInteriorBoundaryFeet"], 18.75
+        )
 
 
 if __name__ == "__main__":

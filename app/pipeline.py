@@ -647,6 +647,29 @@ def _enforce_lidar_acquisition_floor(
     return acquired
 
 
+def _enforce_shared_boundary_completeness(
+    geometry: dict[str, Any], maximum_unmatched_feet: float
+) -> dict[str, Any]:
+    """Reject a model whose facet seams leaked into exterior measurements."""
+
+    topology = geometry.get("topology") or {}
+    unmatched_count = int(topology.get("unmatchedInteriorBoundaryCount") or 0)
+    unmatched_feet = float(topology.get("unmatchedInteriorBoundaryFeet") or 0)
+    result = {
+        "unmatchedInteriorBoundaryCount": unmatched_count,
+        "unmatchedInteriorBoundaryFeet": round(unmatched_feet, 2),
+        "maximumUnmatchedInteriorBoundaryFeet": round(maximum_unmatched_feet, 2),
+    }
+    if unmatched_count and unmatched_feet > maximum_unmatched_feet:
+        raise UnreliableGeometryError(
+            "ROOF_TOPOLOGY_SHARED_BOUNDARY_INCOMPLETE",
+            "Reconstructed facet seams could not be distinguished safely from exterior roof edges.",
+            details=result,
+        )
+    geometry["sharedBoundaryCompleteness"] = result
+    return result
+
+
 def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, Any]:
     longitude = request.location.longitude
     latitude = request.location.latitude
@@ -741,6 +764,10 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     maximum_nodata_fraction=settings.maximum_nodata_fraction,
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
                     include_validation_facets=True,
+                )
+                _enforce_shared_boundary_completeness(
+                    geometry,
+                    settings.maximum_unmatched_interior_boundary_feet,
                 )
                 _enforce_roofprint_perimeter_consistency(
                     geometry,
@@ -953,6 +980,9 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                         settings.roofer_plane_detect_epsilon_meters
                     ),
                     "rooferComplexityFactor": settings.roofer_complexity_factor,
+                    "maximumUnmatchedInteriorBoundaryFeet": (
+                        settings.maximum_unmatched_interior_boundary_feet
+                    ),
                     "minimumServiceConfidence": settings.minimum_service_confidence,
                 },
                 "warnings": imagery_decision["warnings"],
