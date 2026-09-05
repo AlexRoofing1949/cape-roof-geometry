@@ -12,6 +12,8 @@ from app.cityjson_geometry import (
     _edge_direction_variance_degrees,
     _facet_side_height_delta,
     _noded_edge_uses,
+    _reconcile_offset_shared_boundaries,
+    _roof_facets,
     _validated_plane_intersection_edge,
     extract_roof_geometry,
     load_cityjson_feature,
@@ -22,6 +24,143 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CityJsonGeometryTests(unittest.TestCase):
+    def test_mutually_unique_offset_interior_boundaries_are_reconciled(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first_vertices = (
+            (0.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0),
+            (10.0, 5.0, 5.0),
+        )
+        second_vertices = (
+            (10.0, 0.16, 0.16),
+            (0.0, 0.16, 0.16),
+            (0.0, -5.0, 5.32),
+        )
+        first = facet("F1", first_vertices, (0.0, -root_half, root_half))
+        second = facet("F2", second_vertices, (0.0, root_half, root_half))
+        edge_uses = {
+            (0, 1): [
+                EdgeUse(first, 0, 1, first_vertices[0], first_vertices[1])
+            ],
+            (2, 3): [
+                EdgeUse(second, 0, 1, second_vertices[0], second_vertices[1])
+            ],
+        }
+
+        reconciled, evidence, audit = _reconcile_offset_shared_boundaries(
+            edge_uses,
+            roofprint_boundary=Polygon(
+                [(-1, -6), (11, -6), (11, 6), (-1, 6)]
+            ).boundary,
+            exterior_boundary_maximum_distance_meters=0.5,
+            maximum_displacement_meters=0.35,
+            maximum_direction_variance_degrees=5.0,
+            coplanar_tolerance_degrees=3.0,
+        )
+
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(len(next(iter(reconciled.values()))), 2)
+        repaired_key = next(iter(reconciled))
+        self.assertEqual(
+            evidence[repaired_key]["pairingDerivation"],
+            "MUTUAL_UNIQUE_OFFSET_BOUNDARY_PAIR",
+        )
+        self.assertEqual(audit["offsetBoundaryCandidateCount"], 1)
+        self.assertEqual(audit["repairedSharedBoundaryCount"], 1)
+        self.assertEqual(audit["unpairedInteriorBoundaryCount"], 0)
+
+    def test_ambiguous_offset_boundary_candidates_remain_unmatched(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
+        second_vertices = ((10.0, 0.16, 0.16), (0.0, 0.16, 0.16), (0.0, -5.0, 5.32))
+        third_vertices = ((10.0, 0.18, 0.14), (0.0, 0.18, 0.14), (0.0, -5.0, 5.32))
+        first = facet("F1", first_vertices, (0.0, -root_half, root_half))
+        second = facet("F2", second_vertices, (0.0, root_half, root_half))
+        third = facet("F3", third_vertices, (0.0, root_half, root_half))
+        edge_uses = {
+            (0, 1): [EdgeUse(first, 0, 1, first_vertices[0], first_vertices[1])],
+            (2, 3): [EdgeUse(second, 0, 1, second_vertices[0], second_vertices[1])],
+            (4, 5): [EdgeUse(third, 0, 1, third_vertices[0], third_vertices[1])],
+        }
+
+        reconciled, evidence, audit = _reconcile_offset_shared_boundaries(
+            edge_uses,
+            roofprint_boundary=Polygon(
+                [(-1, -6), (11, -6), (11, 6), (-1, 6)]
+            ).boundary,
+            exterior_boundary_maximum_distance_meters=0.5,
+            maximum_displacement_meters=0.35,
+            maximum_direction_variance_degrees=5.0,
+            coplanar_tolerance_degrees=3.0,
+        )
+
+        self.assertEqual(reconciled, edge_uses)
+        self.assertEqual(evidence, {})
+        self.assertEqual(audit["offsetBoundaryCandidateCount"], 2)
+        self.assertEqual(audit["repairedSharedBoundaryCount"], 0)
+        self.assertEqual(audit["ambiguousOffsetBoundaryCount"], 1)
+        self.assertEqual(audit["unpairedInteriorBoundaryCount"], 3)
+
+    def test_offset_boundaries_on_roofprint_remain_exterior(self):
+        feature, transform = load_cityjson_feature(
+            FIXTURES / "simple_gable.city.jsonl"
+        )
+        facets, _ = _roof_facets(feature, transform)
+        edge_uses = _noded_edge_uses(facets)
+
+        reconciled, evidence, audit = _reconcile_offset_shared_boundaries(
+            edge_uses,
+            roofprint_boundary=Polygon([(0, 0), (10, 0), (10, 6), (0, 6)]).boundary,
+            exterior_boundary_maximum_distance_meters=100.0,
+            maximum_displacement_meters=0.35,
+            maximum_direction_variance_degrees=5.0,
+            coplanar_tolerance_degrees=3.0,
+        )
+
+        self.assertEqual(reconciled, edge_uses)
+        self.assertEqual(evidence, {})
+        self.assertEqual(audit["offsetBoundaryCandidateCount"], 0)
+
     def test_sub_decimetre_shared_edge_offsets_are_noded(self):
         first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
         second_vertices = ((10.0, 0.04, 0.03), (0.0, 0.04, 0.03), (0.0, -5.0, 5.0))

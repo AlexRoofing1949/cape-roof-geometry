@@ -629,6 +629,176 @@ def _noded_edge_uses(
     return edge_uses
 
 
+def _reconcile_offset_shared_boundaries(
+    edge_uses: dict[tuple[int, int], list[EdgeUse]],
+    *,
+    roofprint_boundary: Any | None,
+    exterior_boundary_maximum_distance_meters: float,
+    maximum_displacement_meters: float,
+    maximum_direction_variance_degrees: float,
+    coplanar_tolerance_degrees: float,
+    minimum_length_agreement_ratio: float = 0.80,
+) -> tuple[
+    dict[tuple[int, int], list[EdgeUse]],
+    dict[tuple[int, int], dict[str, Any]],
+    dict[str, Any],
+]:
+    """Pair mutually unique Roofer seams that missed strict coordinate noding.
+
+    A Roofer boundary is eligible only when the roofprint proves that it is not
+    exterior.  Candidate sides must independently agree in direction, length,
+    endpoint support, incident planes, and the derived plane-plane
+    intersection.  Ambiguous candidates are deliberately left unmatched so
+    the downstream safety gate requires an inspection instead of guessing.
+    """
+
+    raw_edge_count = len(edge_uses)
+    if roofprint_boundary is None:
+        return dict(edge_uses), {}, {
+            "rawNodedEdgeCount": raw_edge_count,
+            "offsetBoundaryCandidateCount": 0,
+            "repairedSharedBoundaryCount": 0,
+            "repairedSharedBoundaryFeet": 0.0,
+            "ambiguousOffsetBoundaryCount": 0,
+            "unpairedInteriorBoundaryCount": 0,
+        }
+
+    eligible: list[tuple[tuple[int, int], EdgeUse]] = []
+    for key, uses in edge_uses.items():
+        if len(uses) != 1:
+            continue
+        use = uses[0]
+        midpoint = Point(
+            (use.start[0] + use.end[0]) / 2,
+            (use.start[1] + use.end[1]) / 2,
+        )
+        if float(roofprint_boundary.distance(midpoint)) > exterior_boundary_maximum_distance_meters:
+            eligible.append((key, use))
+    eligible.sort(key=lambda item: item[0])
+
+    candidates: list[
+        tuple[
+            tuple[int, int],
+            tuple[int, int],
+            list[EdgeUse],
+            dict[str, Any],
+        ]
+    ] = []
+    candidates_by_key: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for first_index, (first_key, first) in enumerate(eligible):
+        for second_key, second in eligible[first_index + 1 :]:
+            if first.facet.facet_id == second.facet.facet_id:
+                continue
+            direction_variance = _edge_direction_variance_degrees(first, second)
+            if direction_variance > maximum_direction_variance_degrees:
+                continue
+            first_length = _edge_length(first.start, first.end)
+            second_length = _edge_length(second.start, second.end)
+            length_agreement = min(first_length, second_length) / max(
+                first_length, second_length, 1e-12
+            )
+            if length_agreement < minimum_length_agreement_ratio:
+                continue
+            plane_angle = _normal_angle_degrees(first.facet, second.facet)
+            if plane_angle <= coplanar_tolerance_degrees:
+                continue
+            plane_direction = _cross(first.facet.normal, second.facet.normal)
+            boundary_alignments = [
+                _vector_alignment_degrees(
+                    _vector(use.start, use.end), plane_direction
+                )
+                for use in (first, second)
+            ]
+            if any(
+                alignment > maximum_direction_variance_degrees
+                for alignment in boundary_alignments
+            ):
+                continue
+            try:
+                corrected, intersection = _validated_plane_intersection_edge(
+                    [first, second], maximum_displacement_meters
+                )
+            except UnreliableGeometryError:
+                continue
+            same_order = _distance(first.start, second.start) + _distance(
+                first.end, second.end
+            )
+            reverse_order = _distance(first.start, second.end) + _distance(
+                first.end, second.start
+            )
+            paired_second = (
+                (second.end, second.start)
+                if reverse_order < same_order
+                else (second.start, second.end)
+            )
+            endpoint_displacements = [
+                _distance(first.start, paired_second[0]),
+                _distance(first.end, paired_second[1]),
+            ]
+            evidence = {
+                "pairingDerivation": "MUTUAL_UNIQUE_OFFSET_BOUNDARY_PAIR",
+                "facetIds": sorted(
+                    [first.facet.facet_id, second.facet.facet_id]
+                ),
+                "lengthAgreementRatio": _round(length_agreement, 4),
+                "maximumEndpointSeparationMeters": _round(
+                    max(endpoint_displacements), 3
+                ),
+                "maximumAllowedCorrectionMeters": _round(
+                    maximum_displacement_meters, 3
+                ),
+                "directionVarianceDegrees": _round(direction_variance, 3),
+                "incidentPlaneAngleDegrees": _round(plane_angle, 3),
+                "planeIntersection": intersection,
+            }
+            candidate_index = len(candidates)
+            candidates.append(
+                (first_key, second_key, corrected, evidence)
+            )
+            candidates_by_key[first_key].append(candidate_index)
+            candidates_by_key[second_key].append(candidate_index)
+
+    reconciled = dict(edge_uses)
+    repaired_evidence: dict[tuple[int, int], dict[str, Any]] = {}
+    repaired_lengths: list[float] = []
+    next_node = max(
+        (node for key in edge_uses for node in key), default=-1
+    ) + 1
+    consumed: set[tuple[int, int]] = set()
+    for candidate_index, (first_key, second_key, corrected, evidence) in enumerate(candidates):
+        if first_key in consumed or second_key in consumed:
+            continue
+        if candidates_by_key[first_key] != [candidate_index]:
+            continue
+        if candidates_by_key[second_key] != [candidate_index]:
+            continue
+        reconciled.pop(first_key, None)
+        reconciled.pop(second_key, None)
+        repaired_key = (next_node, next_node + 1)
+        next_node += 2
+        reconciled[repaired_key] = corrected
+        repaired_evidence[repaired_key] = evidence
+        repaired_lengths.append(_edge_length(corrected[0].start, corrected[0].end))
+        consumed.update((first_key, second_key))
+
+    ambiguous_keys = {
+        key for key, matches in candidates_by_key.items() if len(matches) > 1
+    }
+    return reconciled, repaired_evidence, {
+        "rawNodedEdgeCount": raw_edge_count,
+        "offsetBoundaryCandidateCount": len(candidates),
+        "repairedSharedBoundaryCount": len(repaired_evidence),
+        "repairedSharedBoundaryFeet": _round(
+            sum(repaired_lengths) * METERS_TO_FEET
+        ),
+        "ambiguousOffsetBoundaryCount": len(ambiguous_keys),
+        "unpairedInteriorBoundaryCount": len(eligible) - len(consumed),
+        "minimumLengthAgreementRatio": _round(
+            minimum_length_agreement_ratio, 3
+        ),
+    }
+
+
 def _decode_vertices(
     encoded: list[list[float]], transform: dict[str, list[float]] | None
 ) -> list[tuple[float, float, float]]:
@@ -909,6 +1079,22 @@ def extract_roof_geometry(
         edge_node_tolerance_meters,
         edge_node_vertical_tolerance_meters,
     )
+    edge_uses, repaired_edge_evidence, boundary_repair_audit = (
+        _reconcile_offset_shared_boundaries(
+            edge_uses,
+            roofprint_boundary=roofprint_boundary,
+            exterior_boundary_maximum_distance_meters=(
+                exterior_boundary_maximum_distance_meters
+            ),
+            maximum_displacement_meters=(
+                plane_intersection_maximum_displacement_meters
+            ),
+            maximum_direction_variance_degrees=(
+                shared_edge_maximum_direction_variance_degrees
+            ),
+            coplanar_tolerance_degrees=coplanar_tolerance_degrees,
+        )
+    )
 
     classified: dict[str, list[dict[str, Any]]] = {
         "rakes": [],
@@ -1019,7 +1205,7 @@ def extract_roof_geometry(
         else:
             add_edge("eaves", [use], boundary_evidence)
 
-    for uses in edge_uses.values():
+    for edge_key, uses in edge_uses.items():
         if len(uses) > 2:
             raise UnreliableGeometryError("NON_MANIFOLD_ROOF_EDGE", "More than two roof facets share a reconstructed edge.")
         first = uses[0]
@@ -1094,6 +1280,10 @@ def extract_roof_geometry(
         )
         first, second = uses
         intersection_evidence["adjacentFacetCount"] = 2
+        if edge_key in repaired_edge_evidence:
+            intersection_evidence["boundaryPairing"] = repaired_edge_evidence[
+                edge_key
+            ]
         first_delta = _facet_side_height_delta(first)
         second_delta = _facet_side_height_delta(second)
         first_decisive = abs(first_delta) > plane_side_tolerance_meters
@@ -1213,6 +1403,7 @@ def extract_roof_geometry(
                 edge_node_vertical_tolerance_meters, 3
             ),
             "nodedEdgeCount": len(edge_uses),
+            **boundary_repair_audit,
             "sharedEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 2)
             - len(rejected_noded_adjacencies),
             "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1),
