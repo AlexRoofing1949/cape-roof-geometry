@@ -80,6 +80,30 @@ class SolarBuildingModelValidationTests(unittest.TestCase):
         self.assertEqual(result["currentImagery"]["validation"], "PASSED")
         self.assertEqual(result["currentImagery"]["captureDatePrecision"], "PROVIDER_APPROXIMATE_DAY")
         self.assertEqual(result["currentImagery"]["attribution"], "Includes data from Google Maps")
+        self.assertEqual(
+            result["currentImagery"]["lidarReferenceDatePrecision"],
+            "EXACT_GPS_DATE",
+        )
+
+    def test_registered_project_window_end_can_be_used_conservatively(self):
+        self.lidar.tile_acquisition_date = ""
+
+        result = self.validate()
+
+        self.assertEqual(result["verificationStatus"], "VERIFIED_HISTORICAL_UNCHANGED")
+        self.assertTrue(result["pricingAllowed"])
+        self.assertEqual(
+            result["currentImagery"]["lidarReferenceDate"],
+            self.lidar.acquired_end,
+        )
+        self.assertEqual(
+            result["currentImagery"]["lidarReferenceDatePrecision"],
+            "REGISTERED_PROJECT_WINDOW_END",
+        )
+        self.assertIn(
+            "LIDAR_REFERENCE_USES_REGISTERED_PROJECT_WINDOW_END",
+            result["warnings"],
+        )
 
     def test_area_change_fails_closed(self):
         changed = SimpleNamespace(**vars(self.solar))

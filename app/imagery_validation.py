@@ -362,7 +362,7 @@ def _solar_model_validation(
     )
 
 
-def validate_current_structure(
+def _validate_current_structure_impl(
     footprint: FootprintResult,
     lidar: LidarResource,
     county: str,
@@ -384,16 +384,13 @@ def validate_current_structure(
     the immutable service version.
     """
 
+    # Prefer the unique GPS date recovered from the property crop.  Some public
+    # EPT/LAS collections strip that dimension, while still publishing a
+    # registered acquisition window.  Using the window end is conservative for
+    # change detection: only evidence newer than the latest possible collection
+    # day can verify that the building remained unchanged.  The public wrapper
+    # below preserves this non-exact provenance in every response.
     lidar_reference_date = date.fromisoformat(lidar.tile_acquisition_date or lidar.acquired_end)
-    if not lidar.tile_acquisition_date:
-        return {
-            "verificationStatus": "INSPECTION_REQUIRED",
-            "pricingAllowed": False,
-            "status": "LIDAR_TILE_DATE_UNAVAILABLE",
-            "holdReason": "LIDAR_TILE_DATE_UNAVAILABLE",
-            "currentImagery": {"sourceId": "", "captureDate": "", "validation": "NOT_RUN"},
-            "warnings": ["The selected project has an acquisition window but no exact registered tile date."],
-        }
 
     eligible = [
         source
@@ -558,3 +555,51 @@ def validate_current_structure(
         "currentImagery": current_imagery,
         "warnings": [] if pricing_allowed else ["Historical LiDAR passed visible-change checks but pricing remains disabled."],
     }
+
+
+def validate_current_structure(
+    footprint: FootprintResult,
+    lidar: LidarResource,
+    county: str,
+    registries: RegistryBundle,
+    *,
+    current_lidar_max_age_years: int,
+    maximum_current_imagery_age_years: int,
+    allow_historical_verified_pricing: bool,
+    solar_reference: Any = None,
+    reconstructed_geometry: dict[str, Any] | None = None,
+    maximum_area_variance_percent: float = 15,
+    maximum_pitch_variance_degrees: float = 10,
+    provider_timeout_seconds: int = 45,
+) -> dict[str, Any]:
+    """Validate current structure and retain LiDAR date precision provenance."""
+
+    result = _validate_current_structure_impl(
+        footprint,
+        lidar,
+        county,
+        registries,
+        current_lidar_max_age_years=current_lidar_max_age_years,
+        maximum_current_imagery_age_years=maximum_current_imagery_age_years,
+        allow_historical_verified_pricing=allow_historical_verified_pricing,
+        solar_reference=solar_reference,
+        reconstructed_geometry=reconstructed_geometry,
+        maximum_area_variance_percent=maximum_area_variance_percent,
+        maximum_pitch_variance_degrees=maximum_pitch_variance_degrees,
+        provider_timeout_seconds=provider_timeout_seconds,
+    )
+    exact_date = str(lidar.tile_acquisition_date or "").strip()
+    reference_date = exact_date or str(lidar.acquired_end)
+    current_imagery = dict(result.get("currentImagery") or {})
+    current_imagery["lidarReferenceDate"] = reference_date
+    current_imagery["lidarReferenceDatePrecision"] = (
+        "EXACT_GPS_DATE" if exact_date else "REGISTERED_PROJECT_WINDOW_END"
+    )
+    result["currentImagery"] = current_imagery
+    if not exact_date:
+        warnings = list(result.get("warnings") or [])
+        marker = "LIDAR_REFERENCE_USES_REGISTERED_PROJECT_WINDOW_END"
+        if marker not in warnings:
+            warnings.append(marker)
+        result["warnings"] = warnings
+    return result

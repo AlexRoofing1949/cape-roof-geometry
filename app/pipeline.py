@@ -858,6 +858,14 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "acquiredStart": lidar.acquired_start,
                     "acquiredEnd": lidar.acquired_end,
                     "tileAcquisitionDate": lidar.tile_acquisition_date,
+                    "acquisitionReferenceDate": (
+                        lidar.tile_acquisition_date or lidar.acquired_end
+                    ),
+                    "acquisitionDatePrecision": (
+                        "EXACT_GPS_DATE"
+                        if lidar.tile_acquisition_date
+                        else "REGISTERED_PROJECT_WINDOW_END"
+                    ),
                     "acquisitionYear": int((lidar.tile_acquisition_date or lidar.acquired_end)[:4]),
                     "ageYears": lidar.age_years,
                     "coverageRatio": lidar.coverage_ratio,
