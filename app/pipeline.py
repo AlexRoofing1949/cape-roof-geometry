@@ -438,6 +438,8 @@ def _run_roofer(pointcloud: Path, footprint: Path, output: Path, settings: Setti
             "request_id",
             "--split-cjseq",
             "--lod22",
+            "--plane-detect-min-points",
+            str(settings.roofer_plane_detect_min_points),
             "--plane-detect-epsilon",
             str(settings.roofer_plane_detect_epsilon_meters),
             "--complexity-factor",
@@ -909,6 +911,9 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "minimumCoverageRatio": settings.minimum_lidar_coverage_ratio,
                     "maximumNoDataFraction": settings.maximum_nodata_fraction,
                     "maximumRooferRmseMeters": settings.maximum_roofer_rmse_meters,
+                    "rooferPlaneDetectMinimumPoints": (
+                        settings.roofer_plane_detect_min_points
+                    ),
                     "rooferPlaneDetectEpsilonMeters": (
                         settings.roofer_plane_detect_epsilon_meters
                     ),
