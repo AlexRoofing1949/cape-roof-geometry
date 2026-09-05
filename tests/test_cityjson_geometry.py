@@ -20,6 +20,7 @@ from app.cityjson_geometry import (
     extract_roof_geometry,
     load_cityjson_feature,
 )
+from app.errors import UnreliableGeometryError
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -941,6 +942,115 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(
             result["rakesFeet"], 2 * math.sqrt(10**2 + 2**2) * 3.280839895013123, delta=0.05
         )
+
+    def test_plan_coincident_separate_roof_levels_are_verified_transitions(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "ROOF-LEVEL-TRANSITION",
+            "vertices": [
+                [0, 0, 3], [10, 0, 3], [10, 5, 5], [0, 5, 5],
+                [0, 5, 10], [10, 5, 10], [10, 10, 12], [0, 10, 12],
+            ],
+            "CityObjects": {
+                "ROOF-LEVEL-TRANSITION": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+        roofprint = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+        result = extract_roof_geometry(
+            feature,
+            None,
+            roofprint_boundary=roofprint.boundary,
+            exterior_boundary_maximum_distance_meters=0.10,
+        )
+
+        self.assertEqual(result["topology"]["unmatchedInteriorBoundaryCount"], 0)
+        self.assertEqual(result["topology"]["verticalLevelTransitionCount"], 1)
+        self.assertAlmostEqual(
+            result["topology"]["verticalLevelTransitionFeet"],
+            10 * 3.280839895013123,
+            delta=0.02,
+        )
+        self.assertAlmostEqual(
+            result["highPerimeterFeet"],
+            20 * 3.280839895013123,
+            delta=0.02,
+        )
+        transition_edges = [
+            edge
+            for edge in result["highPerimeters"]
+            if edge["classificationEvidence"]["derivation"]
+            == "PLAN_COINCIDENT_VERTICAL_LEVEL_TRANSITION"
+        ]
+        self.assertEqual(len(transition_edges), 1)
+        transition = result["topology"]["verticalLevelTransitions"][0]
+        self.assertEqual(
+            transition["derivation"],
+            "PLAN_COINCIDENT_VERTICAL_LEVEL_TRANSITION",
+        )
+        self.assertGreater(transition["minimumVerticalSeparationMeters"], 4.9)
+
+    def test_converging_plan_coincident_levels_fail_closed(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "AMBIGUOUS-LEVEL-TRANSITION",
+            "vertices": [
+                [0, 0, 3], [10, 0, 3], [10, 5, 5], [0, 5, 5],
+                [0, 5, 5.1], [10, 5, 6], [10, 10, 8], [0, 10, 7.1],
+            ],
+            "CityObjects": {
+                "AMBIGUOUS-LEVEL-TRANSITION": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+
+        with self.assertRaises(UnreliableGeometryError) as context:
+            extract_roof_geometry(feature, None)
+
+        self.assertEqual(context.exception.code, "ROOF_VERTICAL_TRANSITION_AMBIGUOUS")
 
     def test_missing_transform_is_allowed_for_unquantized_fixture(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")

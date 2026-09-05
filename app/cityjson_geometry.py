@@ -160,6 +160,65 @@ def _edge_height_at_xy(
     return start[2] + t * (end[2] - start[2])
 
 
+def _paired_edge_vertical_separations(
+    first: EdgeUse, second: EdgeUse
+) -> tuple[float, float, float]:
+    """Measure vertical separation at plan-corresponding edge locations.
+
+    Roofer may reconstruct two roof levels whose boundaries are coincident in
+    plan but deliberately separated in elevation by a wall.  Comparing the
+    original vertex order is unsafe because adjacent rings commonly run in
+    opposite directions.  The lower-cost XY endpoint pairing supplies two
+    plan probes; their midpoint supplies a third guard against a crossing pair.
+    """
+
+    same_order_distance = math.hypot(
+        first.start[0] - second.start[0],
+        first.start[1] - second.start[1],
+    ) + math.hypot(
+        first.end[0] - second.end[0],
+        first.end[1] - second.end[1],
+    )
+    reverse_order_distance = math.hypot(
+        first.start[0] - second.end[0],
+        first.start[1] - second.end[1],
+    ) + math.hypot(
+        first.end[0] - second.start[0],
+        first.end[1] - second.start[1],
+    )
+    second_start, second_end = (
+        (second.end, second.start)
+        if reverse_order_distance < same_order_distance
+        else (second.start, second.end)
+    )
+    probes = [
+        (
+            (first.start[0] + second_start[0]) / 2,
+            (first.start[1] + second_start[1]) / 2,
+            0.0,
+        ),
+        (
+            (first.end[0] + second_end[0]) / 2,
+            (first.end[1] + second_end[1]) / 2,
+            0.0,
+        ),
+    ]
+    probes.append(
+        (
+            (probes[0][0] + probes[1][0]) / 2,
+            (probes[0][1] + probes[1][1]) / 2,
+            0.0,
+        )
+    )
+    return tuple(
+        abs(
+            _edge_height_at_xy(first.start, first.end, probe)
+            - _edge_height_at_xy(second.start, second.end, probe)
+        )
+        for probe in probes
+    )  # type: ignore[return-value]
+
+
 def _facet_side_height_delta(use: EdgeUse) -> float:
     """Return the facet's vertical change one metre inward from a shared edge.
 
@@ -1287,7 +1346,11 @@ def extract_roof_geometry(
     edge_uses = _noded_edge_uses(
         facets,
         edge_node_tolerance_meters,
-        edge_node_vertical_tolerance_meters,
+        # Build one deterministic planar arrangement first.  Elevation is
+        # validated below per paired segment so vertically separated roof
+        # levels are recorded as measured transitions instead of leaking into
+        # exterior-edge or missing-seam failures.
+        math.inf,
     )
     edge_uses, repaired_edge_evidence, boundary_repair_audit = (
         _reconcile_offset_shared_boundaries(
@@ -1314,6 +1377,7 @@ def extract_roof_geometry(
     ambiguous: list[dict[str, Any]] = []
     rejected_noded_adjacencies: list[dict[str, Any]] = []
     unmatched_interior_boundaries: list[dict[str, Any]] = []
+    vertical_level_transitions: list[dict[str, Any]] = []
     counters: dict[str, int] = defaultdict(int)
     edge_prefixes = {
         "rakes": "RA",
@@ -1423,6 +1487,65 @@ def extract_roof_geometry(
             continue
 
         second = uses[1]
+        vertical_separations = _paired_edge_vertical_separations(first, second)
+        minimum_vertical_separation = min(vertical_separations)
+        maximum_vertical_separation = max(vertical_separations)
+        if minimum_vertical_separation > edge_node_vertical_tolerance_meters:
+            lower = min(
+                uses,
+                key=lambda use: _edge_height_at_xy(
+                    use.start,
+                    use.end,
+                    (
+                        (use.start[0] + use.end[0]) / 2,
+                        (use.start[1] + use.end[1]) / 2,
+                        0.0,
+                    ),
+                ),
+            )
+            evidence = {
+                "derivation": "PLAN_COINCIDENT_VERTICAL_LEVEL_TRANSITION",
+                "adjacentFacetCount": 2,
+                "facetIds": sorted(
+                    [first.facet.facet_id, second.facet.facet_id]
+                ),
+                "verticalSeparationMeters": [
+                    _round(value, 3) for value in vertical_separations
+                ],
+                "minimumVerticalSeparationMeters": _round(
+                    minimum_vertical_separation, 3
+                ),
+                "verticalNodeToleranceMeters": _round(
+                    edge_node_vertical_tolerance_meters, 3
+                ),
+                "classificationRule": "LOWER_ROOF_WALL_INTERFACE",
+            }
+            add_edge("highPerimeters", [lower], evidence)
+            vertical_level_transitions.append(
+                {
+                    **evidence,
+                    "lengthFeet": _round(
+                        _edge_length(lower.start, lower.end) * METERS_TO_FEET
+                    ),
+                }
+            )
+            continue
+        if maximum_vertical_separation > edge_node_vertical_tolerance_meters:
+            raise UnreliableGeometryError(
+                "ROOF_VERTICAL_TRANSITION_AMBIGUOUS",
+                "Plan-coincident roof boundaries converge across the segment and cannot be classified safely.",
+                details={
+                    "facetIds": sorted(
+                        [first.facet.facet_id, second.facet.facet_id]
+                    ),
+                    "verticalSeparationMeters": [
+                        _round(value, 3) for value in vertical_separations
+                    ],
+                    "verticalNodeToleranceMeters": _round(
+                        edge_node_vertical_tolerance_meters, 3
+                    ),
+                },
+            )
         direction_variance = _edge_direction_variance_degrees(first, second)
         if direction_variance > shared_edge_maximum_direction_variance_degrees:
             evidence = {
@@ -1609,10 +1732,17 @@ def extract_roof_geometry(
             "edgeNodeVerticalToleranceMeters": _round(
                 edge_node_vertical_tolerance_meters, 3
             ),
+            "nodingMode": "PLANAR_WITH_VERTICAL_TRANSITION_VALIDATION",
             "nodedEdgeCount": len(edge_uses),
             **boundary_repair_audit,
             "sharedEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 2)
-            - len(rejected_noded_adjacencies),
+            - len(rejected_noded_adjacencies)
+            - len(vertical_level_transitions),
+            "verticalLevelTransitionCount": len(vertical_level_transitions),
+            "verticalLevelTransitionFeet": _round(
+                sum(item["lengthFeet"] for item in vertical_level_transitions)
+            ),
+            "verticalLevelTransitions": vertical_level_transitions,
             "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1),
             "sharedEdgeMaximumDirectionVarianceDegrees": _round(
                 shared_edge_maximum_direction_variance_degrees, 3
