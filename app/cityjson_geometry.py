@@ -263,20 +263,11 @@ def _project_to_line(
     )  # type: ignore[return-value]
 
 
-def _validated_plane_intersection_edge(
-    uses: list[EdgeUse], maximum_displacement_meters: float
-) -> tuple[list[EdgeUse], dict[str, Any]]:
-    """Snap one shared edge to the independently derived facet-plane line.
+def _plane_intersection_line(
+    first: EdgeUse, second: EdgeUse
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return a stable origin and unit direction for two incident planes."""
 
-    Roofer can return each side of a shared boundary with a small, independent
-    XY/Z residual.  The two fitted planes are the measurement authority; their
-    3D intersection supplies a common line while the original edge endpoints
-    supply only the supported clipping limits.
-    """
-
-    if len(uses) != 2:
-        raise ValueError("Exactly two edge uses are required.")
-    first, second = uses
     direction = _cross(first.facet.normal, second.facet.normal)
     direction_squared = _dot(direction, direction)
     if direction_squared <= 1e-12:
@@ -284,9 +275,6 @@ def _validated_plane_intersection_edge(
             "ROOF_PLANE_INTERSECTION_UNDEFINED",
             "Adjacent noncoplanar roof facets did not produce a stable plane intersection.",
         )
-    # Roofer coordinates are usually in a projected CRS with northings in the
-    # millions of metres.  Solve in a local frame around this edge to avoid
-    # cancellation when the two plane constants are combined.
     local_anchor = tuple(
         (
             first.start[index]
@@ -314,6 +302,31 @@ def _validated_plane_intersection_edge(
     origin = tuple(
         local_anchor[index] + local_origin[index] for index in range(3)
     )
+    direction_length = math.sqrt(direction_squared)
+    unit_direction = tuple(
+        component / direction_length for component in direction
+    )
+    return origin, unit_direction  # type: ignore[return-value]
+
+
+def _validated_plane_intersection_edge(
+    uses: list[EdgeUse], maximum_displacement_meters: float
+) -> tuple[list[EdgeUse], dict[str, Any]]:
+    """Snap one shared edge to the independently derived facet-plane line.
+
+    Roofer can return each side of a shared boundary with a small, independent
+    XY/Z residual.  The two fitted planes are the measurement authority; their
+    3D intersection supplies a common line while the original edge endpoints
+    supply only the supported clipping limits.
+    """
+
+    if len(uses) != 2:
+        raise ValueError("Exactly two edge uses are required.")
+    first, second = uses
+    # Roofer coordinates are usually in a projected CRS with northings in the
+    # millions of metres.  The helper solves in a local frame to avoid
+    # cancellation when plane constants are combined.
+    origin, direction = _plane_intersection_line(first, second)
 
     same_order_distance = _distance(first.start, second.start) + _distance(
         first.end, second.end
@@ -419,6 +432,94 @@ def _validated_plane_intersection_edge(
         "incidentPlaneAngleDegrees": diagnostic_evidence[
             "incidentPlaneAngleDegrees"
         ],
+    }
+
+
+def _validated_plane_supported_overlap(
+    first: EdgeUse,
+    second: EdgeUse,
+    maximum_displacement_meters: float,
+    minimum_overlap_ratio: float,
+    minimum_overlap_meters: float = 0.20,
+) -> tuple[list[EdgeUse], dict[str, Any]]:
+    """Clip fragmented facet boundaries to their common validated plane line."""
+
+    origin, direction = _plane_intersection_line(first, second)
+
+    def parameter(point: tuple[float, float, float]) -> float:
+        return _dot(_vector(origin, point), direction)
+
+    def point_at(value: float) -> tuple[float, float, float]:
+        return tuple(
+            origin[index] + value * direction[index] for index in range(3)
+        )  # type: ignore[return-value]
+
+    endpoint_distances: list[float] = []
+    intervals: list[tuple[float, float]] = []
+    for use in (first, second):
+        values = [parameter(use.start), parameter(use.end)]
+        intervals.append((min(values), max(values)))
+        endpoint_distances.extend(
+            _distance(point, point_at(value))
+            for point, value in zip((use.start, use.end), values)
+        )
+    maximum_distance = max(endpoint_distances)
+    if maximum_distance > maximum_displacement_meters:
+        raise UnreliableGeometryError(
+            "ROOF_BOUNDARY_PLANE_SUPPORT_DISPLACEMENT_EXCEEDED",
+            "A fragmented facet boundary is too far from the incident plane intersection.",
+            details={
+                "maximumDisplacementMeters": _round(maximum_distance, 3),
+                "allowedDisplacementMeters": _round(
+                    maximum_displacement_meters, 3
+                ),
+            },
+        )
+    overlap_start = max(interval[0] for interval in intervals)
+    overlap_end = min(interval[1] for interval in intervals)
+    overlap_length = overlap_end - overlap_start
+    if overlap_length < minimum_overlap_meters:
+        raise UnreliableGeometryError(
+            "ROOF_BOUNDARY_PLANE_SUPPORT_NO_OVERLAP",
+            "Fragmented facet boundaries do not share enough support on the incident plane intersection.",
+        )
+    support_lengths = [end - start for start, end in intervals]
+    overlap_ratio = overlap_length / max(min(support_lengths), 1e-12)
+    if overlap_ratio < minimum_overlap_ratio:
+        raise UnreliableGeometryError(
+            "ROOF_BOUNDARY_PLANE_SUPPORT_OVERLAP_TOO_LOW",
+            "Fragmented facet boundaries have insufficient mutual support on the incident plane intersection.",
+            details={
+                "overlapRatio": _round(overlap_ratio, 4),
+                "minimumOverlapRatio": _round(minimum_overlap_ratio, 4),
+            },
+        )
+    low = point_at(overlap_start)
+    high = point_at(overlap_end)
+
+    def corrected_use(use: EdgeUse) -> EdgeUse:
+        ordered = (low, high)
+        if _dot(_vector(use.start, use.end), direction) < 0:
+            ordered = (high, low)
+        return EdgeUse(
+            use.facet,
+            use.start_id,
+            use.end_id,
+            ordered[0],
+            ordered[1],
+        )
+
+    corrected = [corrected_use(first), corrected_use(second)]
+    return corrected, {
+        "derivation": "PLANE_INTERSECTION_SUPPORTED_FRAGMENT_OVERLAP",
+        "correctedLengthMeters": _round(overlap_length, 3),
+        "maximumCorrectionMeters": _round(maximum_distance, 3),
+        "allowedCorrectionMeters": _round(maximum_displacement_meters, 3),
+        "overlapRatio": _round(overlap_ratio, 4),
+        "minimumOverlapRatio": _round(minimum_overlap_ratio, 4),
+        "incidentPlaneAngleDegrees": _round(
+            _normal_angle_degrees(first.facet, second.facet), 3
+        ),
     }
 
 
@@ -635,9 +736,8 @@ def _reconcile_offset_shared_boundaries(
     roofprint_boundary: Any | None,
     exterior_boundary_maximum_distance_meters: float,
     maximum_displacement_meters: float,
-    maximum_direction_variance_degrees: float,
     coplanar_tolerance_degrees: float,
-    minimum_length_agreement_ratio: float = 0.80,
+    minimum_overlap_ratio: float = 0.80,
 ) -> tuple[
     dict[tuple[int, int], list[EdgeUse]],
     dict[tuple[int, int], dict[str, Any]],
@@ -647,8 +747,8 @@ def _reconcile_offset_shared_boundaries(
 
     A Roofer boundary is eligible only when the roofprint proves that it is not
     exterior.  Candidate sides must independently agree in direction, length,
-    endpoint support, incident planes, and the derived plane-plane
-    intersection.  Ambiguous candidates are deliberately left unmatched so
+    endpoint support, incident planes, and overlapping support along the
+    derived plane-plane intersection. Ambiguous candidates are left unmatched so
     the downstream safety gate requires an inspection instead of guessing.
     """
 
@@ -663,8 +763,8 @@ def _reconcile_offset_shared_boundaries(
             "repairedSharedBoundaryFeet": 0.0,
             "ambiguousOffsetBoundaryCount": 0,
             "unpairedInteriorBoundaryCount": 0,
-            "minimumLengthAgreementRatio": _round(
-                minimum_length_agreement_ratio, 3
+            "minimumBoundaryOverlapRatio": _round(
+                minimum_overlap_ratio, 3
             ),
             "offsetBoundaryRejectionCounts": {},
         }
@@ -700,65 +800,31 @@ def _reconcile_offset_shared_boundaries(
                 rejection_counts["SAME_FACET"] += 1
                 continue
             direction_variance = _edge_direction_variance_degrees(first, second)
-            if direction_variance > maximum_direction_variance_degrees:
-                rejection_counts["BOUNDARY_DIRECTION_MISMATCH"] += 1
-                continue
             first_length = _edge_length(first.start, first.end)
             second_length = _edge_length(second.start, second.end)
             length_agreement = min(first_length, second_length) / max(
                 first_length, second_length, 1e-12
             )
-            if length_agreement < minimum_length_agreement_ratio:
-                rejection_counts["BOUNDARY_LENGTH_MISMATCH"] += 1
-                continue
             plane_angle = _normal_angle_degrees(first.facet, second.facet)
             if plane_angle <= coplanar_tolerance_degrees:
                 rejection_counts["INCIDENT_PLANES_COPLANAR"] += 1
                 continue
-            plane_direction = _cross(first.facet.normal, second.facet.normal)
-            boundary_alignments = [
-                _vector_alignment_degrees(
-                    _vector(use.start, use.end), plane_direction
-                )
-                for use in (first, second)
-            ]
-            if any(
-                alignment > maximum_direction_variance_degrees
-                for alignment in boundary_alignments
-            ):
-                rejection_counts["PLANE_INTERSECTION_DIRECTION_MISMATCH"] += 1
-                continue
             try:
-                corrected, intersection = _validated_plane_intersection_edge(
-                    [first, second], maximum_displacement_meters
+                corrected, intersection = _validated_plane_supported_overlap(
+                    first,
+                    second,
+                    maximum_displacement_meters,
+                    minimum_overlap_ratio,
                 )
             except UnreliableGeometryError as error:
                 rejection_counts[error.code] += 1
                 continue
-            same_order = _distance(first.start, second.start) + _distance(
-                first.end, second.end
-            )
-            reverse_order = _distance(first.start, second.end) + _distance(
-                first.end, second.start
-            )
-            paired_second = (
-                (second.end, second.start)
-                if reverse_order < same_order
-                else (second.start, second.end)
-            )
-            endpoint_displacements = [
-                _distance(first.start, paired_second[0]),
-                _distance(first.end, paired_second[1]),
-            ]
             evidence = {
-                "pairingDerivation": "MUTUAL_UNIQUE_OFFSET_BOUNDARY_PAIR",
+                "pairingDerivation": "MUTUAL_UNIQUE_PLANE_SUPPORTED_BOUNDARY_PAIR",
                 "facetIds": sorted(
                     [first.facet.facet_id, second.facet.facet_id]
                 ),
                 "lengthAgreementRatio": _round(length_agreement, 4),
-                "maximumEndpointSeparationMeters": _round(
-                    max(endpoint_displacements), 3
-                ),
                 "maximumAllowedCorrectionMeters": _round(
                     maximum_displacement_meters, 3
                 ),
@@ -810,8 +876,8 @@ def _reconcile_offset_shared_boundaries(
         ),
         "ambiguousOffsetBoundaryCount": len(ambiguous_keys),
         "unpairedInteriorBoundaryCount": len(eligible) - len(consumed),
-        "minimumLengthAgreementRatio": _round(
-            minimum_length_agreement_ratio, 3
+        "minimumBoundaryOverlapRatio": _round(
+            minimum_overlap_ratio, 3
         ),
         "offsetBoundaryRejectionCounts": dict(sorted(rejection_counts.items())),
     }
@@ -1106,9 +1172,6 @@ def extract_roof_geometry(
             ),
             maximum_displacement_meters=(
                 plane_intersection_maximum_displacement_meters
-            ),
-            maximum_direction_variance_degrees=(
-                shared_edge_maximum_direction_variance_degrees
             ),
             coplanar_tolerance_degrees=coplanar_tolerance_degrees,
         )

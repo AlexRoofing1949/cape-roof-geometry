@@ -669,7 +669,7 @@ def _enforce_shared_boundary_completeness(
         "repairedSharedBoundaryFeet",
         "ambiguousOffsetBoundaryCount",
         "unpairedInteriorBoundaryCount",
-        "minimumLengthAgreementRatio",
+        "minimumBoundaryOverlapRatio",
         "offsetBoundaryRejectionCounts",
     ):
         if key in topology:
