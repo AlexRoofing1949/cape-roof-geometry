@@ -67,11 +67,18 @@ class PipelineConfidenceTests(unittest.TestCase):
                 "currentImagery": {
                     "sourceId": "public-current-imagery",
                     "captureDate": "2026-03-22",
+                    "captureDatePrecision": "PROJECT_WINDOW_END",
+                    "footprintIou": 0.8132,
+                    "centroidShiftMeters": 2.113,
+                    "areaChangePercent": 9.412,
+                    "providerFeatureId": "75249",
                     "validation": "NOT_RUN",
                     "rawImage": "must-not-be-returned",
                 },
             },
-            SimpleNamespace(source_id="usgs-public-lidar"),
+            SimpleNamespace(
+                source_id="usgs-public-lidar", acquired_end="2019-03-31"
+            ),
             {"tileAcquisitionDate": ""},
             12.3456,
         )
@@ -83,6 +90,21 @@ class PipelineConfidenceTests(unittest.TestCase):
             result["geometry"]["independentPlaneValidation"], "PASSED"
         )
         self.assertNotIn("rawImage", result["currentStructure"]["currentImagery"])
+        self.assertEqual(
+            result["currentStructure"]["currentImagery"]["footprintIou"],
+            0.8132,
+        )
+        self.assertEqual(
+            result["currentStructure"]["currentImagery"]["providerFeatureId"],
+            "75249",
+        )
+        self.assertEqual(
+            result["pointCloud"]["acquisitionReferenceDate"], "2019-03-31"
+        )
+        self.assertEqual(
+            result["pointCloud"]["acquisitionDatePrecision"],
+            "REGISTERED_PROJECT_WINDOW_END",
+        )
         self.assertEqual(result["pointCloud"]["pointDensityPpsm"], 12.346)
 
     def test_roofprint_perimeter_reconciliation_passes_without_inference(self):

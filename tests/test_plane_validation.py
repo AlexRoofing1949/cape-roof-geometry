@@ -42,6 +42,9 @@ class PlaneValidationTests(unittest.TestCase):
                     command[command.index("--plane-detect-min-points") + 1], "20"
                 )
                 self.assertEqual(
+                    command[command.index("--plane-detect-k") + 1], "15"
+                )
+                self.assertEqual(
                     command[command.index("--plane-detect-epsilon") + 1], "0.15"
                 )
                 self.assertEqual(
@@ -50,6 +53,7 @@ class PlaneValidationTests(unittest.TestCase):
 
             configured = SimpleNamespace(
                 command_timeout_seconds=30,
+                roofer_plane_detect_k=15,
                 roofer_plane_detect_min_points=20,
                 roofer_plane_detect_epsilon_meters=0.15,
                 roofer_complexity_factor=0.95,

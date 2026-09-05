@@ -438,6 +438,8 @@ def _run_roofer(pointcloud: Path, footprint: Path, output: Path, settings: Setti
             "request_id",
             "--split-cjseq",
             "--lod22",
+            "--plane-detect-k",
+            str(settings.roofer_plane_detect_k),
             "--plane-detect-min-points",
             str(settings.roofer_plane_detect_min_points),
             "--plane-detect-epsilon",
@@ -578,9 +580,30 @@ def _confidence_diagnostics(
                 for key in (
                     "sourceId",
                     "captureDate",
+                    "captureDatePrecision",
+                    "captureStart",
+                    "gsdMeters",
                     "validation",
                     "unchanged",
                     "method",
+                    "validationMethod",
+                    "providerFeatureId",
+                    "providerBuildingSource",
+                    "evidenceUpdatedDate",
+                    "footprintIou",
+                    "centroidShiftMeters",
+                    "areaChangePercent",
+                    "imageryQuality",
+                    "imageryAgeYears",
+                    "solarGroundAreaSqFt",
+                    "overtureFootprintAreaSqFt",
+                    "footprintAreaVariancePercent",
+                    "solarRoofAreaSqFt",
+                    "lidarRoofAreaSqFt",
+                    "roofAreaVariancePercent",
+                    "pitchVarianceDegrees",
+                    "solarFacetCount",
+                    "lidarFacetCount",
                     "failureReasons",
                 )
             },
@@ -589,6 +612,15 @@ def _confidence_diagnostics(
         "pointCloud": {
             "sourceId": lidar.source_id,
             "tileAcquisitionDate": point_audit.get("tileAcquisitionDate") or "",
+            "acquisitionReferenceDate": (
+                point_audit.get("tileAcquisitionDate")
+                or getattr(lidar, "acquired_end", "")
+            ),
+            "acquisitionDatePrecision": (
+                "EXACT_GPS_DATE"
+                if point_audit.get("tileAcquisitionDate")
+                else "REGISTERED_PROJECT_WINDOW_END"
+            ),
             "pointDensityPpsm": round(point_density, 3),
         },
     }
@@ -913,6 +945,9 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "maximumRooferRmseMeters": settings.maximum_roofer_rmse_meters,
                     "rooferPlaneDetectMinimumPoints": (
                         settings.roofer_plane_detect_min_points
+                    ),
+                    "rooferPlaneDetectNeighborhoodPoints": (
+                        settings.roofer_plane_detect_k
                     ),
                     "rooferPlaneDetectEpsilonMeters": (
                         settings.roofer_plane_detect_epsilon_meters

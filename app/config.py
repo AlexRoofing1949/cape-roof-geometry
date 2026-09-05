@@ -92,6 +92,7 @@ class Settings:
     minimum_point_density: float
     maximum_nodata_fraction: float
     maximum_roofer_rmse_meters: float
+    roofer_plane_detect_k: int
     roofer_plane_detect_min_points: int
     roofer_plane_detect_epsilon_meters: float
     roofer_complexity_factor: float
@@ -225,6 +226,7 @@ class Settings:
             minimum_point_density=_float("MINIMUM_POINT_DENSITY", 8),
             maximum_nodata_fraction=_float("MAXIMUM_NODATA_FRACTION", 0.10),
             maximum_roofer_rmse_meters=_float("MAXIMUM_ROOFER_RMSE_METERS", 0.35),
+            roofer_plane_detect_k=_int("ROOFER_PLANE_DETECT_K", 15),
             roofer_plane_detect_min_points=_int("ROOFER_PLANE_DETECT_MIN_POINTS", 20),
             roofer_plane_detect_epsilon_meters=_float(
                 "ROOFER_PLANE_DETECT_EPSILON_METERS", 0.15
@@ -386,6 +388,11 @@ class Settings:
             raise ConfigurationError(
                 "ROOFER_PLANE_SUPPORT_INVALID",
                 "ROOFER_PLANE_DETECT_MIN_POINTS must be between 10 and 100.",
+            )
+        if not 5 <= self.roofer_plane_detect_k <= 100:
+            raise ConfigurationError(
+                "ROOFER_PLANE_NEIGHBORHOOD_INVALID",
+                "ROOFER_PLANE_DETECT_K must be between 5 and 100.",
             )
         if not 0.50 <= self.roofer_complexity_factor <= 1.0:
             raise ConfigurationError(
