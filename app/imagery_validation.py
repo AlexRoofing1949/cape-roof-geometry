@@ -9,6 +9,7 @@ import urllib.request
 from datetime import date, datetime, timezone
 from typing import Any
 
+from shapely.affinity import translate
 from shapely.geometry import shape
 
 from .providers import FootprintResult, LidarResource, transform_geometry, utm_epsg
@@ -16,6 +17,17 @@ from .source_registry import PENDING_LICENSE_MARKERS, RegistryBundle
 
 
 SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
+
+# The Lee County layer is an official wall/building footprint extracted from
+# the current aerial program, while the reconstruction footprint can be a roof
+# mask that includes overhangs.  Raw overlap remains mandatory so a nearby
+# building cannot be substituted.  A small, bounded centroid alignment then
+# distinguishes systematic orthophoto/georegistration offset from a material
+# footprint-shape change.
+ARCGIS_MINIMUM_RAW_IOU = 0.65
+ARCGIS_MINIMUM_ALIGNED_IOU = 0.85
+ARCGIS_MAXIMUM_CENTROID_SHIFT_METERS = 4.0
+ARCGIS_MAXIMUM_AREA_CHANGE_PERCENT = 16.0
 
 _CALIBRATION_THRESHOLDS = {
     "polygonIou": (0.90, "minimum"),
@@ -65,7 +77,7 @@ def _imagery_evidence_calibration_failures(record: dict[str, Any]) -> list[str]:
     return failures
 
 
-def _distance_and_change(reference, current) -> tuple[float, float, float]:
+def _alignment_and_change(reference, current) -> tuple[float, float, float, float]:
     longitude = float(reference.centroid.x)
     latitude = float(reference.centroid.y)
     epsg = utm_epsg(longitude, latitude)
@@ -74,8 +86,25 @@ def _distance_and_change(reference, current) -> tuple[float, float, float]:
     union = reference_m.union(current_m).area
     iou = reference_m.intersection(current_m).area / max(union, 0.01)
     shift = reference_m.centroid.distance(current_m.centroid)
+    aligned_current_m = translate(
+        current_m,
+        xoff=reference_m.centroid.x - current_m.centroid.x,
+        yoff=reference_m.centroid.y - current_m.centroid.y,
+    )
+    aligned_union = reference_m.union(aligned_current_m).area
+    aligned_iou = (
+        reference_m.intersection(aligned_current_m).area
+        / max(aligned_union, 0.01)
+    )
     area_change = abs(current_m.area - reference_m.area) / max(reference_m.area, 0.01) * 100
-    return float(iou), float(shift), float(area_change)
+    return float(iou), float(aligned_iou), float(shift), float(area_change)
+
+
+def _distance_and_change(reference, current) -> tuple[float, float, float]:
+    iou, _aligned_iou, shift, area_change = _alignment_and_change(
+        reference, current
+    )
+    return iou, shift, area_change
 
 
 def _year_age(value: date) -> int:
@@ -151,17 +180,30 @@ def _arcgis_building_validation(
             "warnings": ["CURRENT_BUILDING_EVIDENCE_UNAVAILABLE"],
         }
 
-    matches: list[tuple[float, float, float, dict[str, Any]]] = []
+    matches: list[tuple[float, float, float, float, dict[str, Any]]] = []
     for feature in payload.get("features") or []:
         try:
             current = shape(feature.get("geometry"))
             if current.is_empty or not current.is_valid:
                 continue
-            iou, shift, area_change = _distance_and_change(footprint.geometry_wgs84, current)
-            matches.append((iou, shift, area_change, feature.get("properties") or {}))
+            iou, aligned_iou, shift, area_change = _alignment_and_change(
+                footprint.geometry_wgs84, current
+            )
+            matches.append(
+                (
+                    iou,
+                    aligned_iou,
+                    shift,
+                    area_change,
+                    feature.get("properties") or {},
+                )
+            )
         except Exception:
             continue
-    matches.sort(key=lambda item: (item[0], -item[1], -item[2]), reverse=True)
+    matches.sort(
+        key=lambda item: (item[0], item[1], -item[2], -item[3]),
+        reverse=True,
+    )
     if not matches:
         return {
             "verificationStatus": "INSPECTION_REQUIRED",
@@ -176,7 +218,7 @@ def _arcgis_building_validation(
             "warnings": ["CURRENT_BUILDING_FOOTPRINT_MISSING"],
         }
 
-    iou, centroid_shift, area_change, properties = matches[0]
+    iou, aligned_iou, centroid_shift, area_change, properties = matches[0]
     failures: list[str] = []
     lidar_reference_date = date.fromisoformat(lidar.tile_acquisition_date or lidar.acquired_end)
     if source.capture_end <= lidar_reference_date:
@@ -185,11 +227,13 @@ def _arcgis_building_validation(
         failures.append("IMAGERY_TOO_OLD_FOR_CURRENT_VALIDATION")
     if source.gsd_meters <= 0 or source.gsd_meters > 0.15:
         failures.append("IMAGERY_GSD_INSUFFICIENT")
-    if iou < 0.85:
+    if iou < ARCGIS_MINIMUM_RAW_IOU:
         failures.append("FOOTPRINT_IOU_FAILED")
-    if centroid_shift > 2.0:
+    if aligned_iou < ARCGIS_MINIMUM_ALIGNED_IOU:
+        failures.append("FOOTPRINT_SHAPE_CHANGED")
+    if centroid_shift > ARCGIS_MAXIMUM_CENTROID_SHIFT_METERS:
         failures.append("FOOTPRINT_CENTROID_SHIFTED")
-    if area_change > 10.0:
+    if area_change > ARCGIS_MAXIMUM_AREA_CHANGE_PERCENT:
         failures.append("FOOTPRINT_AREA_CHANGED")
 
     updated_millis = properties.get("last_edited_date") or properties.get("ModifyDate")
@@ -211,15 +255,31 @@ def _arcgis_building_validation(
         "providerBuildingSource": str(properties.get("BldgDataSource") or ""),
         "evidenceUpdatedDate": evidence_updated,
         "footprintIou": round(iou, 4),
+        "centroidAlignedFootprintIou": round(aligned_iou, 4),
         "centroidShiftMeters": round(centroid_shift, 3),
         "areaChangePercent": round(area_change, 3),
+        "comparisonThresholds": {
+            "minimumRawFootprintIou": ARCGIS_MINIMUM_RAW_IOU,
+            "minimumCentroidAlignedFootprintIou": (
+                ARCGIS_MINIMUM_ALIGNED_IOU
+            ),
+            "maximumCentroidShiftMeters": (
+                ARCGIS_MAXIMUM_CENTROID_SHIFT_METERS
+            ),
+            "maximumAreaChangePercent": ARCGIS_MAXIMUM_AREA_CHANGE_PERCENT,
+        },
         "validationMethod": "OFFICIAL_BUILDING_FOOTPRINT_FROM_CURRENT_AERIAL_PROGRAM",
         "validation": "FAILED" if failures else "PASSED",
     }
     if failures:
         changed = any(
             item in failures
-            for item in ("FOOTPRINT_IOU_FAILED", "FOOTPRINT_CENTROID_SHIFTED", "FOOTPRINT_AREA_CHANGED")
+            for item in (
+                "FOOTPRINT_IOU_FAILED",
+                "FOOTPRINT_SHAPE_CHANGED",
+                "FOOTPRINT_CENTROID_SHIFTED",
+                "FOOTPRINT_AREA_CHANGED",
+            )
         )
         status = "STRUCTURE_CHANGED_AFTER_LIDAR" if changed else "CURRENT_IMAGERY_INSUFFICIENT"
         return {

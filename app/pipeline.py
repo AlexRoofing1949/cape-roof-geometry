@@ -591,8 +591,10 @@ def _confidence_diagnostics(
                     "providerBuildingSource",
                     "evidenceUpdatedDate",
                     "footprintIou",
+                    "centroidAlignedFootprintIou",
                     "centroidShiftMeters",
                     "areaChangePercent",
+                    "comparisonThresholds",
                     "imageryQuality",
                     "imageryAgeYears",
                     "solarGroundAreaSqFt",
@@ -608,6 +610,7 @@ def _confidence_diagnostics(
                 )
             },
             "warnings": imagery_decision.get("warnings") or [],
+            "alternateEvidence": imagery_decision.get("alternateEvidence") or {},
         },
         "pointCloud": {
             "sourceId": lidar.source_id,

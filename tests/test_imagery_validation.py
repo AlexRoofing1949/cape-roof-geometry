@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from shapely.affinity import translate
 from shapely.geometry import Polygon, mapping
 
 from app.imagery_validation import (
@@ -163,6 +164,114 @@ class SolarBuildingModelValidationTests(unittest.TestCase):
         self.assertTrue(result["pricingAllowed"])
         self.assertEqual(result["currentImagery"]["validation"], "PASSED")
         self.assertEqual(result["currentImagery"]["providerFeatureId"], "75249")
+
+    @patch("app.imagery_validation.urllib.request.urlopen")
+    def test_official_wall_footprint_allows_bounded_registration_offset(
+        self, urlopen
+    ):
+        epsg = utm_epsg(
+            float(self.geometry_wgs84.centroid.x),
+            float(self.geometry_wgs84.centroid.y),
+        )
+        footprint_m = transform_geometry(
+            self.geometry_wgs84, "EPSG:4326", f"EPSG:{epsg}"
+        )
+        shifted_m = translate(footprint_m, xoff=3.0, yoff=0.0)
+        shifted = transform_geometry(
+            shifted_m, f"EPSG:{epsg}", "EPSG:4326"
+        )
+        payload = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "OBJECTID": 75250,
+                        "BldgDataSource": "LeePA Building Footprints",
+                    },
+                    "geometry": mapping(shifted),
+                }
+            ],
+        }
+        urlopen.return_value = io.BytesIO(json.dumps(payload).encode("utf-8"))
+        source = SimpleNamespace(
+            id="lee_county_2026_building_evidence",
+            evidence_endpoint="https://example.invalid/query",
+            imagery_endpoint="https://example.invalid/imagery",
+            capture_start=self.lidar_date,
+            capture_end=self.imagery_date,
+            gsd_meters=0.0762,
+            license="LEE_COUNTY_PUBLIC_INFORMATION_RESOURCE",
+            attribution="Eagle View, Lee County Property Appraiser, Lee County GIS",
+        )
+
+        result = _arcgis_building_validation(
+            self.footprint,
+            self.lidar,
+            source,
+            provider_timeout_seconds=5,
+            maximum_current_imagery_age_years=2,
+            current_lidar_max_age_years=2,
+            allow_historical_verified_pricing=True,
+        )
+
+        self.assertEqual(result["verificationStatus"], "VERIFIED_HISTORICAL_UNCHANGED")
+        self.assertTrue(result["pricingAllowed"])
+        self.assertGreaterEqual(
+            result["currentImagery"]["centroidAlignedFootprintIou"],
+            0.999,
+        )
+        self.assertGreater(result["currentImagery"]["centroidShiftMeters"], 2.9)
+
+    @patch("app.imagery_validation.urllib.request.urlopen")
+    def test_centroid_alignment_does_not_hide_material_shape_change(self, urlopen):
+        changed = Polygon(
+            [
+                (-81.95860, 26.63255),
+                (-81.95839, 26.63255),
+                (-81.95839, 26.63261),
+                (-81.95860, 26.63261),
+            ]
+        )
+        payload = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"OBJECTID": 75251},
+                    "geometry": mapping(changed),
+                }
+            ],
+        }
+        urlopen.return_value = io.BytesIO(json.dumps(payload).encode("utf-8"))
+        source = SimpleNamespace(
+            id="lee_county_2026_building_evidence",
+            evidence_endpoint="https://example.invalid/query",
+            imagery_endpoint="https://example.invalid/imagery",
+            capture_start=self.lidar_date,
+            capture_end=self.imagery_date,
+            gsd_meters=0.0762,
+            license="LEE_COUNTY_PUBLIC_INFORMATION_RESOURCE",
+            attribution="Lee County GIS",
+        )
+
+        result = _arcgis_building_validation(
+            self.footprint,
+            self.lidar,
+            source,
+            provider_timeout_seconds=5,
+            maximum_current_imagery_age_years=2,
+            current_lidar_max_age_years=2,
+            allow_historical_verified_pricing=True,
+        )
+
+        self.assertEqual(result["verificationStatus"], "INSPECTION_REQUIRED")
+        self.assertFalse(result["pricingAllowed"])
+        self.assertEqual(result["status"], "STRUCTURE_CHANGED_AFTER_LIDAR")
+        self.assertTrue(
+            {"FOOTPRINT_SHAPE_CHANGED", "FOOTPRINT_AREA_CHANGED"}
+            & set(result["warnings"])
+        )
 
     def test_solar_model_is_used_when_county_geometry_does_not_match(self):
         source = SimpleNamespace(

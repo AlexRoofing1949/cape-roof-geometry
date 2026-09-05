@@ -1634,7 +1634,29 @@ def extract_roof_geometry(
 
     for edge_key, uses in edge_uses.items():
         if len(uses) > 2:
-            raise UnreliableGeometryError("NON_MANIFOLD_ROOF_EDGE", "More than two roof facets share a reconstructed edge.")
+            raise UnreliableGeometryError(
+                "NON_MANIFOLD_ROOF_EDGE",
+                "More than two roof facets share a reconstructed edge.",
+                details={
+                    "facetIds": sorted(
+                        use.facet.facet_id for use in uses
+                    ),
+                    "adjacentFacetCount": len(uses),
+                    "candidateLengthFeet": _round(
+                        sum(_edge_length(use.start, use.end) for use in uses)
+                        / len(uses)
+                        * METERS_TO_FEET
+                    ),
+                    "pairwiseIncidentPlaneAnglesDegrees": [
+                        _round(
+                            _normal_angle_degrees(first_use.facet, second_use.facet),
+                            3,
+                        )
+                        for first_index, first_use in enumerate(uses)
+                        for second_use in uses[first_index + 1 :]
+                    ],
+                },
+            )
         first = uses[0]
         if _edge_length(first.start, first.end) <= 0.10:
             continue
