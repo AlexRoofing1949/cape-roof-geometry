@@ -863,6 +863,8 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
         )
 
         return {
+            "schemaVersion": "1.1",
+            "coordinateReferenceSystem": f"EPSG:{target_epsg}",
             "available": True,
             "verificationStatus": imagery_decision["verificationStatus"],
             "pricingAllowed": imagery_decision["pricingAllowed"],

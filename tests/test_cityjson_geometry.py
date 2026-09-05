@@ -357,6 +357,25 @@ class CityJsonGeometryTests(unittest.TestCase):
         for facet in result["facets"]:
             self.assertAlmostEqual(facet["areaSqFt"], facet["slopeAreaFormulaSqFt"], delta=0.02)
             self.assertAlmostEqual(facet["pitchRisePer12"], 12, delta=0.01)
+        vertices = {vertex["vertexId"]: vertex for vertex in result["vertices"]}
+        self.assertEqual(result["topology"]["edgeCount"], len(result["edges"]))
+        self.assertEqual(result["topology"]["vertexCount"], len(vertices))
+        self.assertEqual(len(result["topology"]["topologyHash"]), 64)
+        for edge in result["edges"]:
+            start = vertices[edge["startVertexId"]]
+            end = vertices[edge["endVertexId"]]
+            self.assertEqual(
+                edge["geometryMeters"][0],
+                [start["x"], start["y"], start["z"]],
+            )
+            self.assertEqual(
+                edge["geometryMeters"][-1],
+                [end["x"], end["y"], end["z"]],
+            )
+            expected_length = math.dist(
+                edge["geometryMeters"][0], edge["geometryMeters"][-1]
+            ) * 3.280839895013123
+            self.assertAlmostEqual(edge["lengthFeet"], expected_length, delta=0.01)
 
     def test_facet_ids_and_edges_are_independent_of_roofer_surface_order(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")

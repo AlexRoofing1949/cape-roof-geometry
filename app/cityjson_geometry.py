@@ -8,6 +8,7 @@ footprint, house area, roof type, or other generic assumption.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -423,6 +424,88 @@ def _validated_plane_intersection_edge(
 
 def _round(value: float, digits: int = 2) -> float:
     return round(float(value), digits)
+
+
+def _canonical_topology_graph(
+    classified: dict[str, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Expose deterministic projected endpoints without changing measurements."""
+
+    raw_points = {
+        tuple(round(float(value), 6) for value in point)
+        for entries in classified.values()
+        for edge in entries
+        for point in edge.get("_geometryMeters", ())
+    }
+    ordered_points = sorted(raw_points)
+    vertex_ids = {
+        point: f"V-{index:06d}"
+        for index, point in enumerate(ordered_points, start=1)
+    }
+    incident_facets: dict[tuple[float, float, float], set[str]] = {
+        point: set() for point in ordered_points
+    }
+    type_names = {
+        "rakes": "RAKE",
+        "eaves": "EAVE",
+        "valleys": "VALLEY",
+        "ridges": "RIDGE",
+        "hips": "HIP",
+        "highPerimeters": "HIGH_PERIMETER",
+    }
+    graph_edges: list[dict[str, Any]] = []
+    for kind in (
+        "eaves",
+        "rakes",
+        "ridges",
+        "hips",
+        "valleys",
+        "highPerimeters",
+    ):
+        for edge in classified[kind]:
+            raw_geometry = edge.pop("_geometryMeters")
+            start = tuple(round(float(value), 6) for value in raw_geometry[0])
+            end = tuple(round(float(value), 6) for value in raw_geometry[-1])
+            if kind in {"rakes", "hips", "valleys"}:
+                if (end[2], end[0], end[1]) < (start[2], start[0], start[1]):
+                    start, end = end, start
+            elif end < start:
+                start, end = end, start
+            geometry = [list(start), list(end)]
+            length_feet = _round(_edge_length(start, end) * METERS_TO_FEET)
+            edge["startVertexId"] = vertex_ids[start]
+            edge["endVertexId"] = vertex_ids[end]
+            edge["geometryMeters"] = geometry
+            edge["lengthFeet"] = length_feet
+            for point in (start, end):
+                incident_facets[point].update(str(value) for value in edge["facetIds"])
+            graph_edges.append({"type": type_names[kind], **edge})
+
+    graph_edges.sort(
+        key=lambda edge: (
+            edge["type"],
+            edge["startVertexId"],
+            edge["endVertexId"],
+            tuple(edge["facetIds"]),
+        )
+    )
+    vertices = [
+        {
+            "vertexId": vertex_ids[point],
+            "x": point[0],
+            "y": point[1],
+            "z": point[2],
+            "incidentFacetIds": sorted(incident_facets[point]),
+            "source": "RECONSTRUCTED_ROOF_TOPOLOGY",
+        }
+        for point in ordered_points
+    ]
+    normalized = json.dumps(
+        {"vertices": vertices, "edges": graph_edges},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return vertices, graph_edges, hashlib.sha256(normalized).hexdigest()
 
 
 def _edge_parameter(
@@ -862,6 +945,7 @@ def extract_roof_geometry(
                 _projected_edge_length(first.start, first.end) * METERS_TO_FEET
             ),
             "facetIds": [use.facet.facet_id for use in uses],
+            "_geometryMeters": [first.start, first.end],
             "classificationEvidence": classification_evidence
             or {
                 "derivation": "RECONSTRUCTED_FACET_BOUNDARY",
@@ -1094,6 +1178,9 @@ def extract_roof_geometry(
         kind: _round(sum(edge["projectedLengthFeet"] for edge in entries))
         for kind, entries in classified.items()
     }
+    topology_vertices, topology_edges, topology_hash = _canonical_topology_graph(
+        classified
+    )
     result = {
         "roofAreaSqFt": _round(roof_area_square_meters * SQUARE_METERS_TO_SQUARE_FEET),
         "averagePitchDegrees": _round(weighted_pitch),
@@ -1117,6 +1204,10 @@ def extract_roof_geometry(
         ),
         "highPerimeterFeet": totals["highPerimeters"],
         "topology": {
+            "contractVersion": "1.1",
+            "topologyHash": topology_hash,
+            "vertexCount": len(topology_vertices),
+            "edgeCount": len(topology_edges),
             "edgeNodeToleranceMeters": _round(edge_node_tolerance_meters, 3),
             "edgeNodeVerticalToleranceMeters": _round(
                 edge_node_vertical_tolerance_meters, 3
@@ -1152,6 +1243,8 @@ def extract_roof_geometry(
         ),
         "confidence": _round(quality_confidence, 3),
         "facets": result_facets,
+        "vertices": topology_vertices,
+        "edges": topology_edges,
         "rakes": classified["rakes"],
         "eaves": classified["eaves"],
         "valleys": classified["valleys"],
