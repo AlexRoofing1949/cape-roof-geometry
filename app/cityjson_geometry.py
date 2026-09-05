@@ -656,11 +656,17 @@ def _reconcile_offset_shared_boundaries(
     if roofprint_boundary is None:
         return dict(edge_uses), {}, {
             "rawNodedEdgeCount": raw_edge_count,
+            "eligibleOffsetBoundaryCount": 0,
+            "offsetBoundaryPairCount": 0,
             "offsetBoundaryCandidateCount": 0,
             "repairedSharedBoundaryCount": 0,
             "repairedSharedBoundaryFeet": 0.0,
             "ambiguousOffsetBoundaryCount": 0,
             "unpairedInteriorBoundaryCount": 0,
+            "minimumLengthAgreementRatio": _round(
+                minimum_length_agreement_ratio, 3
+            ),
+            "offsetBoundaryRejectionCounts": {},
         }
 
     eligible: list[tuple[tuple[int, int], EdgeUse]] = []
@@ -685,12 +691,17 @@ def _reconcile_offset_shared_boundaries(
         ]
     ] = []
     candidates_by_key: dict[tuple[int, int], list[int]] = defaultdict(list)
+    pair_count = 0
+    rejection_counts: dict[str, int] = defaultdict(int)
     for first_index, (first_key, first) in enumerate(eligible):
         for second_key, second in eligible[first_index + 1 :]:
+            pair_count += 1
             if first.facet.facet_id == second.facet.facet_id:
+                rejection_counts["SAME_FACET"] += 1
                 continue
             direction_variance = _edge_direction_variance_degrees(first, second)
             if direction_variance > maximum_direction_variance_degrees:
+                rejection_counts["BOUNDARY_DIRECTION_MISMATCH"] += 1
                 continue
             first_length = _edge_length(first.start, first.end)
             second_length = _edge_length(second.start, second.end)
@@ -698,9 +709,11 @@ def _reconcile_offset_shared_boundaries(
                 first_length, second_length, 1e-12
             )
             if length_agreement < minimum_length_agreement_ratio:
+                rejection_counts["BOUNDARY_LENGTH_MISMATCH"] += 1
                 continue
             plane_angle = _normal_angle_degrees(first.facet, second.facet)
             if plane_angle <= coplanar_tolerance_degrees:
+                rejection_counts["INCIDENT_PLANES_COPLANAR"] += 1
                 continue
             plane_direction = _cross(first.facet.normal, second.facet.normal)
             boundary_alignments = [
@@ -713,12 +726,14 @@ def _reconcile_offset_shared_boundaries(
                 alignment > maximum_direction_variance_degrees
                 for alignment in boundary_alignments
             ):
+                rejection_counts["PLANE_INTERSECTION_DIRECTION_MISMATCH"] += 1
                 continue
             try:
                 corrected, intersection = _validated_plane_intersection_edge(
                     [first, second], maximum_displacement_meters
                 )
-            except UnreliableGeometryError:
+            except UnreliableGeometryError as error:
+                rejection_counts[error.code] += 1
                 continue
             same_order = _distance(first.start, second.start) + _distance(
                 first.end, second.end
@@ -786,6 +801,8 @@ def _reconcile_offset_shared_boundaries(
     }
     return reconciled, repaired_evidence, {
         "rawNodedEdgeCount": raw_edge_count,
+        "eligibleOffsetBoundaryCount": len(eligible),
+        "offsetBoundaryPairCount": pair_count,
         "offsetBoundaryCandidateCount": len(candidates),
         "repairedSharedBoundaryCount": len(repaired_evidence),
         "repairedSharedBoundaryFeet": _round(
@@ -796,6 +813,7 @@ def _reconcile_offset_shared_boundaries(
         "minimumLengthAgreementRatio": _round(
             minimum_length_agreement_ratio, 3
         ),
+        "offsetBoundaryRejectionCounts": dict(sorted(rejection_counts.items())),
     }
 
 

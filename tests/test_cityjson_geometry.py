@@ -88,6 +88,7 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertEqual(audit["offsetBoundaryCandidateCount"], 1)
         self.assertEqual(audit["repairedSharedBoundaryCount"], 1)
         self.assertEqual(audit["unpairedInteriorBoundaryCount"], 0)
+        self.assertEqual(audit["offsetBoundaryRejectionCounts"], {})
 
     def test_ambiguous_offset_boundary_candidates_remain_unmatched(self):
         root_half = math.sqrt(0.5)
@@ -140,6 +141,10 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertEqual(audit["repairedSharedBoundaryCount"], 0)
         self.assertEqual(audit["ambiguousOffsetBoundaryCount"], 1)
         self.assertEqual(audit["unpairedInteriorBoundaryCount"], 3)
+        self.assertEqual(
+            audit["offsetBoundaryRejectionCounts"],
+            {"INCIDENT_PLANES_COPLANAR": 1},
+        )
 
     def test_offset_boundaries_on_roofprint_remain_exterior(self):
         feature, transform = load_cityjson_feature(

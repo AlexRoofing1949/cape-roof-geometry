@@ -660,6 +660,20 @@ def _enforce_shared_boundary_completeness(
         "unmatchedInteriorBoundaryFeet": round(unmatched_feet, 2),
         "maximumUnmatchedInteriorBoundaryFeet": round(maximum_unmatched_feet, 2),
     }
+    for key in (
+        "rawNodedEdgeCount",
+        "eligibleOffsetBoundaryCount",
+        "offsetBoundaryPairCount",
+        "offsetBoundaryCandidateCount",
+        "repairedSharedBoundaryCount",
+        "repairedSharedBoundaryFeet",
+        "ambiguousOffsetBoundaryCount",
+        "unpairedInteriorBoundaryCount",
+        "minimumLengthAgreementRatio",
+        "offsetBoundaryRejectionCounts",
+    ):
+        if key in topology:
+            result[key] = topology[key]
     if unmatched_count and unmatched_feet > maximum_unmatched_feet:
         raise UnreliableGeometryError(
             "ROOF_TOPOLOGY_SHARED_BOUNDARY_INCOMPLETE",

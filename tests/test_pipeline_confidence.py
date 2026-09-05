@@ -152,6 +152,11 @@ class PipelineConfidenceTests(unittest.TestCase):
             "topology": {
                 "unmatchedInteriorBoundaryCount": 4,
                 "unmatchedInteriorBoundaryFeet": 18.75,
+                "offsetBoundaryCandidateCount": 7,
+                "repairedSharedBoundaryCount": 2,
+                "offsetBoundaryRejectionCounts": {
+                    "BOUNDARY_DIRECTION_MISMATCH": 5
+                },
             }
         }
 
@@ -164,6 +169,16 @@ class PipelineConfidenceTests(unittest.TestCase):
         )
         self.assertEqual(
             context.exception.details["unmatchedInteriorBoundaryFeet"], 18.75
+        )
+        self.assertEqual(
+            context.exception.details["offsetBoundaryCandidateCount"], 7
+        )
+        self.assertEqual(
+            context.exception.details["repairedSharedBoundaryCount"], 2
+        )
+        self.assertEqual(
+            context.exception.details["offsetBoundaryRejectionCounts"],
+            {"BOUNDARY_DIRECTION_MISMATCH": 5},
         )
 
 
