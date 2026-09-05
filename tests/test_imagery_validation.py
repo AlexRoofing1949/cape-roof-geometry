@@ -164,6 +164,67 @@ class SolarBuildingModelValidationTests(unittest.TestCase):
         self.assertEqual(result["currentImagery"]["validation"], "PASSED")
         self.assertEqual(result["currentImagery"]["providerFeatureId"], "75249")
 
+    def test_solar_model_is_used_when_county_geometry_does_not_match(self):
+        source = SimpleNamespace(
+            id="lee_county_2026_building_evidence",
+            enabled=True,
+            counties=("Lee",),
+            commercial_estimate_use_allowed=True,
+            license="LEE_COUNTY_PUBLIC_INFORMATION_RESOURCE",
+            capture_end=self.imagery_date,
+            evidence_file=None,
+            evidence_kind="arcgis_building_footprints",
+            evidence_endpoint="https://example.invalid/query",
+        )
+        self.registries = SimpleNamespace(imagery_sources=(source,))
+        county_failure = {
+            "verificationStatus": "INSPECTION_REQUIRED",
+            "pricingAllowed": False,
+            "status": "STRUCTURE_CHANGED_AFTER_LIDAR",
+            "holdReason": "STRUCTURE_CHANGED_AFTER_LIDAR",
+            "currentImagery": {
+                "sourceId": source.id,
+                "validation": "FAILED",
+            },
+            "warnings": ["FOOTPRINT_IOU_FAILED"],
+        }
+        solar_success = {
+            "verificationStatus": "VERIFIED_HISTORICAL_UNCHANGED",
+            "pricingAllowed": True,
+            "status": "GEOMETRY_VERIFIED",
+            "holdReason": "",
+            "currentImagery": {
+                "sourceId": "google_solar_building_insights",
+                "validation": "PASSED",
+            },
+            "warnings": [],
+        }
+
+        with (
+            patch(
+                "app.imagery_validation._arcgis_building_validation",
+                return_value=county_failure,
+            ),
+            patch(
+                "app.imagery_validation._solar_model_validation",
+                return_value=solar_success,
+            ),
+        ):
+            result = self.validate()
+
+        self.assertTrue(result["pricingAllowed"])
+        self.assertEqual(
+            result["currentImagery"]["sourceId"],
+            "google_solar_building_insights",
+        )
+        self.assertEqual(
+            result["alternateEvidence"]["sourceId"], source.id
+        )
+        self.assertIn(
+            "COUNTY_BUILDING_EVIDENCE_REJECTED_SOLAR_MODEL_USED",
+            result["warnings"],
+        )
+
     def test_uncalibrated_segmentation_evidence_is_rejected(self):
         failures = _imagery_evidence_calibration_failures(
             {

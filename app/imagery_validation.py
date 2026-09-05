@@ -432,7 +432,7 @@ def _validate_current_structure_impl(
 
     source = eligible[0]
     if source.evidence_kind == "arcgis_building_footprints":
-        return _arcgis_building_validation(
+        county_result = _arcgis_building_validation(
             footprint,
             lidar,
             source,
@@ -441,6 +441,45 @@ def _validate_current_structure_impl(
             current_lidar_max_age_years=current_lidar_max_age_years,
             allow_historical_verified_pricing=allow_historical_verified_pricing,
         )
+        if county_result.get("pricingAllowed") or solar_reference is None:
+            return county_result
+        solar_result = _solar_model_validation(
+            footprint,
+            lidar,
+            solar_reference,
+            reconstructed_geometry,
+            maximum_current_imagery_age_years=maximum_current_imagery_age_years,
+            maximum_area_variance_percent=maximum_area_variance_percent,
+            maximum_pitch_variance_degrees=maximum_pitch_variance_degrees,
+            current_lidar_max_age_years=current_lidar_max_age_years,
+            allow_historical_verified_pricing=allow_historical_verified_pricing,
+        )
+        if solar_result.get("pricingAllowed"):
+            warnings = list(solar_result.get("warnings") or [])
+            warnings.append("COUNTY_BUILDING_EVIDENCE_REJECTED_SOLAR_MODEL_USED")
+            solar_result["warnings"] = warnings
+            solar_result["alternateEvidence"] = {
+                "sourceId": (county_result.get("currentImagery") or {}).get(
+                    "sourceId", source.id
+                ),
+                "status": county_result.get("status"),
+                "validation": (county_result.get("currentImagery") or {}).get(
+                    "validation"
+                ),
+                "warnings": list(county_result.get("warnings") or []),
+            }
+            return solar_result
+        county_result["alternateEvidence"] = {
+            "sourceId": (solar_result.get("currentImagery") or {}).get(
+                "sourceId", "google_solar_building_insights"
+            ),
+            "status": solar_result.get("status"),
+            "validation": (solar_result.get("currentImagery") or {}).get(
+                "validation"
+            ),
+            "warnings": list(solar_result.get("warnings") or []),
+        }
+        return county_result
     try:
         payload = json.loads(source.evidence_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
