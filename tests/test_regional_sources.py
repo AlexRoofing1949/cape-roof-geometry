@@ -1,6 +1,8 @@
 import json
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from dataclasses import replace
 from datetime import date, datetime, timezone
@@ -24,6 +26,7 @@ try:
     from app.providers import (
         FootprintResult,
         _bing_quadkey,
+        _cached_json_url,
         _simplify_google_solar_mask,
         fetch_best_footprint,
         fetch_google_solar_roofprint,
@@ -100,6 +103,40 @@ sources:
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     def test_microsoft_quadkey_is_stable_for_cape_coral(self):
         self.assertEqual(_bing_quadkey(-81.9495, 26.5629, 9), "032023011")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._download_file")
+    def test_shared_json_cache_is_populated_once_for_concurrent_requests(self, download):
+        calls: list[Path] = []
+
+        def write_payload(_url, destination, **_kwargs):
+            calls.append(destination)
+            time.sleep(0.05)
+            destination.write_text('{"features": []}', encoding="utf-8")
+
+        download.side_effect = write_payload
+        with tempfile.TemporaryDirectory() as directory:
+            configured = SimpleNamespace(
+                work_root=Path(directory),
+                catalog_cache_seconds=3600,
+                catalog_download_timeout_seconds=30,
+                catalog_maximum_bytes=1_000_000,
+            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(
+                        _cached_json_url,
+                        "https://example.invalid/shared.json",
+                        "shared",
+                        configured,
+                    )
+                    for _ in range(2)
+                ]
+                results = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(results, [{"features": []}, {"features": []}])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].name.endswith(".download"))
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.fetch_osm_footprint")
