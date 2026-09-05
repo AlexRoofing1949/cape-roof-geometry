@@ -96,7 +96,45 @@ def validate_facet_points(
         assigned_before_distance_gate = int(
             np.count_nonzero(np.isfinite(closest_distances) & (closest_facets == facet_index))
         )
-        if len(selected) < settings.open3d_minimum_facet_points:
+        facet_plan_area_square_meters = float(prepared["polygon"].area)
+        minimum_support_density = float(
+            getattr(settings, "minimum_point_density", 8.0)
+        )
+        candidate_density = (
+            plan_view_candidate_counts[facet_index]
+            / facet_plan_area_square_meters
+        )
+        support_density = len(selected) / facet_plan_area_square_meters
+        # A fixed 20-return floor incorrectly rejects legitimate compact roof
+        # facets even when their local point density is far above the production
+        # minimum.  Keep an absolute 10-return floor for a stable RANSAC fit,
+        # require the same per-square-metre density as the whole roof, and retain
+        # the configured 20-return requirement whenever the facet contains
+        # enough evidence to satisfy it.  Large, sparsely sampled facets therefore
+        # continue to fail closed instead of benefiting from this size-aware gate.
+        required_support_points = min(
+            settings.open3d_minimum_facet_points,
+            max(
+                10,
+                math.ceil(
+                    plan_view_candidate_counts[facet_index]
+                    * settings.open3d_minimum_inlier_ratio
+                ),
+            ),
+        )
+        uses_density_aware_floor = (
+            required_support_points < settings.open3d_minimum_facet_points
+        )
+        if (
+            len(selected) < required_support_points
+            or (
+                uses_density_aware_floor
+                and (
+                    candidate_density < minimum_support_density
+                    or support_density < minimum_support_density
+                )
+            )
+        ):
             raise UnreliableGeometryError(
                 "OPEN3D_FACET_SUPPORT_INSUFFICIENT",
                 "Too few roof points support a reconstructed facet.",
@@ -108,11 +146,15 @@ def validate_facet_points(
                     ),
                     "planViewCandidatePoints": plan_view_candidate_counts[facet_index],
                     "supportPoints": int(len(selected)),
+                    "candidateDensityPpsm": round(candidate_density, 3),
+                    "supportDensityPpsm": round(support_density, 3),
+                    "minimumSupportDensityPpsm": round(minimum_support_density, 3),
                     "discardedBeyondPlaneDistance": assigned_before_distance_gate - int(len(selected)),
                     "maximumAssignmentDistanceMeters": (
                         settings.open3d_maximum_assignment_distance_meters
                     ),
                     "minimumSupportPoints": settings.open3d_minimum_facet_points,
+                    "requiredSupportPoints": required_support_points,
                 },
             )
 
@@ -173,6 +215,10 @@ def validate_facet_points(
             ],
             "planViewCandidatePoints": plan_view_candidate_counts[facet_index],
             "supportPoints": int(len(selected)),
+            "candidateDensityPpsm": round(candidate_density, 3),
+            "supportDensityPpsm": round(support_density, 3),
+            "minimumSupportDensityPpsm": round(minimum_support_density, 3),
+            "requiredSupportPoints": required_support_points,
             "discardedBeyondPlaneDistance": assigned_before_distance_gate - int(len(selected)),
             "maximumAssignmentDistanceMeters": settings.open3d_maximum_assignment_distance_meters,
             "inlierPoints": int(len(inliers)),

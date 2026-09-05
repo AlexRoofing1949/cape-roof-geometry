@@ -15,6 +15,7 @@ def settings():
     return SimpleNamespace(
         open3d_minimum_facet_points=20,
         open3d_minimum_inlier_ratio=0.65,
+        minimum_point_density=8,
         open3d_maximum_assignment_distance_meters=0.6,
         open3d_distance_threshold_meters=0.05,
         open3d_maximum_normal_variance_degrees=5,
@@ -220,6 +221,70 @@ class PlaneValidationTests(unittest.TestCase):
         )
         self.assertEqual(result["facets"][0]["supportPoints"], len(roof))
         self.assertEqual(result["facets"][0]["discardedBeyondPlaneDistance"], len(remote_layer))
+
+    def test_small_dense_facet_uses_density_aware_support_floor(self):
+        points = np.asarray(
+            [
+                [x, y, 3 + 0.2 * y]
+                for x in np.linspace(0.05, 0.75, 5)
+                for y in np.linspace(0.1, 0.4, 2)
+            ],
+            dtype=float,
+        )
+        result = validate_facet_points(
+            points,
+            [
+                {
+                    "facetId": "F1",
+                    "verticesMeters": [
+                        [0, 0, 3],
+                        [0.8, 0, 3],
+                        [0.8, 0.5, 3.1],
+                        [0, 0.5, 3.1],
+                    ],
+                    "normal": [0, -0.2, 1],
+                    "areaSqFt": 4.39,
+                    "pitchDegrees": 11.31,
+                }
+            ],
+            settings(),
+        )
+
+        facet = result["facets"][0]
+        self.assertEqual(facet["supportPoints"], 10)
+        self.assertEqual(facet["requiredSupportPoints"], 10)
+        self.assertGreater(facet["supportDensityPpsm"], 8)
+
+    def test_large_sparse_facet_still_fails_closed(self):
+        points = np.asarray(
+            [[x, 5, 4] for x in np.linspace(0.5, 9.5, 10)],
+            dtype=float,
+        )
+        with self.assertRaisesRegex(Exception, "Too few roof points") as raised:
+            validate_facet_points(
+                points,
+                [
+                    {
+                        "facetId": "F1",
+                        "verticesMeters": [
+                            [0, 0, 4],
+                            [10, 0, 4],
+                            [10, 10, 4],
+                            [0, 10, 4],
+                        ],
+                        "normal": [0, 0, 1],
+                        "areaSqFt": 1076.39,
+                        "pitchDegrees": 0,
+                    }
+                ],
+                settings(),
+            )
+
+        self.assertEqual(raised.exception.code, "OPEN3D_FACET_SUPPORT_INSUFFICIENT")
+        self.assertLess(
+            raised.exception.details["supportDensityPpsm"],
+            raised.exception.details["minimumSupportDensityPpsm"],
+        )
 
     def test_disagreeing_plane_fails_closed(self):
         points = np.asarray(
