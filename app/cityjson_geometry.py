@@ -97,6 +97,25 @@ def _projected_edge_length(
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
 
+def _projected_edge_direction_variance_degrees(
+    first: EdgeUse, second: EdgeUse
+) -> float:
+    """Compare boundary direction in the planar topology arrangement."""
+
+    return _vector_alignment_degrees(
+        (
+            first.end[0] - first.start[0],
+            first.end[1] - first.start[1],
+            0.0,
+        ),
+        (
+            second.end[0] - second.start[0],
+            second.end[1] - second.start[1],
+            0.0,
+        ),
+    )
+
+
 def _horizontal_ring_area(points: Iterable[tuple[float, float, float]]) -> float:
     values = list(points)
     return abs(
@@ -1536,12 +1555,15 @@ def extract_roof_geometry(
                 }
             )
             continue
-        direction_variance = _edge_direction_variance_degrees(first, second)
+        direction_variance = _projected_edge_direction_variance_degrees(
+            first, second
+        )
         if direction_variance > shared_edge_maximum_direction_variance_degrees:
             evidence = {
                 "derivation": "SUPPRESSED_CROSSING_NODE_ARTIFACT",
                 "facetIds": [first.facet.facet_id, second.facet.facet_id],
                 "directionVarianceDegrees": _round(direction_variance, 3),
+                "directionVarianceReference": "PROJECTED_BOUNDARY",
                 "maximumDirectionVarianceDegrees": _round(
                     shared_edge_maximum_direction_variance_degrees, 3
                 ),
