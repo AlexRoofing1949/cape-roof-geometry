@@ -26,6 +26,110 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CityJsonGeometryTests(unittest.TestCase):
+    @staticmethod
+    def _non_manifold_fixture(edge_length_meters):
+        root_half = math.sqrt(0.5)
+        normals = (
+            (0.0, -root_half, root_half),
+            (-root_half, 0.0, root_half),
+            (root_half, 0.0, root_half),
+        )
+        facets = []
+        uses = []
+        for index, normal in enumerate(normals, start=1):
+            vertices = (
+                (0.0, 0.0, 1.0),
+                (edge_length_meters, 0.0, 1.0),
+                (0.0, 1.0, 2.0),
+            )
+            facet = Facet(
+                facet_id=f"F{index}",
+                vertex_ids=(0, 1, 2),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[axis] for point in vertices) / len(vertices)
+                    for axis in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+            facets.append(facet)
+            uses.append(
+                EdgeUse(facet, 0, 1, vertices[0], vertices[1])
+            )
+        attributes = {
+            "rf_success": True,
+            "rf_pointcloud_unusable": False,
+            "rf_extrusion_mode": "standard",
+            "rf_pt_density": 15,
+            "rf_nodata_frac": 0.01,
+            "rf_rmse_lod22": 0.1,
+        }
+        return facets, uses, attributes
+
+    def test_sub_node_tolerance_non_manifold_fragment_is_suppressed_and_audited(self):
+        facets, uses, attributes = self._non_manifold_fixture(0.12)
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=(facets, attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"artifact": uses},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"artifact": uses}, {}, {}),
+            ),
+        ):
+            result = extract_roof_geometry(
+                {}, None, edge_node_tolerance_meters=0.15
+            )
+
+        topology = result["topology"]
+        self.assertEqual(topology["suppressedNonManifoldJunctionCount"], 1)
+        self.assertAlmostEqual(
+            topology["suppressedNonManifoldJunctionFeet"],
+            0.12 * 3.280839895013123,
+            delta=0.005,
+        )
+        self.assertEqual(
+            topology["suppressedNonManifoldJunctions"][0]["derivation"],
+            "SUPPRESSED_SUB_NODE_TOLERANCE_NON_MANIFOLD_JUNCTION",
+        )
+
+    def test_material_non_manifold_edge_still_fails_closed(self):
+        facets, uses, attributes = self._non_manifold_fixture(0.20)
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=(facets, attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"material": uses},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"material": uses}, {}, {}),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                Exception, "More than two roof facets"
+            ) as context:
+                extract_roof_geometry(
+                    {}, None, edge_node_tolerance_meters=0.15
+                )
+
+        self.assertEqual(context.exception.code, "NON_MANIFOLD_ROOF_EDGE")
+
     def test_coplanar_offset_fragments_are_validated_for_suppression(self):
         root_half = math.sqrt(0.5)
 

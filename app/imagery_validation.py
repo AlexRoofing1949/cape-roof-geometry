@@ -25,7 +25,12 @@ SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
 # distinguishes systematic orthophoto/georegistration offset from a material
 # footprint-shape change.
 ARCGIS_MINIMUM_RAW_IOU = 0.65
-ARCGIS_MINIMUM_ALIGNED_IOU = 0.85
+# County wall-footprint layers and the independently selected source can be
+# translated by a few meters even when they describe the same building.  Use
+# the same shape-consensus threshold as the provider cascade after centroid
+# registration, while retaining the independent raw-IoU, area-change, and
+# centroid-shift gates below.  Material same-area shape changes still fail.
+ARCGIS_MINIMUM_ALIGNED_IOU = 0.70
 ARCGIS_MAXIMUM_CENTROID_SHIFT_METERS = 4.0
 ARCGIS_MAXIMUM_AREA_CHANGE_PERCENT = 16.0
 

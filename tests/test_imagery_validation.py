@@ -273,6 +273,69 @@ class SolarBuildingModelValidationTests(unittest.TestCase):
             & set(result["warnings"])
         )
 
+    @patch("app.imagery_validation.urllib.request.urlopen")
+    def test_centroid_alignment_rejects_same_area_shape_change(self, urlopen):
+        epsg = utm_epsg(
+            float(self.geometry_wgs84.centroid.x),
+            float(self.geometry_wgs84.centroid.y),
+        )
+        footprint_m = transform_geometry(
+            self.geometry_wgs84, "EPSG:4326", f"EPSG:{epsg}"
+        )
+        center = footprint_m.centroid
+        minx, miny, maxx, maxy = footprint_m.bounds
+        width = (maxx - minx) * 1.5
+        height = (maxy - miny) / 1.5
+        changed_m = Polygon(
+            [
+                (center.x - width / 2, center.y - height / 2),
+                (center.x + width / 2, center.y - height / 2),
+                (center.x + width / 2, center.y + height / 2),
+                (center.x - width / 2, center.y + height / 2),
+            ]
+        )
+        changed = transform_geometry(changed_m, f"EPSG:{epsg}", "EPSG:4326")
+        payload = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"OBJECTID": 75252},
+                    "geometry": mapping(changed),
+                }
+            ],
+        }
+        urlopen.return_value = io.BytesIO(json.dumps(payload).encode("utf-8"))
+        source = SimpleNamespace(
+            id="lee_county_2026_building_evidence",
+            evidence_endpoint="https://example.invalid/query",
+            imagery_endpoint="https://example.invalid/imagery",
+            capture_start=self.lidar_date,
+            capture_end=self.imagery_date,
+            gsd_meters=0.0762,
+            license="LEE_COUNTY_PUBLIC_INFORMATION_RESOURCE",
+            attribution="Lee County GIS",
+        )
+
+        result = _arcgis_building_validation(
+            self.footprint,
+            self.lidar,
+            source,
+            provider_timeout_seconds=5,
+            maximum_current_imagery_age_years=2,
+            current_lidar_max_age_years=2,
+            allow_historical_verified_pricing=True,
+        )
+
+        self.assertEqual(result["verificationStatus"], "INSPECTION_REQUIRED")
+        self.assertFalse(result["pricingAllowed"])
+        self.assertEqual(result["status"], "STRUCTURE_CHANGED_AFTER_LIDAR")
+        self.assertIn("FOOTPRINT_SHAPE_CHANGED", result["warnings"])
+        self.assertNotIn("FOOTPRINT_AREA_CHANGED", result["warnings"])
+        self.assertLess(
+            result["currentImagery"]["centroidAlignedFootprintIou"], 0.70
+        )
+
     def test_solar_model_is_used_when_county_geometry_does_not_match(self):
         source = SimpleNamespace(
             id="lee_county_2026_building_evidence",

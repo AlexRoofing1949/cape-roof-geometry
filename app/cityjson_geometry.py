@@ -1533,6 +1533,7 @@ def extract_roof_geometry(
     rejected_noded_adjacencies: list[dict[str, Any]] = []
     unmatched_interior_boundaries: list[dict[str, Any]] = []
     vertical_level_transitions: list[dict[str, Any]] = []
+    suppressed_non_manifold_junctions: list[dict[str, Any]] = []
     planar_consensus_lengths: list[float] = []
     counters: dict[str, int] = defaultdict(int)
     edge_prefixes = {
@@ -1634,28 +1635,41 @@ def extract_roof_geometry(
 
     for edge_key, uses in edge_uses.items():
         if len(uses) > 2:
+            candidate_length_meters = sum(
+                _edge_length(use.start, use.end) for use in uses
+            ) / len(uses)
+            evidence = {
+                "facetIds": sorted(use.facet.facet_id for use in uses),
+                "adjacentFacetCount": len(uses),
+                "candidateLengthFeet": _round(
+                    candidate_length_meters * METERS_TO_FEET
+                ),
+                "pairwiseIncidentPlaneAnglesDegrees": [
+                    _round(
+                        _normal_angle_degrees(first_use.facet, second_use.facet),
+                        3,
+                    )
+                    for first_index, first_use in enumerate(uses)
+                    for second_use in uses[first_index + 1 :]
+                ],
+            }
+            if candidate_length_meters <= edge_node_tolerance_meters:
+                suppressed_non_manifold_junctions.append(
+                    {
+                        **evidence,
+                        "derivation": (
+                            "SUPPRESSED_SUB_NODE_TOLERANCE_NON_MANIFOLD_JUNCTION"
+                        ),
+                        "maximumArtifactLengthMeters": _round(
+                            edge_node_tolerance_meters, 3
+                        ),
+                    }
+                )
+                continue
             raise UnreliableGeometryError(
                 "NON_MANIFOLD_ROOF_EDGE",
                 "More than two roof facets share a reconstructed edge.",
-                details={
-                    "facetIds": sorted(
-                        use.facet.facet_id for use in uses
-                    ),
-                    "adjacentFacetCount": len(uses),
-                    "candidateLengthFeet": _round(
-                        sum(_edge_length(use.start, use.end) for use in uses)
-                        / len(uses)
-                        * METERS_TO_FEET
-                    ),
-                    "pairwiseIncidentPlaneAnglesDegrees": [
-                        _round(
-                            _normal_angle_degrees(first_use.facet, second_use.facet),
-                            3,
-                        )
-                        for first_index, first_use in enumerate(uses)
-                        for second_use in uses[first_index + 1 :]
-                    ],
-                },
+                details=evidence,
             )
         first = uses[0]
         if _edge_length(first.start, first.end) <= 0.10:
@@ -1989,6 +2003,18 @@ def extract_roof_geometry(
             ),
             "rejectedNodedAdjacencyCount": len(rejected_noded_adjacencies),
             "rejectedNodedAdjacencies": rejected_noded_adjacencies,
+            "suppressedNonManifoldJunctionCount": len(
+                suppressed_non_manifold_junctions
+            ),
+            "suppressedNonManifoldJunctionFeet": _round(
+                sum(
+                    item["candidateLengthFeet"]
+                    for item in suppressed_non_manifold_junctions
+                )
+            ),
+            "suppressedNonManifoldJunctions": (
+                suppressed_non_manifold_junctions
+            ),
             "suppressedCrossingArtifactFeet": _round(
                 sum(
                     item["candidateLengthFeet"]
