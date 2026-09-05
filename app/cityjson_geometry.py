@@ -179,6 +179,18 @@ def _edge_height_at_xy(
     return start[2] + t * (end[2] - start[2])
 
 
+def _facet_plane_height_at_xy(facet: Facet, x: float, y: float) -> float:
+    """Return the fitted facet-plane elevation at a projected coordinate."""
+
+    origin_x, origin_y, origin_z = facet.vertices[0]
+    normal_x, normal_y, normal_z = facet.normal
+    if abs(normal_z) <= 1e-12:
+        raise ValueError("Roof facet plane is vertical and has no single XY height")
+    return origin_z - (
+        normal_x * (x - origin_x) + normal_y * (y - origin_y)
+    ) / normal_z
+
+
 def _paired_edge_vertical_separations(
     first: EdgeUse, second: EdgeUse
 ) -> tuple[float, float, float]:
@@ -267,17 +279,11 @@ def _facet_side_height_delta(use: EdgeUse) -> float:
     midpoint_y = (use.start[1] + use.end[1]) / 2
     probe_x = midpoint_x + inward_x
     probe_y = midpoint_y + inward_y
-    normal_x, normal_y, normal_z = use.facet.normal
-    plane_height = use.start[2] - (
-        normal_x * (probe_x - use.start[0])
-        + normal_y * (probe_y - use.start[1])
-    ) / normal_z
-    edge_height = _edge_height_at_xy(
-        use.start,
-        use.end,
-        (probe_x, probe_y, plane_height),
+    boundary_height = _facet_plane_height_at_xy(
+        use.facet, midpoint_x, midpoint_y
     )
-    return plane_height - edge_height
+    plane_height = _facet_plane_height_at_xy(use.facet, probe_x, probe_y)
+    return plane_height - boundary_height
 
 
 def _normal_angle_degrees(first: Facet, second: Facet) -> float:

@@ -467,6 +467,48 @@ class CityJsonGeometryTests(unittest.TestCase):
             0.35,
         )
 
+    def test_facet_side_delta_uses_fitted_plane_not_consensus_edge_z(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first = facet(
+            "F1",
+            ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0)),
+            (0.0, -root_half, root_half),
+        )
+        second = facet(
+            "F2",
+            ((10.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, -5.0, 5.0)),
+            (0.0, root_half, root_half),
+        )
+        consensus_start = (0.0, 0.0, -0.3)
+        consensus_end = (10.0, 0.0, 0.3)
+        uses = (
+            EdgeUse(first, 0, 1, consensus_start, consensus_end),
+            EdgeUse(second, 0, 1, consensus_end, consensus_start),
+        )
+
+        self.assertAlmostEqual(_facet_side_height_delta(uses[0]), 1.0)
+        self.assertAlmostEqual(_facet_side_height_delta(uses[1]), 1.0)
+
     def test_crossing_corner_fragments_are_not_shared_boundaries(self):
         first_facet = Facet(
             facet_id="F1",
