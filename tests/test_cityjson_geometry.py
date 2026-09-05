@@ -20,7 +20,6 @@ from app.cityjson_geometry import (
     extract_roof_geometry,
     load_cityjson_feature,
 )
-from app.errors import UnreliableGeometryError
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -1012,7 +1011,7 @@ class CityJsonGeometryTests(unittest.TestCase):
         )
         self.assertGreater(transition["minimumVerticalSeparationMeters"], 4.9)
 
-    def test_converging_plan_coincident_levels_fail_closed(self):
+    def test_converging_plan_coincident_edges_are_not_level_transitions(self):
         feature = {
             "type": "CityJSONFeature",
             "id": "AMBIGUOUS-LEVEL-TRANSITION",
@@ -1047,10 +1046,9 @@ class CityJsonGeometryTests(unittest.TestCase):
             },
         }
 
-        with self.assertRaises(UnreliableGeometryError) as context:
-            extract_roof_geometry(feature, None)
+        result = extract_roof_geometry(feature, None)
 
-        self.assertEqual(context.exception.code, "ROOF_VERTICAL_TRANSITION_AMBIGUOUS")
+        self.assertEqual(result["topology"]["verticalLevelTransitionCount"], 0)
 
     def test_missing_transform_is_allowed_for_unquantized_fixture(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")

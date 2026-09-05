@@ -1489,8 +1489,11 @@ def extract_roof_geometry(
         second = uses[1]
         vertical_separations = _paired_edge_vertical_separations(first, second)
         minimum_vertical_separation = min(vertical_separations)
-        maximum_vertical_separation = max(vertical_separations)
-        if minimum_vertical_separation > edge_node_vertical_tolerance_meters:
+        minimum_level_transition_separation = max(
+            edge_node_vertical_tolerance_meters,
+            plane_intersection_maximum_displacement_meters,
+        )
+        if minimum_vertical_separation > minimum_level_transition_separation:
             lower = min(
                 uses,
                 key=lambda use: _edge_height_at_xy(
@@ -1518,6 +1521,9 @@ def extract_roof_geometry(
                 "verticalNodeToleranceMeters": _round(
                     edge_node_vertical_tolerance_meters, 3
                 ),
+                "minimumLevelTransitionSeparationMeters": _round(
+                    minimum_level_transition_separation, 3
+                ),
                 "classificationRule": "LOWER_ROOF_WALL_INTERFACE",
             }
             add_edge("highPerimeters", [lower], evidence)
@@ -1530,22 +1536,6 @@ def extract_roof_geometry(
                 }
             )
             continue
-        if maximum_vertical_separation > edge_node_vertical_tolerance_meters:
-            raise UnreliableGeometryError(
-                "ROOF_VERTICAL_TRANSITION_AMBIGUOUS",
-                "Plan-coincident roof boundaries converge across the segment and cannot be classified safely.",
-                details={
-                    "facetIds": sorted(
-                        [first.facet.facet_id, second.facet.facet_id]
-                    ),
-                    "verticalSeparationMeters": [
-                        _round(value, 3) for value in vertical_separations
-                    ],
-                    "verticalNodeToleranceMeters": _round(
-                        edge_node_vertical_tolerance_meters, 3
-                    ),
-                },
-            )
         direction_variance = _edge_direction_variance_degrees(first, second)
         if direction_variance > shared_edge_maximum_direction_variance_degrees:
             evidence = {
