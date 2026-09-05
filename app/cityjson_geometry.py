@@ -311,14 +311,51 @@ def _vector_alignment_degrees(
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
 
 
-def _edge_downslope_alignment_degrees(use: EdgeUse) -> float | None:
+def _roofprint_local_tangent_direction(
+    roofprint_boundary: Any,
+    midpoint: Point,
+    sampling_radius_meters: float = 0.75,
+) -> tuple[float, float, float] | None:
+    """Return a locally smoothed plan tangent for a pixel-derived roofprint."""
+
+    boundary_length = float(getattr(roofprint_boundary, "length", 0.0) or 0.0)
+    if boundary_length <= 1e-12:
+        return None
+    try:
+        station = float(roofprint_boundary.project(midpoint))
+        radius = min(
+            max(float(sampling_radius_meters), 0.10),
+            boundary_length / 4,
+        )
+        is_closed = bool(getattr(roofprint_boundary, "is_ring", False))
+
+        def sample(position: float) -> Point:
+            if is_closed:
+                position %= boundary_length
+            else:
+                position = min(max(position, 0.0), boundary_length)
+            return roofprint_boundary.interpolate(position)
+
+        before = sample(station - radius)
+        after = sample(station + radius)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    direction = (float(after.x - before.x), float(after.y - before.y), 0.0)
+    return direction if _norm(direction) > 1e-12 else None
+
+
+def _edge_downslope_alignment_degrees(
+    use: EdgeUse,
+    edge_direction: tuple[float, float, float] | None = None,
+) -> float | None:
     """Return plan-angle from an exterior edge to its facet's downslope axis."""
 
-    edge_direction = (
-        use.end[0] - use.start[0],
-        use.end[1] - use.start[1],
-        0.0,
-    )
+    if edge_direction is None:
+        edge_direction = (
+            use.end[0] - use.start[0],
+            use.end[1] - use.start[1],
+            0.0,
+        )
     downslope_direction = (
         use.facet.normal[0] / use.facet.normal[2],
         use.facet.normal[1] / use.facet.normal[2],
@@ -1616,7 +1653,18 @@ def extract_roof_geometry(
                 ),
             }
 
-        downslope_alignment = _edge_downslope_alignment_degrees(use)
+        tangent_direction = None
+        if roofprint_boundary is not None:
+            midpoint = Point(
+                (use.start[0] + use.end[0]) / 2,
+                (use.start[1] + use.end[1]) / 2,
+            )
+            tangent_direction = _roofprint_local_tangent_direction(
+                roofprint_boundary, midpoint
+            )
+        downslope_alignment = _edge_downslope_alignment_degrees(
+            use, tangent_direction
+        )
         if downslope_alignment is not None:
             boundary_evidence = {
                 **(boundary_evidence or {}),
@@ -1624,6 +1672,14 @@ def extract_roof_geometry(
                     downslope_alignment, 3
                 ),
                 "classificationRule": "FACET_SLOPE_DIRECTION",
+                "edgeDirectionSource": (
+                    "LOCAL_ROOFPRINT_TANGENT"
+                    if tangent_direction is not None
+                    else "RECONSTRUCTED_EDGE_SEGMENT"
+                ),
+                "roofprintTangentSamplingRadiusMeters": (
+                    0.75 if tangent_direction is not None else None
+                ),
             }
         # A true rake travels substantially across the facet contours.  Small
         # vertical changes along a raster-derived eave are expected plane-fit

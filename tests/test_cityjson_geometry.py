@@ -4,7 +4,7 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 from app.cityjson_geometry import (
     EdgeUse,
@@ -13,6 +13,7 @@ from app.cityjson_geometry import (
     _facet_side_height_delta,
     _noded_edge_uses,
     _reconcile_offset_shared_boundaries,
+    _roofprint_local_tangent_direction,
     _roof_facets,
     _validated_coplanar_boundary_overlap,
     _validated_plane_intersection_edge,
@@ -26,6 +27,94 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CityJsonGeometryTests(unittest.TestCase):
+    def test_roofprint_tangent_smooths_pixel_stair_step_direction(self):
+        boundary = LineString(
+            [
+                (0.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 0.10),
+                (4.0, 0.10),
+                (4.0, 0.0),
+                (6.0, 0.0),
+            ]
+        )
+
+        tangent = _roofprint_local_tangent_direction(
+            boundary, Point(2.0, 0.05), sampling_radius_meters=0.75
+        )
+
+        self.assertIsNotNone(tangent)
+        self.assertGreater(abs(tangent[0]), 1.0)
+        self.assertLess(abs(tangent[1]), 0.2)
+
+    def test_pixel_stair_step_is_classified_from_smoothed_roofprint_tangent(self):
+        root_half = math.sqrt(0.5)
+        vertices = (
+            (2.0, 0.0, 1.0),
+            (2.0, 0.10, 1.10),
+            (3.0, 1.0, 2.0),
+        )
+        facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=vertices,
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=45.0,
+            azimuth_degrees=180.0,
+            centroid=tuple(
+                sum(point[axis] for point in vertices) / len(vertices)
+                for axis in range(3)
+            ),
+            normal=(0.0, -root_half, root_half),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        use = EdgeUse(facet, 0, 1, vertices[0], vertices[1])
+        attributes = {
+            "rf_success": True,
+            "rf_pointcloud_unusable": False,
+            "rf_extrusion_mode": "standard",
+            "rf_pt_density": 15,
+            "rf_nodata_frac": 0.01,
+            "rf_rmse_lod22": 0.1,
+        }
+        boundary = LineString(
+            [
+                (0.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 0.10),
+                (4.0, 0.10),
+                (4.0, 0.0),
+                (6.0, 0.0),
+            ]
+        )
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=([facet], attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"stair": [use]},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"stair": [use]}, {}, {}),
+            ),
+        ):
+            result = extract_roof_geometry(
+                {}, None, roofprint_boundary=boundary
+            )
+
+        self.assertEqual(result["rakesFeet"], 0.0)
+        self.assertGreater(result["eavesFeet"], 0.0)
+        self.assertEqual(
+            result["eaves"][0]["classificationEvidence"]["edgeDirectionSource"],
+            "LOCAL_ROOFPRINT_TANGENT",
+        )
+
     @staticmethod
     def _non_manifold_fixture(edge_length_meters):
         root_half = math.sqrt(0.5)
@@ -929,10 +1018,25 @@ class CityJsonGeometryTests(unittest.TestCase):
         )
 
         self.assertEqual(result["topology"]["unmatchedInteriorBoundaryCount"], 0)
+        self.assertAlmostEqual(
+            result["eavesFeet"], 20 * 3.280839895013123, delta=0.02
+        )
+        self.assertAlmostEqual(
+            result["rakesFeet"],
+            4 * math.sqrt(18) * 3.280839895013123,
+            delta=0.03,
+        )
         self.assertTrue(
             all(
                 edge["classificationEvidence"]["derivation"]
                 == "ROOFPRINT_CORROBORATED_FACET_BOUNDARY"
+                for edge in result["eaves"] + result["rakes"]
+            )
+        )
+        self.assertTrue(
+            all(
+                edge["classificationEvidence"]["edgeDirectionSource"]
+                == "LOCAL_ROOFPRINT_TANGENT"
                 for edge in result["eaves"] + result["rakes"]
             )
         )
