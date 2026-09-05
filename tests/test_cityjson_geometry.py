@@ -509,6 +509,58 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(_facet_side_height_delta(uses[0]), 1.0)
         self.assertAlmostEqual(_facet_side_height_delta(uses[1]), 1.0)
 
+    def test_misaligned_consensus_dihedral_conflict_is_audited_not_priced(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "MISALIGNED-CONSENSUS-CONFLICT",
+            "vertices": [
+                [0, 0, 0], [1, 0, 0], [1, 1, 1], [0, 1, 1],
+                [1, 0, 0.4], [0, 0, 0], [0, -1, -1], [1, -1, -0.6],
+            ],
+            "CityObjects": {
+                "MISALIGNED-CONSENSUS-CONFLICT": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        self.assertEqual(result["topology"]["rejectedNodedAdjacencyCount"], 1)
+        rejected = result["topology"]["rejectedNodedAdjacencies"][0]
+        self.assertEqual(
+            rejected["derivation"],
+            "SUPPRESSED_PLANAR_CONSENSUS_DIHEDRAL_CONFLICT",
+        )
+        self.assertAlmostEqual(
+            result["topology"]["suppressedCrossingArtifactFeet"],
+            math.sqrt(1.0**2 + 0.2**2) * 3.280839895,
+            delta=0.02,
+        )
+        self.assertEqual(result["ridges"], [])
+        self.assertEqual(result["hips"], [])
+        self.assertEqual(result["valleys"], [])
+
     def test_crossing_corner_fragments_are_not_shared_boundaries(self):
         first_facet = Facet(
             facet_id="F1",

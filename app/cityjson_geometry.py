@@ -1823,6 +1823,39 @@ def extract_roof_geometry(
                 add_edge("ridges", uses, intersection_evidence)
             else:
                 add_edge("hips", uses, intersection_evidence)
+        elif (
+            len(decisive_deltas) == 2
+            and first_delta * second_delta < 0
+            and intersection_evidence.get("derivation")
+            == "PLAN_COINCIDENT_ENDPOINT_CONSENSUS"
+            and (intersection_evidence.get("planeIntersectionFallback") or {}).get(
+                "errorCode"
+            )
+            == "ROOF_PLANE_INTERSECTION_MISALIGNED"
+        ):
+            # Roofer occasionally leaves short, plan-coincident fragments at a
+            # noded corner even though the two incident planes do not meet in
+            # that direction.  Endpoint consensus proves only that the fragment
+            # is spatially bounded; opposing plane derivatives prove it is not a
+            # physically classifiable ridge, hip, or valley.  Exclude and audit
+            # this fragment instead of inventing a roof-line type.
+            rejected_noded_adjacencies.append(
+                {
+                    "derivation": (
+                        "SUPPRESSED_PLANAR_CONSENSUS_DIHEDRAL_CONFLICT"
+                    ),
+                    "facetIds": [first.facet.facet_id, second.facet.facet_id],
+                    "sideHeightsMeters": [
+                        _round(first_delta, 3),
+                        _round(second_delta, 3),
+                    ],
+                    "candidateLengthFeet": _round(
+                        _edge_length(first.start, first.end) * METERS_TO_FEET
+                    ),
+                    "planarConsensus": intersection_evidence,
+                }
+            )
+            continue
         else:
             ambiguous.append(
                 {
