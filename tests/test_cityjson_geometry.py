@@ -410,6 +410,63 @@ class CityJsonGeometryTests(unittest.TestCase):
         self.assertGreater(_facet_side_height_delta(corrected[0]), 0)
         self.assertGreater(_facet_side_height_delta(corrected[1]), 0)
 
+    def test_plan_coincident_seam_uses_bounded_endpoint_consensus(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "PLANAR-CONSENSUS-SEAM",
+            "vertices": [
+                [0, 0, 0], [10, 0, 0], [10, 5, 0.5], [0, 5, 0.5],
+                [10, 0, 0.2], [0, 0, 0.2], [0, -5, 0.7], [10, -5, 0.7],
+            ],
+            "CityObjects": {
+                "PLANAR-CONSENSUS-SEAM": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        self.assertEqual(
+            result["topology"]["planarConsensusSharedBoundaryCount"], 1
+        )
+        self.assertAlmostEqual(
+            result["topology"]["planarConsensusSharedBoundaryFeet"],
+            10 * 3.280839895013123,
+            delta=0.02,
+        )
+        consensus_edges = [
+            edge
+            for edge in result["edges"]
+            if edge["classificationEvidence"].get("derivation")
+            == "PLAN_COINCIDENT_ENDPOINT_CONSENSUS"
+        ]
+        self.assertEqual(len(consensus_edges), 1)
+        self.assertLessEqual(
+            consensus_edges[0]["classificationEvidence"]["maximumCorrectionMeters"],
+            0.35,
+        )
+
     def test_crossing_corner_fragments_are_not_shared_boundaries(self):
         first_facet = Facet(
             facet_id="F1",

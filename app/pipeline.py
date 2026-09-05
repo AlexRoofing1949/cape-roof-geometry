@@ -672,6 +672,8 @@ def _enforce_shared_boundary_completeness(
         "nodingMode",
         "verticalLevelTransitionCount",
         "verticalLevelTransitionFeet",
+        "planarConsensusSharedBoundaryCount",
+        "planarConsensusSharedBoundaryFeet",
         "ambiguousOffsetBoundaryCount",
         "unpairedInteriorBoundaryCount",
         "minimumBoundaryOverlapRatio",

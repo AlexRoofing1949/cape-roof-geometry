@@ -513,6 +513,136 @@ def _validated_plane_intersection_edge(
     }
 
 
+def _validated_planar_consensus_edge(
+    uses: list[EdgeUse],
+    *,
+    maximum_planar_displacement_meters: float,
+    maximum_3d_correction_meters: float,
+) -> tuple[list[EdgeUse], dict[str, Any]]:
+    """Average a plan-coincident seam when fitted planes are nearly parallel.
+
+    A small independent plane-fit offset can move the mathematical
+    plane-plane intersection far from a boundary even though both reconstructed
+    facets measure the same plan seam and their endpoint elevations agree
+    within the allowed correction.  The consensus remains fail-closed: each
+    original boundary must lie on its own incident facet plane, corresponding
+    endpoints must be plan-coincident, and the averaged 3D endpoints must stay
+    within the configured correction distance of both measured boundaries and
+    both incident planes.
+    """
+
+    if len(uses) != 2:
+        raise ValueError("Exactly two edge uses are required.")
+    first, second = uses
+    same_order_distance = math.hypot(
+        first.start[0] - second.start[0],
+        first.start[1] - second.start[1],
+    ) + math.hypot(
+        first.end[0] - second.end[0],
+        first.end[1] - second.end[1],
+    )
+    reverse_order_distance = math.hypot(
+        first.start[0] - second.end[0],
+        first.start[1] - second.end[1],
+    ) + math.hypot(
+        first.end[0] - second.start[0],
+        first.end[1] - second.start[1],
+    )
+    second_reversed = reverse_order_distance < same_order_distance
+    second_start = second.end if second_reversed else second.start
+    second_end = second.start if second_reversed else second.end
+    endpoint_pairs = ((first.start, second_start), (first.end, second_end))
+    planar_displacements = [
+        math.hypot(a[0] - b[0], a[1] - b[1]) for a, b in endpoint_pairs
+    ]
+    if max(planar_displacements) > maximum_planar_displacement_meters:
+        raise UnreliableGeometryError(
+            "ROOF_PLANAR_CONSENSUS_DISPLACEMENT_EXCEEDED",
+            "Candidate roof boundaries are not plan-coincident enough to form a measured seam.",
+        )
+
+    def plane_distance(facet: Facet, point: tuple[float, float, float]) -> float:
+        return abs(_dot(facet.normal, _vector(facet.vertices[0], point)))
+
+    own_plane_residuals = [
+        plane_distance(use.facet, point)
+        for use in (first, second)
+        for point in (use.start, use.end)
+    ]
+    if max(own_plane_residuals) > 0.02:
+        raise UnreliableGeometryError(
+            "ROOF_BOUNDARY_OFF_INCIDENT_PLANE",
+            "A candidate boundary is inconsistent with its reconstructed incident facet plane.",
+        )
+
+    corrected_start = tuple(
+        (first.start[index] + second_start[index]) / 2 for index in range(3)
+    )
+    corrected_end = tuple(
+        (first.end[index] + second_end[index]) / 2 for index in range(3)
+    )
+    corrected_points = (corrected_start, corrected_end)
+    correction_distances = [
+        _distance(original, corrected)
+        for pair, corrected in zip(endpoint_pairs, corrected_points)
+        for original in pair
+    ]
+    incident_plane_distances = [
+        plane_distance(facet, point)
+        for facet in (first.facet, second.facet)
+        for point in corrected_points
+    ]
+    maximum_correction = max(correction_distances + incident_plane_distances)
+    if maximum_correction > maximum_3d_correction_meters:
+        raise UnreliableGeometryError(
+            "ROOF_PLANAR_CONSENSUS_CORRECTION_EXCEEDED",
+            "A plan-coincident seam exceeds the allowed 3D correction distance.",
+            details={
+                "maximumCorrectionMeters": _round(maximum_correction, 3),
+                "allowedCorrectionMeters": _round(
+                    maximum_3d_correction_meters, 3
+                ),
+            },
+        )
+    if _distance(corrected_start, corrected_end) <= 0.10:
+        raise UnreliableGeometryError(
+            "ROOF_PLANAR_CONSENSUS_DEGENERATE",
+            "A plan-coincident seam is too short to measure safely.",
+        )
+    corrected_second_start = corrected_end if second_reversed else corrected_start
+    corrected_second_end = corrected_start if second_reversed else corrected_end
+    corrected = [
+        EdgeUse(
+            first.facet,
+            first.start_id,
+            first.end_id,
+            corrected_start,
+            corrected_end,
+        ),
+        EdgeUse(
+            second.facet,
+            second.start_id,
+            second.end_id,
+            corrected_second_start,
+            corrected_second_end,
+        ),
+    ]
+    return corrected, {
+        "derivation": "PLAN_COINCIDENT_ENDPOINT_CONSENSUS",
+        "maximumCorrectionMeters": _round(maximum_correction, 3),
+        "allowedCorrectionMeters": _round(maximum_3d_correction_meters, 3),
+        "maximumPlanarDisplacementMeters": _round(
+            max(planar_displacements), 3
+        ),
+        "allowedPlanarDisplacementMeters": _round(
+            maximum_planar_displacement_meters, 3
+        ),
+        "incidentPlaneAngleDegrees": _round(
+            _normal_angle_degrees(first.facet, second.facet), 3
+        ),
+    }
+
+
 def _validated_plane_supported_overlap(
     first: EdgeUse,
     second: EdgeUse,
@@ -1397,6 +1527,7 @@ def extract_roof_geometry(
     rejected_noded_adjacencies: list[dict[str, Any]] = []
     unmatched_interior_boundaries: list[dict[str, Any]] = []
     vertical_level_transitions: list[dict[str, Any]] = []
+    planar_consensus_lengths: list[float] = []
     counters: dict[str, int] = defaultdict(int)
     edge_prefixes = {
         "rakes": "RA",
@@ -1589,37 +1720,69 @@ def extract_roof_geometry(
             )
             for use in uses
         ]
-        if any(
+        alignment_exceeded = any(
             alignment > shared_edge_maximum_direction_variance_degrees
             for alignment in boundary_alignments
-        ):
-            evidence = {
-                "derivation": "SUPPRESSED_PLANE_INTERSECTION_MISALIGNMENT",
-                "facetIds": [first.facet.facet_id, second.facet.facet_id],
-                "directionVarianceDegrees": _round(direction_variance, 3),
+        )
+        plane_intersection_error: UnreliableGeometryError | None = None
+        if alignment_exceeded:
+            plane_intersection_error = UnreliableGeometryError(
+                "ROOF_PLANE_INTERSECTION_MISALIGNED",
+                "The reconstructed boundary direction is not aligned with the incident plane intersection.",
+            )
+        else:
+            try:
+                uses, intersection_evidence = _validated_plane_intersection_edge(
+                    uses, plane_intersection_maximum_displacement_meters
+                )
+            except UnreliableGeometryError as error:
+                plane_intersection_error = error
+        if plane_intersection_error is not None:
+            try:
+                uses, intersection_evidence = _validated_planar_consensus_edge(
+                    uses,
+                    maximum_planar_displacement_meters=edge_node_tolerance_meters,
+                    maximum_3d_correction_meters=(
+                        plane_intersection_maximum_displacement_meters
+                    ),
+                )
+            except UnreliableGeometryError as consensus_error:
+                if not alignment_exceeded:
+                    raise plane_intersection_error
+                evidence = {
+                    "derivation": "SUPPRESSED_PLANE_INTERSECTION_MISALIGNMENT",
+                    "facetIds": [first.facet.facet_id, second.facet.facet_id],
+                    "directionVarianceDegrees": _round(direction_variance, 3),
+                    "originalBoundaryAlignmentDegrees": [
+                        _round(alignment, 3) for alignment in boundary_alignments
+                    ],
+                    "maximumDirectionVarianceDegrees": _round(
+                        shared_edge_maximum_direction_variance_degrees, 3
+                    ),
+                    "incidentPlaneAngleDegrees": _round(
+                        _normal_angle_degrees(first.facet, second.facet), 3
+                    ),
+                    "planarConsensusRejectionCode": consensus_error.code,
+                    "candidateLengthFeet": _round(
+                        (
+                            _edge_length(first.start, first.end)
+                            + _edge_length(second.start, second.end)
+                        )
+                        / 2
+                        * METERS_TO_FEET
+                    ),
+                }
+                rejected_noded_adjacencies.append(evidence)
+                continue
+            intersection_evidence["planeIntersectionFallback"] = {
+                "errorCode": plane_intersection_error.code,
                 "originalBoundaryAlignmentDegrees": [
                     _round(alignment, 3) for alignment in boundary_alignments
                 ],
-                "maximumDirectionVarianceDegrees": _round(
-                    shared_edge_maximum_direction_variance_degrees, 3
-                ),
-                "incidentPlaneAngleDegrees": _round(
-                    _normal_angle_degrees(first.facet, second.facet), 3
-                ),
-                "candidateLengthFeet": _round(
-                    (
-                        _edge_length(first.start, first.end)
-                        + _edge_length(second.start, second.end)
-                    )
-                    / 2
-                    * METERS_TO_FEET
-                ),
             }
-            rejected_noded_adjacencies.append(evidence)
-            continue
-        uses, intersection_evidence = _validated_plane_intersection_edge(
-            uses, plane_intersection_maximum_displacement_meters
-        )
+            planar_consensus_lengths.append(
+                _edge_length(uses[0].start, uses[0].end)
+            )
         first, second = uses
         intersection_evidence["adjacentFacetCount"] = 2
         if edge_key in repaired_edge_evidence:
@@ -1755,6 +1918,10 @@ def extract_roof_geometry(
                 sum(item["lengthFeet"] for item in vertical_level_transitions)
             ),
             "verticalLevelTransitions": vertical_level_transitions,
+            "planarConsensusSharedBoundaryCount": len(planar_consensus_lengths),
+            "planarConsensusSharedBoundaryFeet": _round(
+                sum(planar_consensus_lengths) * METERS_TO_FEET
+            ),
             "exteriorEdgeCount": sum(1 for uses in edge_uses.values() if len(uses) == 1),
             "sharedEdgeMaximumDirectionVarianceDegrees": _round(
                 shared_edge_maximum_direction_variance_degrees, 3
