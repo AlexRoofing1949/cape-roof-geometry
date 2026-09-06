@@ -1470,9 +1470,13 @@ def _quality_confidence(attributes: dict[str, Any], minimum_density: float, maxi
         raise UnreliableGeometryError("ROOFER_RECONSTRUCTION_UNUSABLE", "Roofer marked the source point cloud or reconstruction unusable.")
     if str(attributes.get("rf_extrusion_mode", "standard")) != "standard":
         raise UnreliableGeometryError("ROOFER_FALLBACK_MODEL", "Roofer used a fallback extrusion instead of verified LoD2.2 roof planes.")
-    density = float(attributes.get("rf_pt_density", 0) or 0)
-    nodata = float(attributes.get("rf_nodata_frac", 1) or 1)
-    rmse = float(attributes.get("rf_rmse_lod22", math.inf) or math.inf)
+    def metric(name: str, missing: float) -> float:
+        value = attributes.get(name)
+        return float(missing if value is None or value == "" else value)
+
+    density = metric("rf_pt_density", 0)
+    nodata = metric("rf_nodata_frac", 1)
+    rmse = metric("rf_rmse_lod22", math.inf)
     if density < minimum_density:
         raise UnreliableGeometryError(
             "LIDAR_DENSITY_TOO_LOW",

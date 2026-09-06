@@ -1255,6 +1255,19 @@ class CityJsonGeometryTests(unittest.TestCase):
             {"noDataFraction": 0.25, "maximumNoDataFraction": 0.10},
         )
 
+    def test_zero_nodata_and_zero_rmse_are_preserved_as_perfect_metrics(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        attributes = feature["CityObjects"]["TEST-GABLE"]["attributes"]
+        attributes["rf_nodata_frac"] = 0
+        attributes["rf_rmse_lod22"] = 0
+
+        result = extract_roof_geometry(feature, transform)
+
+        self.assertEqual(result["quality"]["nodataFraction"], 0)
+        self.assertEqual(result["quality"]["rmseMeters"], 0)
+        self.assertEqual(result["quality"]["components"]["coverage"], 1)
+        self.assertEqual(result["quality"]["components"]["rmse"], 1)
+
     def test_roofer_multisurface_semantics_are_measured(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         geometry = feature["CityObjects"]["TEST-GABLE-0"]["geometry"][0]
