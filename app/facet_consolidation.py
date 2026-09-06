@@ -984,7 +984,7 @@ def _partition_roofer_facet(
     # ridge, hip, or valley.  Optimize labels across the complete arrangement
     # with a hard geometric compatibility penalty, then reject any unresolved
     # seam before CityJSON edge classification.
-    adjacency: list[tuple[int, int, BaseGeometry, float]] = []
+    adjacency: list[tuple[int, int, tuple[float, float, float, float, float]]] = []
     for left in range(len(cell_assignments)):
         left_cell = cell_assignments[left][0]
         for right in range(left + 1, len(cell_assignments)):
@@ -992,10 +992,35 @@ def _partition_roofer_facet(
             shared = left_cell.boundary.intersection(right_cell.boundary)
             shared_length = float(shared.length)
             if shared_length > 1e-6:
-                adjacency.append((left, right, shared, shared_length))
+                shared_lines = _line_parts(shared)
+                if not shared_lines:
+                    continue
+                longest = max(shared_lines, key=lambda line: float(line.length))
+                start, end = longest.coords[0], longest.coords[-1]
+                edge_x = float(end[0] - start[0])
+                edge_y = float(end[1] - start[1])
+                edge_length = math.hypot(edge_x, edge_y)
+                if edge_length <= 1e-8:
+                    continue
+                midpoint = longest.interpolate(0.5, normalized=True)
+                adjacency.append(
+                    (
+                        left,
+                        right,
+                        (
+                            shared_length,
+                            edge_x / edge_length,
+                            edge_y / edge_length,
+                            float(midpoint.x),
+                            float(midpoint.y),
+                        ),
+                    )
+                )
 
     def labels_compatible(
-        left_label: int, right_label: int, shared: BaseGeometry
+        left_label: int,
+        right_label: int,
+        edge: tuple[float, float, float, float, float],
     ) -> bool:
         if left_label == right_label:
             return True
@@ -1009,15 +1034,7 @@ def _partition_roofer_facet(
         )
         if horizontal_length <= 1e-8:
             return False
-        shared_lines = _line_parts(shared)
-        if not shared_lines:
-            return False
-        longest = max(shared_lines, key=lambda line: float(line.length))
-        start, end = longest.coords[0], longest.coords[-1]
-        edge_x, edge_y = float(end[0] - start[0]), float(end[1] - start[1])
-        edge_length = math.hypot(edge_x, edge_y)
-        if edge_length <= 1e-8:
-            return False
+        _, edge_x, edge_y, midpoint_x, midpoint_y = edge
         alignment = math.degrees(
             math.acos(
                 min(
@@ -1027,26 +1044,27 @@ def _partition_roofer_facet(
                             edge_x * float(intersection_direction[0])
                             + edge_y * float(intersection_direction[1])
                         )
-                        / (edge_length * horizontal_length)
+                        / horizontal_length
                     ),
                 )
             )
         )
-        midpoint = longest.interpolate(0.5, normalized=True)
         height_delta = abs(
-            _plane_height(left_plane, midpoint.x, midpoint.y)
-            - _plane_height(right_plane, midpoint.x, midpoint.y)
+            _plane_height(left_plane, midpoint_x, midpoint_y)
+            - _plane_height(right_plane, midpoint_x, midpoint_y)
         )
         return alignment <= 5.0 and height_delta <= 0.10
 
     initial_labels = [label for _, label in cell_assignments]
     labels = list(initial_labels)
-    incident: dict[int, list[tuple[int, BaseGeometry, float]]] = {
+    incident: dict[
+        int, list[tuple[int, tuple[float, float, float, float, float]]]
+    ] = {
         index: [] for index in range(len(cell_assignments))
     }
-    for left, right, shared, shared_length in adjacency:
-        incident[left].append((right, shared, shared_length))
-        incident[right].append((left, shared, shared_length))
+    for left, right, edge in adjacency:
+        incident[left].append((right, edge))
+        incident[right].append((left, edge))
     order = sorted(
         range(len(cell_assignments)),
         key=lambda index: (
@@ -1062,9 +1080,9 @@ def _partition_roofer_facet(
             scored_labels = []
             for label, unary_cost in cell_label_costs[cell_index].items():
                 conflict_cost = 0.0
-                for neighbour, shared, shared_length in incident[cell_index]:
-                    if not labels_compatible(label, labels[neighbour], shared):
-                        conflict_cost += 1000000.0 + shared_length * 10000.0
+                for neighbour, edge in incident[cell_index]:
+                    if not labels_compatible(label, labels[neighbour], edge):
+                        conflict_cost += 1000000.0 + edge[0] * 10000.0
                 scored_labels.append((unary_cost + conflict_cost, label))
             winner = min(scored_labels)[1]
             if winner != labels[cell_index]:
@@ -1073,13 +1091,13 @@ def _partition_roofer_facet(
         if not changed:
             break
     unresolved = []
-    for left, right, shared, shared_length in adjacency:
-        if not labels_compatible(labels[left], labels[right], shared):
+    for left, right, edge in adjacency:
+        if not labels_compatible(labels[left], labels[right], edge):
             unresolved.append(
                 {
                     "leftCell": left,
                     "rightCell": right,
-                    "lengthMeters": round(shared_length, 6),
+                    "lengthMeters": round(edge[0], 6),
                 }
             )
     if unresolved:
