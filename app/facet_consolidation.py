@@ -2050,8 +2050,14 @@ def consolidate_roofer_feature(
                 "lidarReferenceDate": temporal_audit["lidarReferenceDate"],
                 "verticalDatumNormalization": "NOT_APPLIED_TO_NEWER_LIDAR",
             }
-    active_matches = list(
-        (solar_audit.get("postDsmRefinement") or solar_audit).get("matches", [])
+    active_matches = (
+        list(
+            (solar_audit.get("postDsmRefinement") or solar_audit).get(
+                "matches", []
+            )
+        )
+        if enforce_solar
+        else []
     )
     plane_evidence: dict[int, dict[str, float | None]] = {}
     if len(active_matches) == len(planes):
