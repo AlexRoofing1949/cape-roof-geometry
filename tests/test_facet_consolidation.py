@@ -60,6 +60,11 @@ class FacetConsolidationTests(unittest.TestCase):
             centroid=(2.5, 2.5, 0.5),
             rmse_meters=0.0,
             support_hull=Polygon([(1, 1), (4, 1), (4, 4), (1, 4)]),
+            support_coordinates=tuple(
+                (x, y, x * 0.2)
+                for x in (1.5, 2.0, 2.5, 3.0, 3.5)
+                for y in (1.5, 2.5, 3.5)
+            ),
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "dsm.tif"
@@ -101,6 +106,10 @@ class FacetConsolidationTests(unittest.TestCase):
         self.assertEqual(
             [tuple(round(value, 6) for value in plane.normal) for plane in expected],
             [tuple(round(value, 6) for value in plane.normal) for plane in actual],
+        )
+        self.assertEqual(
+            [plane.support_coordinates for plane in expected],
+            [plane.support_coordinates for plane in actual],
         )
         self.assertEqual(expected_audit["consolidatedPlaneCount"], 2)
         self.assertEqual(actual_audit["consolidatedPlaneCount"], 2)

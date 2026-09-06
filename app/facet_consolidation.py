@@ -33,6 +33,10 @@ class ConsolidatedPlane:
     centroid: tuple[float, float, float]
     rmse_meters: float
     support_hull: BaseGeometry
+    # A bounded, deterministic sample of the actual LiDAR returns supporting
+    # this plane. DSM reconciliation must use interior measured returns, not
+    # hull vertices that commonly land on mixed roof/wall/vegetation pixels.
+    support_coordinates: tuple[tuple[float, float, float], ...] = ()
 
     @property
     def pitch_degrees(self) -> float:
@@ -105,6 +109,22 @@ def _support_hull(points: np.ndarray, indexes: np.ndarray) -> BaseGeometry:
     if hull.geom_type != "Polygon" or not hull.is_valid or hull.area <= 0.05:
         hull = cloud.convex_hull
     return hull.simplify(0.02, preserve_topology=True)
+
+
+def _support_coordinate_sample(
+    points: np.ndarray, indexes: np.ndarray, *, maximum: int = 96
+) -> tuple[tuple[float, float, float], ...]:
+    """Return an order-independent, spatially distributed support sample."""
+
+    selected = np.asarray(points[indexes], dtype=float)
+    if not len(selected):
+        return ()
+    order = np.lexsort((selected[:, 2], selected[:, 1], selected[:, 0]))
+    selected = selected[order]
+    if len(selected) > maximum:
+        offsets = np.linspace(0, len(selected) - 1, maximum, dtype=np.int32)
+        selected = selected[offsets]
+    return tuple(tuple(float(value) for value in row) for row in selected)
 
 
 def _normal_angle_degrees(left: np.ndarray, right: np.ndarray) -> float:
@@ -271,6 +291,7 @@ def discover_consolidated_planes(
                     centroid=tuple(float(value) for value in centroid),
                     rmse_meters=rmse,
                     support_hull=hull,
+                    support_coordinates=_support_coordinate_sample(cropped, indexes),
                 )
             )
 
@@ -319,6 +340,9 @@ def discover_consolidated_planes(
                     centroid=tuple(float(value) for value in centroid),
                     rmse_meters=rmse,
                     support_hull=hull,
+                    support_coordinates=_support_coordinate_sample(
+                        cropped, combined_indexes
+                    ),
                 )
                 key = (
                     round(angle, 9),
@@ -351,33 +375,69 @@ def discover_consolidated_planes(
     }
     absorb_by_group: dict[int, list[int]] = {}
     absorb_residual = max(maximum_residual * 2.0, 0.10)
+    assignment_gap = float(
+        getattr(settings, "facet_consolidation_assignment_gap_meters", 1.0)
+    )
+    absorb_without_normal_by_group: dict[int, set[int]] = {}
+    absorbed_without_normal_support = 0
     for point_index in range(len(cropped)):
-        if point_index in assigned_indexes or not valid_normals[point_index]:
+        if point_index in assigned_indexes:
             continue
         point = cropped[point_index]
         point_xy = Point(float(point[0]), float(point[1]))
         rankings = []
         for group_index, group in enumerate(groups):
             normal = np.asarray(group.normal)
-            angle = _normal_angle_degrees(normals[point_index], normal)
-            if angle > maximum_normal_angle * 2.0:
-                continue
+            angle = (
+                _normal_angle_degrees(normals[point_index], normal)
+                if valid_normals[point_index]
+                else None
+            )
             residual = abs(float((point - np.asarray(group.centroid)) @ normal))
             if residual > absorb_residual:
                 continue
             hull_distance = float(group.support_hull.distance(point_xy))
             if hull_distance > merge_gap:
                 continue
+            normal_supported = (
+                angle is not None and angle <= maximum_normal_angle * 2.0
+            )
+            # At roof edges and in sparse areas an Open3D local normal often
+            # blends two planes. A return may still strengthen a plane when
+            # its elevation residual is tight and it is adjacent to existing
+            # support. This preserves the coverage gate while recovering
+            # independently corroborated measured returns.
+            if not normal_supported and (
+                residual > max(maximum_residual * 1.5, 0.08)
+                or hull_distance > assignment_gap
+            ):
+                continue
             rankings.append(
                 (
                     round(residual, 9),
-                    round(angle, 9),
+                    0 if normal_supported else 1,
+                    round(angle if angle is not None else 180.0, 9),
                     round(hull_distance, 9),
                     group_index,
                 )
             )
         if rankings:
-            absorb_by_group.setdefault(min(rankings)[-1], []).append(point_index)
+            rankings.sort()
+            winner = rankings[0]
+            # Without a trustworthy local normal, reject an assignment that
+            # is geometrically ambiguous between two nearly equal planes.
+            if winner[1] == 1 and len(rankings) > 1:
+                runner_up = rankings[1]
+                if (
+                    runner_up[0] - winner[0] < 0.02
+                    and runner_up[3] - winner[3] < 0.10
+                ):
+                    continue
+            absorb_by_group.setdefault(winner[-1], []).append(point_index)
+            if winner[1] == 1:
+                absorb_without_normal_by_group.setdefault(winner[-1], set()).add(
+                    point_index
+                )
     absorbed_point_count = 0
     strengthened_groups: list[ConsolidatedPlane] = []
     for group_index, group in enumerate(groups):
@@ -388,6 +448,9 @@ def discover_consolidated_planes(
         normal, centroid, rmse = _fit_plane(cropped, combined_indexes)
         if additions and rmse <= maximum_fit_rmse:
             absorbed_point_count += len(additions)
+            absorbed_without_normal_support += len(
+                absorb_without_normal_by_group.get(group_index, set())
+            )
             strengthened_groups.append(
                 ConsolidatedPlane(
                     point_indexes=tuple(int(value) for value in combined_indexes),
@@ -395,6 +458,9 @@ def discover_consolidated_planes(
                     centroid=tuple(float(value) for value in centroid),
                     rmse_meters=rmse,
                     support_hull=_support_hull(cropped, combined_indexes),
+                    support_coordinates=_support_coordinate_sample(
+                        cropped, combined_indexes
+                    ),
                 )
             )
         else:
@@ -438,6 +504,7 @@ def discover_consolidated_planes(
         "consolidatedPlaneCount": len(groups),
         "mergeCount": merge_count,
         "absorbedSmallFragmentPointCount": absorbed_point_count,
+        "absorbedPlaneSupportedPointCount": absorbed_without_normal_support,
         "splitNonplanarComponentCount": split_nonplanar,
         "rejectedNonplanarComponentCount": rejected_nonplanar,
         "supportFraction": round(support_fraction, 4),
@@ -922,6 +989,7 @@ def validate_solar_dsm_support(
         source.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         target.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
         transformer = osr.CoordinateTransformation(source, target)
+        reverse_transformer = osr.CoordinateTransformation(target, source)
         band = dataset.GetRasterBand(1)
         nodata = band.GetNoDataValue()
     except (AttributeError, RuntimeError, TypeError, ValueError) as error:
@@ -930,27 +998,49 @@ def validate_solar_dsm_support(
             "The Google Solar DSM georeference could not be reconciled with LiDAR.",
         ) from error
 
-    proposed: list[tuple[int, float, float, float]] = []
+    proposed: list[tuple[int, float, float]] = []
     for plane_index, plane in enumerate(planes, start=1):
-        coordinates = list(getattr(plane.support_hull.exterior, "coords", []))[:-1]
-        if coordinates:
-            stride = max(1, math.ceil(len(coordinates) / 12))
-            coordinates = coordinates[::stride][:12]
-        center = plane.support_hull.representative_point()
-        coordinates.append((center.x, center.y))
-        for x, y in coordinates:
-            proposed.append(
-                (plane_index, float(x), float(y), _plane_height(plane, float(x), float(y)))
+        coordinates = [(row[0], row[1]) for row in plane.support_coordinates]
+        # Prefer actual support returns away from mixed pixels at eaves,
+        # rakes, ridges, and valleys. Progressively relax the interior margin
+        # only for physically small facets.
+        for margin in (0.25, 0.10, 0.0):
+            interior = (
+                plane.support_hull.buffer(-margin)
+                if margin
+                else plane.support_hull
             )
+            if interior.is_empty:
+                continue
+            filtered = [
+                (x, y)
+                for x, y in coordinates
+                if interior.covers(Point(float(x), float(y)))
+            ]
+            if len(filtered) >= 5 or (margin == 0.0 and filtered):
+                coordinates = filtered
+                break
+        if not coordinates:
+            center = plane.support_hull.representative_point()
+            coordinates = [(center.x, center.y)]
+        for x, y in coordinates:
+            proposed.append((plane_index, float(x), float(y)))
 
     samples: list[tuple[int, float]] = []
     per_plane_counts: dict[int, int] = {}
-    for plane_index, x, y, lidar_height in proposed:
+    proposed_pixels: set[tuple[int, int, int]] = set()
+    sampled_pixels: set[tuple[int, int, int]] = set()
+    geotransform = dataset.GetGeoTransform()
+    for plane_index, x, y in proposed:
         try:
             target_x, target_y, _ = transformer.TransformPoint(x, y)
             pixel_x, pixel_y = gdal.ApplyGeoTransform(inverse, target_x, target_y)
             column, row = int(math.floor(pixel_x)), int(math.floor(pixel_y))
+            pixel_key = (plane_index, column, row)
+            proposed_pixels.add(pixel_key)
             if not (0 <= column < dataset.RasterXSize and 0 <= row < dataset.RasterYSize):
+                continue
+            if pixel_key in sampled_pixels:
                 continue
             value = band.ReadAsArray(column, row, 1, 1)
             if value is None or value.size != 1:
@@ -960,17 +1050,37 @@ def validate_solar_dsm_support(
                 continue
             if nodata is not None and math.isclose(dsm_height, float(nodata), abs_tol=1e-6):
                 continue
+            pixel_center_x, pixel_center_y = gdal.ApplyGeoTransform(
+                geotransform, column + 0.5, row + 0.5
+            )
+            lidar_x, lidar_y, _ = reverse_transformer.TransformPoint(
+                pixel_center_x, pixel_center_y
+            )
+            lidar_height = _plane_height(
+                planes[plane_index - 1], float(lidar_x), float(lidar_y)
+            )
         except (RuntimeError, TypeError, ValueError, OverflowError):
             continue
+        sampled_pixels.add(pixel_key)
         samples.append((plane_index, dsm_height - lidar_height))
         per_plane_counts[plane_index] = per_plane_counts.get(plane_index, 0) + 1
 
-    coverage = len(samples) / max(len(proposed), 1)
+    coverage = len(sampled_pixels) / max(len(proposed_pixels), 1)
     minimum_coverage = float(
         getattr(settings, "solar_dsm_minimum_sample_coverage", 0.80)
     )
     supported_planes = len(per_plane_counts)
-    if coverage < minimum_coverage or supported_planes != len(planes):
+    minimum_facet_samples = 3
+    under_sampled_planes = [
+        plane_index
+        for plane_index in range(1, len(planes) + 1)
+        if per_plane_counts.get(plane_index, 0) < minimum_facet_samples
+    ]
+    if (
+        coverage < minimum_coverage
+        or supported_planes != len(planes)
+        or under_sampled_planes
+    ):
         raise UnreliableGeometryError(
             "SOLAR_DSM_COVERAGE_INSUFFICIENT",
             "The Google Solar DSM does not cover every consolidated facet.",
@@ -979,6 +1089,8 @@ def validate_solar_dsm_support(
                 "minimumSampleCoverage": minimum_coverage,
                 "supportedFacetCount": supported_planes,
                 "facetCount": len(planes),
+                "minimumSamplesPerFacet": minimum_facet_samples,
+                "underSampledFacetCount": len(under_sampled_planes),
             },
         )
     offsets = np.asarray([offset for _, offset in samples], dtype=float)
@@ -986,14 +1098,38 @@ def validate_solar_dsm_support(
     facet_offsets: dict[int, float] = {}
     facet_rmses: dict[int, float] = {}
     centered_values = []
+    rejected_outlier_count = 0
+    maximum_outlier_fraction = 0.20
     for plane_index in sorted(per_plane_counts):
         plane_offsets = np.asarray(
             [offset for sample_plane, offset in samples if sample_plane == plane_index],
             dtype=float,
         )
         facet_offset = float(np.median(plane_offsets))
-        facet_offsets[plane_index] = facet_offset
         facet_centered = plane_offsets - facet_offset
+        median_absolute_deviation = float(np.median(np.abs(facet_centered)))
+        robust_limit = max(1.50, 3.5 * 1.4826 * median_absolute_deviation)
+        inlier_mask = np.abs(facet_centered) <= robust_limit
+        minimum_inliers = max(
+            minimum_facet_samples,
+            math.ceil((1.0 - maximum_outlier_fraction) * len(plane_offsets)),
+        )
+        if int(np.count_nonzero(inlier_mask)) < minimum_inliers:
+            raise UnreliableGeometryError(
+                "SOLAR_DSM_SHAPE_CONFLICT",
+                "Google Solar DSM elevations disagree with the consolidated LiDAR roof shape.",
+                details={
+                    "facetOrdinal": plane_index,
+                    "sampleCount": int(len(plane_offsets)),
+                    "inlierSampleCount": int(np.count_nonzero(inlier_mask)),
+                    "maximumOutlierFraction": maximum_outlier_fraction,
+                },
+            )
+        inlier_offsets = plane_offsets[inlier_mask]
+        facet_offset = float(np.median(inlier_offsets))
+        facet_centered = inlier_offsets - facet_offset
+        facet_offsets[plane_index] = facet_offset
+        rejected_outlier_count += int(len(plane_offsets) - len(inlier_offsets))
         facet_rmses[plane_index] = float(
             np.sqrt(np.mean(np.square(facet_centered)))
         )
@@ -1013,6 +1149,7 @@ def validate_solar_dsm_support(
                 "maximumFacetCenteredRmseMeters": round(maximum_facet_rmse, 4),
                 "maximumCenteredRmseMeters": maximum_rmse,
                 "sampleCount": len(samples),
+                "rejectedOutlierCount": rejected_outlier_count,
             },
         )
     facet_offset_values = list(facet_offsets.values())
@@ -1039,6 +1176,8 @@ def validate_solar_dsm_support(
         "maximumFacetCenteredRmseMeters": round(maximum_facet_rmse, 4),
         "facetOffsetRangeMeters": round(facet_offset_range, 4),
         "verticalDatumOffsetMeters": round(vertical_offset, 4),
+        "rejectedOutlierCount": rejected_outlier_count,
+        "maximumOutlierFraction": maximum_outlier_fraction,
     }
 
 
