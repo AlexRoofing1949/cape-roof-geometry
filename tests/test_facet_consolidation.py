@@ -105,6 +105,32 @@ class FacetConsolidationTests(unittest.TestCase):
         self.assertEqual(expected_audit["consolidatedPlaneCount"], 2)
         self.assertEqual(actual_audit["consolidatedPlaneCount"], 2)
 
+    def test_small_coplanar_fragment_strengthens_existing_facet_support(self):
+        points = _gable_points()
+        fragment = np.asarray(
+            [
+                (5.4 + column * 0.2, 0.2 + row * 0.2, (0.2 + row * 0.2) * 0.5)
+                for column in range(2)
+                for row in range(5)
+            ],
+            dtype=float,
+        )
+        planes, audit = discover_consolidated_planes(
+            np.vstack((points, fragment)),
+            Polygon([(0, 0), (6, 0), (6, 4), (0, 4)]),
+            _settings(),
+        )
+        self.assertEqual(len(planes), 2)
+        self.assertGreater(audit["absorbedSmallFragmentPointCount"], 0)
+        self.assertGreater(
+            sum(
+                point_index >= len(points)
+                for plane in planes
+                for point_index in plane.point_indexes
+            ),
+            0,
+        )
+
     def test_plane_intersection_partitions_one_roofer_face_without_gaps(self):
         first = ConsolidatedPlane(
             point_indexes=tuple(range(100)),

@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 from shapely import concave_hull
 from shapely import contains_xy
-from shapely.geometry import LineString, MultiPoint, Polygon
+from shapely.geometry import LineString, MultiPoint, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import split, unary_union
 
@@ -342,6 +342,72 @@ def discover_consolidated_planes(
             -len(plane.point_indexes),
         )
     )
+    # Absorb points left in small connected fragments only when an existing
+    # consolidated plane independently explains their normal, elevation, and
+    # spatial position.  These returns strengthen support coverage without
+    # creating extra facets from roof-edge noise or lowering the coverage gate.
+    assigned_indexes = {
+        point_index for group in groups for point_index in group.point_indexes
+    }
+    absorb_by_group: dict[int, list[int]] = {}
+    absorb_residual = max(maximum_residual * 2.0, 0.10)
+    for point_index in range(len(cropped)):
+        if point_index in assigned_indexes or not valid_normals[point_index]:
+            continue
+        point = cropped[point_index]
+        point_xy = Point(float(point[0]), float(point[1]))
+        rankings = []
+        for group_index, group in enumerate(groups):
+            normal = np.asarray(group.normal)
+            angle = _normal_angle_degrees(normals[point_index], normal)
+            if angle > maximum_normal_angle * 2.0:
+                continue
+            residual = abs(float((point - np.asarray(group.centroid)) @ normal))
+            if residual > absorb_residual:
+                continue
+            hull_distance = float(group.support_hull.distance(point_xy))
+            if hull_distance > merge_gap:
+                continue
+            rankings.append(
+                (
+                    round(residual, 9),
+                    round(angle, 9),
+                    round(hull_distance, 9),
+                    group_index,
+                )
+            )
+        if rankings:
+            absorb_by_group.setdefault(min(rankings)[-1], []).append(point_index)
+    absorbed_point_count = 0
+    strengthened_groups: list[ConsolidatedPlane] = []
+    for group_index, group in enumerate(groups):
+        additions = absorb_by_group.get(group_index, [])
+        combined_indexes = np.asarray(
+            sorted(set(group.point_indexes) | set(additions)), dtype=np.int32
+        )
+        normal, centroid, rmse = _fit_plane(cropped, combined_indexes)
+        if additions and rmse <= maximum_fit_rmse:
+            absorbed_point_count += len(additions)
+            strengthened_groups.append(
+                ConsolidatedPlane(
+                    point_indexes=tuple(int(value) for value in combined_indexes),
+                    normal=tuple(float(value) for value in normal),
+                    centroid=tuple(float(value) for value in centroid),
+                    rmse_meters=rmse,
+                    support_hull=_support_hull(cropped, combined_indexes),
+                )
+            )
+        else:
+            strengthened_groups.append(group)
+    groups = strengthened_groups
+
+    groups.sort(
+        key=lambda plane: (
+            tuple(round(value, 6) for value in plane.centroid),
+            tuple(round(value, 6) for value in plane.normal),
+            -len(plane.point_indexes),
+        )
+    )
     supported_points = sum(len(plane.point_indexes) for plane in groups)
     minimum_support_fraction = float(
         getattr(settings, "facet_consolidation_minimum_support_fraction", 0.75)
@@ -371,6 +437,7 @@ def discover_consolidated_planes(
         ),
         "consolidatedPlaneCount": len(groups),
         "mergeCount": merge_count,
+        "absorbedSmallFragmentPointCount": absorbed_point_count,
         "splitNonplanarComponentCount": split_nonplanar,
         "rejectedNonplanarComponentCount": rejected_nonplanar,
         "supportFraction": round(support_fraction, 4),
@@ -916,19 +983,51 @@ def validate_solar_dsm_support(
         )
     offsets = np.asarray([offset for _, offset in samples], dtype=float)
     vertical_offset = float(np.median(offsets))
-    centered = offsets - vertical_offset
+    facet_offsets: dict[int, float] = {}
+    facet_rmses: dict[int, float] = {}
+    centered_values = []
+    for plane_index in sorted(per_plane_counts):
+        plane_offsets = np.asarray(
+            [offset for sample_plane, offset in samples if sample_plane == plane_index],
+            dtype=float,
+        )
+        facet_offset = float(np.median(plane_offsets))
+        facet_offsets[plane_index] = facet_offset
+        facet_centered = plane_offsets - facet_offset
+        facet_rmses[plane_index] = float(
+            np.sqrt(np.mean(np.square(facet_centered)))
+        )
+        centered_values.extend(float(value) for value in facet_centered)
+    centered = np.asarray(centered_values, dtype=float)
     rmse = float(np.sqrt(np.mean(np.square(centered))))
+    maximum_facet_rmse = max(facet_rmses.values())
     maximum_rmse = float(
         getattr(settings, "solar_dsm_maximum_centered_rmse_meters", 0.75)
     )
-    if rmse > maximum_rmse:
+    if rmse > maximum_rmse or maximum_facet_rmse > maximum_rmse:
         raise UnreliableGeometryError(
             "SOLAR_DSM_SHAPE_CONFLICT",
             "Google Solar DSM elevations disagree with the consolidated LiDAR roof shape.",
             details={
                 "centeredRmseMeters": round(rmse, 4),
+                "maximumFacetCenteredRmseMeters": round(maximum_facet_rmse, 4),
                 "maximumCenteredRmseMeters": maximum_rmse,
                 "sampleCount": len(samples),
+            },
+        )
+    facet_offset_values = list(facet_offsets.values())
+    facet_offset_range = max(facet_offset_values) - min(facet_offset_values)
+    maximum_facet_offset_range = float(
+        getattr(settings, "solar_dsm_maximum_facet_offset_range_meters", 1.50)
+    )
+    if facet_offset_range > maximum_facet_offset_range:
+        raise UnreliableGeometryError(
+            "SOLAR_DSM_FACET_OFFSET_CONFLICT",
+            "Google Solar DSM facet elevations are inconsistent with the LiDAR roof structure.",
+            details={
+                "facetOffsetRangeMeters": round(facet_offset_range, 4),
+                "maximumFacetOffsetRangeMeters": maximum_facet_offset_range,
+                "facetCount": len(facet_offsets),
             },
         )
     return {
@@ -937,6 +1036,8 @@ def validate_solar_dsm_support(
         "sampleCoverage": round(coverage, 4),
         "supportedFacetCount": supported_planes,
         "centeredRmseMeters": round(rmse, 4),
+        "maximumFacetCenteredRmseMeters": round(maximum_facet_rmse, 4),
+        "facetOffsetRangeMeters": round(facet_offset_range, 4),
         "verticalDatumOffsetMeters": round(vertical_offset, 4),
     }
 

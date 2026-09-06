@@ -63,6 +63,7 @@ class Settings:
     solar_dsm_maximum_bytes: int
     solar_dsm_minimum_sample_coverage: float
     solar_dsm_maximum_centered_rmse_meters: float
+    solar_dsm_maximum_facet_offset_range_meters: float
     roof_edge_node_tolerance_meters: float
     roof_edge_vertical_node_tolerance_meters: float
     roof_plane_intersection_maximum_displacement_meters: float
@@ -193,6 +194,9 @@ class Settings:
             ),
             solar_dsm_maximum_centered_rmse_meters=_float(
                 "SOLAR_DSM_MAXIMUM_CENTERED_RMSE_METERS", 0.75
+            ),
+            solar_dsm_maximum_facet_offset_range_meters=_float(
+                "SOLAR_DSM_MAXIMUM_FACET_OFFSET_RANGE_METERS", 1.50
             ),
             roof_edge_node_tolerance_meters=_float(
                 "ROOF_EDGE_NODE_TOLERANCE_METERS", 0.10
@@ -390,6 +394,7 @@ class Settings:
             and 1_000_000 <= self.solar_dsm_maximum_bytes <= 100_000_000
             and 0.50 <= self.solar_dsm_minimum_sample_coverage <= 1.0
             and 0.10 <= self.solar_dsm_maximum_centered_rmse_meters <= 1.0
+            and 0.25 <= self.solar_dsm_maximum_facet_offset_range_meters <= 3.0
             and 0.02 <= self.roof_edge_node_tolerance_meters <= 0.15
             and 0.10 <= self.roof_edge_vertical_node_tolerance_meters <= 0.40
             and 0.10
