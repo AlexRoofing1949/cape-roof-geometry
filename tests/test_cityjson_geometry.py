@@ -115,6 +115,65 @@ class CityJsonGeometryTests(unittest.TestCase):
             "LOCAL_ROOFPRINT_TANGENT",
         )
 
+    def test_horizontal_low_side_is_eave_even_when_roofprint_tangent_points_downslope(self):
+        root_half = math.sqrt(0.5)
+        vertices = (
+            (0.0, 0.0, 1.0),
+            (0.0, 2.0, 1.0),
+            (2.0, 2.0, 3.0),
+        )
+        facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=vertices,
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=45.0,
+            azimuth_degrees=180.0,
+            centroid=tuple(
+                sum(point[axis] for point in vertices) / len(vertices)
+                for axis in range(3)
+            ),
+            normal=(0.0, -root_half, root_half),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        use = EdgeUse(facet, 0, 1, vertices[0], vertices[1])
+        attributes = {
+            "rf_success": True,
+            "rf_pointcloud_unusable": False,
+            "rf_extrusion_mode": "standard",
+            "rf_pt_density": 15,
+            "rf_nodata_frac": 0.01,
+            "rf_rmse_lod22": 0.1,
+        }
+        boundary = LineString([(0.0, -1.0), (0.0, 3.0)])
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=([facet], attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"horizontal-low": [use]},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"horizontal-low": [use]}, {}, {}),
+            ),
+        ):
+            result = extract_roof_geometry(
+                {}, None, roofprint_boundary=boundary
+            )
+
+        self.assertEqual(result["rakesFeet"], 0.0)
+        self.assertGreater(result["eavesFeet"], 0.0)
+        self.assertEqual(
+            result["eaves"][0]["classificationEvidence"]["classificationRule"],
+            "HORIZONTAL_LOW_SIDE_BOUNDARY",
+        )
+
     @staticmethod
     def _non_manifold_fixture(edge_length_meters):
         root_half = math.sqrt(0.5)
@@ -1035,9 +1094,16 @@ class CityJsonGeometryTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
+                edge["classificationEvidence"]["classificationRule"]
+                == "HORIZONTAL_LOW_SIDE_BOUNDARY"
+                for edge in result["eaves"]
+            )
+        )
+        self.assertTrue(
+            all(
                 edge["classificationEvidence"]["edgeDirectionSource"]
                 == "LOCAL_ROOFPRINT_TANGENT"
-                for edge in result["eaves"] + result["rakes"]
+                for edge in result["rakes"]
             )
         )
 

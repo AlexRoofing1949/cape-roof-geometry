@@ -1653,6 +1653,34 @@ def extract_roof_geometry(
                 ),
             }
 
+        projected_edge_length = _projected_edge_length(use.start, use.end)
+        edge_slope_degrees = math.degrees(
+            math.atan2(elevation_change, max(projected_edge_length, 1e-9))
+        )
+        if (
+            elevation_change <= horizontal_edge_tolerance_meters
+            and edge_slope_degrees <= flat_pitch_degrees
+        ):
+            # A corroborated horizontal low-side boundary is an eave even when
+            # a raster roofprint's local tangent happens to point downslope.
+            # The high-side horizontal case was separated above; allowing the
+            # tangent test to relabel the remaining horizontal segment as a
+            # rake creates physically impossible rake fragments.
+            add_edge(
+                "eaves",
+                [use],
+                {
+                    **(boundary_evidence or {}),
+                    "classificationRule": "HORIZONTAL_LOW_SIDE_BOUNDARY",
+                    "edgeDirectionSource": "RECONSTRUCTED_EDGE_SEGMENT",
+                    "edgeSlopeDegrees": _round(edge_slope_degrees, 3),
+                    "maximumHorizontalEdgeSlopeDegrees": _round(
+                        flat_pitch_degrees, 3
+                    ),
+                },
+            )
+            return
+
         tangent_direction = None
         if roofprint_boundary is not None:
             midpoint = Point(
