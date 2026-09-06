@@ -780,6 +780,10 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                         settings,
                         solar_dsm_path=footprint.solar_dsm_path,
                         projected_crs=f"EPSG:{target_epsg}",
+                        solar_imagery_date=request.solarReference.imageryDate,
+                        lidar_reference_date=(
+                            lidar.tile_acquisition_date or lidar.acquired_end
+                        ),
                     )
                 geometry = extract_roof_geometry(
                     feature,

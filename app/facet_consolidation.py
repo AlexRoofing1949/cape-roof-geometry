@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import importlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,7 @@ from shapely import concave_hull
 from shapely import contains_xy
 from shapely.geometry import LineString, MultiPoint, Point, Polygon
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import split, unary_union
+from shapely.ops import polygonize, split, unary_union
 
 from .errors import UnreliableGeometryError
 
@@ -37,6 +38,7 @@ class ConsolidatedPlane:
     # this plane. DSM reconciliation must use interior measured returns, not
     # hull vertices that commonly land on mixed roof/wall/vegetation pixels.
     support_coordinates: tuple[tuple[float, float, float], ...] = ()
+    dsm_residual_rmse_meters: float | None = None
 
     @property
     def pitch_degrees(self) -> float:
@@ -47,6 +49,70 @@ class ConsolidatedPlane:
         return math.degrees(
             math.atan2(self.normal[0] / self.normal[2], self.normal[1] / self.normal[2])
         ) % 360
+
+
+@dataclass(frozen=True)
+class DsmResidualSample:
+    plane_index: int
+    point_index: int
+    x: float
+    y: float
+    lidar_height: float
+    dsm_minus_lidar: float
+
+
+def _spatial_dsm_residual_components(
+    samples: list[DsmResidualSample],
+    centered_residuals: np.ndarray,
+    *,
+    residual_threshold_meters: float,
+    maximum_gap_meters: float,
+) -> list[list[int]]:
+    """Return deterministic connected components of material DSM residuals.
+
+    Residual sign is part of connectivity so a rooftop obstruction above a
+    plane is never joined to a low/no-data edge artefact.  This helper uses
+    measured sample coordinates and has no knowledge of private calibration
+    targets.
+    """
+
+    eligible = [
+        index
+        for index, residual in enumerate(centered_residuals)
+        if abs(float(residual)) > residual_threshold_meters
+    ]
+    if not eligible:
+        return []
+    union = _UnionFind(len(eligible))
+    for left_offset, left_index in enumerate(eligible):
+        left = samples[left_index]
+        left_residual = float(centered_residuals[left_index])
+        for right_offset in range(left_offset + 1, len(eligible)):
+            right_index = eligible[right_offset]
+            right = samples[right_index]
+            right_residual = float(centered_residuals[right_index])
+            if left_residual * right_residual <= 0:
+                continue
+            if math.hypot(left.x - right.x, left.y - right.y) > maximum_gap_meters:
+                continue
+            # Do not bridge two vertically distinct residual populations just
+            # because their pixels touch in plan.
+            if abs(left_residual - right_residual) > max(
+                residual_threshold_meters, 0.50
+            ):
+                continue
+            union.union(left_offset, right_offset)
+    members: dict[int, list[int]] = {}
+    for offset, sample_index in enumerate(eligible):
+        members.setdefault(union.find(offset), []).append(sample_index)
+    return sorted(
+        (sorted(component) for component in members.values()),
+        key=lambda component: (
+            -len(component),
+            round(samples[component[0]].x, 6),
+            round(samples[component[0]].y, 6),
+        ),
+    )
 
 
 class _UnionFind:
@@ -602,6 +668,8 @@ def _partition_roofer_facet(
     candidates: list[ConsolidatedPlane],
     adjacency_gap_meters: float = 1.25,
     minimum_interior_clearance_meters: float = 0.20,
+    plane_evidence: dict[int, dict[str, float | None]] | None = None,
+    assignment_audit: list[dict[str, Any]] | None = None,
 ) -> list[tuple[BaseGeometry, ConsolidatedPlane]]:
     if len(candidates) == 1:
         return [(polygon, candidates[0])]
@@ -735,62 +803,27 @@ def _partition_roofer_facet(
         )[1]
         return [(polygon, strongest)]
 
-    active_indexes = sorted(
-        {
-            int(relation[index_name])
-            for relation in relations
-            for index_name in ("left", "right")
-        }
-    )
-    halfspace_regions: list[tuple[BaseGeometry, ConsolidatedPlane]] = []
-    for index in active_indexes:
-        region: BaseGeometry = polygon
-        for relation in relations:
-            if index == relation["left"]:
-                other_index = int(relation["right"])
-            elif index == relation["right"]:
-                other_index = int(relation["left"])
-            else:
-                continue
-            region = _clip_to_plane_side(
-                region, candidates[index], candidates[other_index]
-            )
-            if region.is_empty:
-                break
-        if not region.is_empty and region.area > 0.25:
-            halfspace_regions.append((region, candidates[index]))
-    halfspace_union = (
-        unary_union([region for region, _ in halfspace_regions])
-        if halfspace_regions
-        else Polygon()
-    )
-    halfspace_coverage = float(halfspace_union.intersection(polygon).area) / max(
-        float(polygon.area), 0.01
-    )
-    halfspace_summed = sum(float(region.area) for region, _ in halfspace_regions)
-    halfspace_overlap = max(
-        0.0, halfspace_summed - float(halfspace_union.area)
-    ) / max(float(polygon.area), 0.01)
-    if halfspace_coverage >= 0.995 and halfspace_overlap <= 0.005:
-        return halfspace_regions
-
-    cells: list[BaseGeometry] = [polygon]
-    for line in lines:
-        next_cells: list[BaseGeometry] = []
-        for cell in cells:
-            try:
-                pieces = split(cell, line)
-            except (ValueError, TypeError) as error:
-                raise UnreliableGeometryError(
-                    "FACET_CONSOLIDATION_SPLIT_INVALID",
-                    "A supported plane intersection could not split the roof coverage.",
-                ) from error
-            next_cells.extend(
-                piece
-                for piece in pieces.geoms
-                if not piece.is_empty and piece.area > 1e-8
-            )
-        cells = next_cells
+    # Node every supported plane intersection and the roofprint boundary in a
+    # single GEOS operation, then polygonize once.  Sequentially splitting a
+    # cell makes the answer depend on line order and can leave incompatible
+    # T-junctions between neighbouring faces.
+    try:
+        arrangement_edges = unary_union(
+            [polygon.boundary]
+            + [line.intersection(polygon) for line in lines]
+        )
+        cells = [
+            cell
+            for cell in polygonize(arrangement_edges)
+            if not cell.is_empty
+            and cell.area > 1e-8
+            and polygon.covers(cell.representative_point())
+        ]
+    except (ValueError, TypeError) as error:
+        raise UnreliableGeometryError(
+            "FACET_CONSOLIDATION_SPLIT_INVALID",
+            "Supported plane intersections could not form a global arrangement.",
+        ) from error
 
     cell_assignments: list[tuple[BaseGeometry, int]] = []
     for cell in cells:
@@ -813,17 +846,71 @@ def _partition_roofer_facet(
                 )
                 if actual_side * expected_side < -1e-8:
                     mismatches += 1
+            evidence = (plane_evidence or {}).get(id(candidate), {})
+            spatial_distance = float(candidate.support_hull.distance(probe))
+            support_overlap = float(candidate.support_hull.intersection(cell).area)
+            overlap_ratio = support_overlap / max(float(cell.area), 0.01)
+            lidar_rmse = float(candidate.rmse_meters)
+            dsm_rmse = float(evidence.get("dsmRmseMeters") or 0.0)
+            solar_pitch_variance = float(
+                evidence.get("solarPitchVarianceDegrees") or 0.0
+            )
+            solar_azimuth_variance = float(
+                evidence.get("solarAzimuthVarianceDegrees") or 0.0
+            )
+            evidence_score = (
+                spatial_distance
+                + lidar_rmse
+                + dsm_rmse
+                + solar_pitch_variance / 10.0
+                + solar_azimuth_variance / 180.0
+                - min(1.0, overlap_ratio)
+            )
             rankings.append(
                 (
                     mismatches,
-                    round(float(candidate.support_hull.distance(probe)), 9),
-                    -round(float(candidate.support_hull.intersection(cell).area), 9),
+                    round(evidence_score, 9),
+                    round(spatial_distance, 9),
+                    -round(support_overlap, 9),
                     -len(candidate.point_indexes),
                     index,
                 )
             )
         winner = min(rankings)[-1]
         cell_assignments.append((cell, winner))
+        if assignment_audit is not None:
+            winner_plane = candidates[winner]
+            winner_evidence = (plane_evidence or {}).get(id(winner_plane), {})
+            assignment_audit.append(
+                {
+                    "cellAreaSquareMeters": round(float(cell.area), 6),
+                    "winnerPlaneOrdinal": winner + 1,
+                    "relationMismatchCount": int(min(rankings)[0]),
+                    "evidenceScore": round(float(min(rankings)[1]), 6),
+                    "spatialSupportDistanceMeters": round(
+                        float(winner_plane.support_hull.distance(probe)), 6
+                    ),
+                    "spatialSupportOverlapSquareMeters": round(
+                        float(winner_plane.support_hull.intersection(cell).area), 6
+                    ),
+                    "lidarPlaneRmseMeters": round(
+                        float(winner_plane.rmse_meters), 6
+                    ),
+                    "dsmResidualRmseMeters": winner_evidence.get(
+                        "dsmRmseMeters"
+                    ),
+                    "solarPitchVarianceDegrees": winner_evidence.get(
+                        "solarPitchVarianceDegrees"
+                    ),
+                    "solarAzimuthVarianceDegrees": winner_evidence.get(
+                        "solarAzimuthVarianceDegrees"
+                    ),
+                }
+            )
+
+    if assignment_audit is not None:
+        for record, (_, final_label) in zip(assignment_audit, cell_assignments):
+            record["finalWinnerPlaneOrdinal"] = final_label + 1
 
     # Arrangement lines can intersect within centimetres of one another and
     # create numerical sliver cells.  Preserve complete coverage while
@@ -884,8 +971,410 @@ def _partition_roofer_facet(
     return regions
 
 
+def _polygon_parts(geometry: BaseGeometry) -> list[Polygon]:
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type == "Polygon":
+        return [geometry]
+    parts: list[Polygon] = []
+    for item in getattr(geometry, "geoms", []):
+        parts.extend(_polygon_parts(item))
+    return parts
+
+
+def _line_parts(geometry: BaseGeometry) -> list[LineString]:
+    if geometry.is_empty:
+        return []
+    if geometry.geom_type in {"LineString", "LinearRing"}:
+        return [LineString(geometry.coords)]
+    parts: list[LineString] = []
+    for item in getattr(geometry, "geoms", []):
+        parts.extend(_line_parts(item))
+    return parts
+
+
+def _merge_adjacent_supported_fragments(
+    regions: list[tuple[BaseGeometry, ConsolidatedPlane]],
+    lidar_points: np.ndarray,
+    settings: Any,
+) -> tuple[list[tuple[BaseGeometry, ConsolidatedPlane]], dict[str, Any]]:
+    """Merge only adjacent fragments whose combined LiDAR fit stays planar."""
+
+    merged = list(regions)
+    merge_records: list[dict[str, Any]] = []
+    configured_angle = float(
+        getattr(settings, "facet_consolidation_merge_angle_degrees", 4.0)
+    )
+    maximum_fragment_angle = max(configured_angle, 6.0)
+    maximum_fit_rmse = min(
+        float(
+            getattr(
+                settings,
+                "facet_consolidation_maximum_plane_rmse_meters",
+                0.15,
+            )
+        ),
+        max(
+            0.075,
+            float(
+                getattr(
+                    settings,
+                    "facet_consolidation_maximum_local_residual_meters",
+                    0.06,
+                )
+            )
+            * 1.5,
+        ),
+    )
+    while True:
+        candidates: list[
+            tuple[
+                tuple[float, ...],
+                int,
+                int,
+                BaseGeometry,
+                ConsolidatedPlane,
+                float,
+                float,
+                float,
+                float,
+                float,
+            ]
+        ] = []
+        for left in range(len(merged)):
+            left_region, left_plane = merged[left]
+            for right in range(left + 1, len(merged)):
+                right_region, right_plane = merged[right]
+                if id(left_plane) == id(right_plane):
+                    continue
+                shared_length = float(
+                    left_region.boundary.intersection(right_region.boundary).length
+                )
+                if shared_length <= 0.10:
+                    continue
+                angle = _normal_angle_degrees(
+                    np.asarray(left_plane.normal), np.asarray(right_plane.normal)
+                )
+                if angle > maximum_fragment_angle:
+                    continue
+                shared_lines = _line_parts(
+                    left_region.boundary.intersection(right_region.boundary)
+                )
+                if not shared_lines:
+                    continue
+                shared_line = max(shared_lines, key=lambda line: float(line.length))
+                start = shared_line.coords[0]
+                end = shared_line.coords[-1]
+                edge_dx = float(end[0] - start[0])
+                edge_dy = float(end[1] - start[1])
+                edge_length = math.hypot(edge_dx, edge_dy)
+                if edge_length <= 1e-8:
+                    continue
+                intersection_direction = np.cross(
+                    np.asarray(left_plane.normal), np.asarray(right_plane.normal)
+                )
+                intersection_xy_length = math.hypot(
+                    float(intersection_direction[0]),
+                    float(intersection_direction[1]),
+                )
+                if intersection_xy_length <= 1e-8:
+                    continue
+                alignment = math.degrees(
+                    math.acos(
+                        min(
+                            1.0,
+                            abs(
+                                (
+                                    edge_dx * float(intersection_direction[0])
+                                    + edge_dy * float(intersection_direction[1])
+                                )
+                                / (edge_length * intersection_xy_length)
+                            ),
+                        )
+                    )
+                )
+
+                midpoint = shared_line.interpolate(0.5, normalized=True)
+                normal_x, normal_y = -edge_dy / edge_length, edge_dx / edge_length
+
+                def inward_slope(
+                    region: BaseGeometry, plane: ConsolidatedPlane
+                ) -> float:
+                    positive = Point(
+                        midpoint.x + normal_x * 0.01,
+                        midpoint.y + normal_y * 0.01,
+                    )
+                    direction = 1.0 if region.covers(positive) else -1.0
+                    gradient_x = -plane.normal[0] / plane.normal[2]
+                    gradient_y = -plane.normal[1] / plane.normal[2]
+                    return direction * (
+                        gradient_x * normal_x + gradient_y * normal_y
+                    )
+
+                left_inward_slope = inward_slope(left_region, left_plane)
+                right_inward_slope = inward_slope(right_region, right_plane)
+                # This final merge is not a general angle heuristic. It is
+                # permitted only for a small fragment at a boundary which is
+                # demonstrably not the incident planes' intersection and for
+                # which neither side has a classifiable dihedral derivative.
+                if (
+                    alignment <= 5.0
+                    or abs(left_inward_slope) > 0.08
+                    or abs(right_inward_slope) > 0.08
+                ):
+                    continue
+                combined_indexes = np.asarray(
+                    sorted(
+                        set(left_plane.point_indexes)
+                        | set(right_plane.point_indexes)
+                    ),
+                    dtype=np.int32,
+                )
+                if not len(combined_indexes) or int(np.max(combined_indexes)) >= len(
+                    lidar_points
+                ):
+                    continue
+                smaller_support_fraction = min(
+                    len(left_plane.point_indexes), len(right_plane.point_indexes)
+                ) / max(len(combined_indexes), 1)
+                if smaller_support_fraction > 0.15:
+                    continue
+                normal, centroid, rmse = _fit_plane(lidar_points, combined_indexes)
+                if rmse > maximum_fit_rmse:
+                    continue
+                combined_region = unary_union((left_region, right_region))
+                if combined_region.geom_type != "Polygon" or not combined_region.is_valid:
+                    continue
+                plane = ConsolidatedPlane(
+                    point_indexes=tuple(map(int, combined_indexes)),
+                    normal=tuple(map(float, normal)),
+                    centroid=tuple(map(float, centroid)),
+                    rmse_meters=rmse,
+                    support_hull=_support_hull(lidar_points, combined_indexes),
+                    support_coordinates=_support_coordinate_sample(
+                        lidar_points, combined_indexes
+                    ),
+                    dsm_residual_rmse_meters=max(
+                        value
+                        for value in (
+                            left_plane.dsm_residual_rmse_meters,
+                            right_plane.dsm_residual_rmse_meters,
+                            0.0,
+                        )
+                        if value is not None
+                    ),
+                )
+                key = (
+                    round(rmse, 9),
+                    round(angle, 9),
+                    -round(shared_length, 9),
+                    round(combined_region.centroid.x, 6),
+                    round(combined_region.centroid.y, 6),
+                )
+                candidates.append(
+                    (
+                        key,
+                        left,
+                        right,
+                        combined_region,
+                        plane,
+                        angle,
+                        smaller_support_fraction,
+                        alignment,
+                        left_inward_slope,
+                        right_inward_slope,
+                    )
+                )
+        if not candidates:
+            break
+        (
+            _,
+            left,
+            right,
+            combined_region,
+            combined_plane,
+            angle,
+            smaller_support_fraction,
+            alignment,
+            left_inward_slope,
+            right_inward_slope,
+        ) = min(candidates, key=lambda item: item[0])
+        merge_records.append(
+            {
+                "angleDegrees": round(angle, 4),
+                "combinedRmseMeters": round(combined_plane.rmse_meters, 4),
+                "smallerSupportFraction": round(smaller_support_fraction, 4),
+                "boundaryAlignmentDegrees": round(alignment, 4),
+                "inwardSlopes": [
+                    round(left_inward_slope, 4),
+                    round(right_inward_slope, 4),
+                ],
+            }
+        )
+        merged = [
+            value
+            for index, value in enumerate(merged)
+            if index not in {left, right}
+        ] + [(combined_region, combined_plane)]
+    return merged, {
+        "validation": "COMBINED_PLANE_SUPPORT_REQUIRED",
+        "mergeCount": len(merge_records),
+        "maximumFragmentAngleDegrees": maximum_fragment_angle,
+        "maximumCombinedRmseMeters": round(maximum_fit_rmse, 4),
+        "merges": merge_records,
+    }
+
+
+def _validate_watertight_partition(
+    regions: list[tuple[BaseGeometry, ConsolidatedPlane]],
+    roofprint: BaseGeometry,
+) -> dict[str, Any]:
+    """Require a complete non-overlapping two-manifold planar subdivision."""
+
+    polygons = [region for region, _ in regions]
+    if not polygons or any(
+        polygon.geom_type != "Polygon" or not polygon.is_valid for polygon in polygons
+    ):
+        raise UnreliableGeometryError(
+            "FACET_GLOBAL_ARRANGEMENT_INVALID",
+            "The global facet arrangement contains an invalid surface.",
+        )
+    union = unary_union(polygons)
+    roof_area = max(float(roofprint.area), 0.01)
+    gap_area = float(roofprint.difference(union).area)
+    outside_area = float(union.difference(roofprint).area)
+    overlap_area = max(0.0, sum(float(item.area) for item in polygons) - float(union.area))
+    maximum_area_error = max(1e-6, roof_area * 1e-8)
+    if max(gap_area, outside_area, overlap_area) > maximum_area_error:
+        raise UnreliableGeometryError(
+            "FACET_GLOBAL_ARRANGEMENT_INCOMPLETE",
+            "The global facet arrangement has a material gap or overlap.",
+            details={
+                "gapAreaSquareMeters": round(gap_area, 6),
+                "outsideAreaSquareMeters": round(outside_area, 6),
+                "overlapAreaSquareMeters": round(overlap_area, 6),
+                "maximumAreaErrorSquareMeters": round(maximum_area_error, 6),
+            },
+        )
+
+    noded = unary_union([polygon.boundary for polygon in polygons])
+    dangling = 0
+    non_manifold = 0
+    non_manifold_lengths: list[float] = []
+    dangling_lengths: list[float] = []
+    redundant_segment_count = 0
+    redundant_segment_length = 0.0
+    failure_patterns: dict[str, int] = {}
+    exterior_segments = 0
+    interior_segments = 0
+    tolerance = 1e-6
+    side_probe_distance = 1e-5
+    for line in _line_parts(noded):
+        coordinates = list(line.coords)
+        for start, end in zip(coordinates, coordinates[1:]):
+            segment = LineString([start, end])
+            if segment.length <= tolerance:
+                continue
+            midpoint = segment.interpolate(0.5, normalized=True)
+            dx = float(end[0] - start[0])
+            dy = float(end[1] - start[1])
+            length = math.hypot(dx, dy)
+            normal_x = -dy / length * side_probe_distance
+            normal_y = dx / length * side_probe_distance
+            probes = (
+                Point(midpoint.x + normal_x, midpoint.y + normal_y),
+                Point(midpoint.x - normal_x, midpoint.y - normal_y),
+            )
+            roof_sides = [roofprint.covers(probe) for probe in probes]
+            side_owners = [
+                [index for index, polygon in enumerate(polygons) if polygon.covers(probe)]
+                for probe in probes
+            ]
+            if sum(roof_sides) == 1:
+                exterior_segments += 1
+                roof_side = roof_sides.index(True)
+                if len(side_owners[roof_side]) != 1 or side_owners[1 - roof_side]:
+                    non_manifold += 1
+                    non_manifold_lengths.append(float(segment.length))
+                    failure_patterns["EXTERIOR_OWNERSHIP"] = (
+                        failure_patterns.get("EXTERIOR_OWNERSHIP", 0) + 1
+                    )
+            elif all(roof_sides):
+                interior_segments += 1
+                if not side_owners[0] or not side_owners[1]:
+                    dangling += 1
+                    dangling_lengths.append(float(segment.length))
+                    failure_patterns["INTERIOR_SIDE_UNOWNED"] = (
+                        failure_patterns.get("INTERIOR_SIDE_UNOWNED", 0) + 1
+                    )
+                elif (
+                    len(side_owners[0]) == 1
+                    and len(side_owners[1]) == 1
+                    and side_owners[0][0] == side_owners[1][0]
+                ):
+                    # GEOS can retain a zero-width cut after cells with the
+                    # same label are dissolved. It separates no surfaces and
+                    # therefore is not a manifold edge.
+                    redundant_segment_count += 1
+                    redundant_segment_length += float(segment.length)
+                elif len(side_owners[0]) != 1 or len(side_owners[1]) != 1:
+                    non_manifold += 1
+                    non_manifold_lengths.append(float(segment.length))
+                    failure_patterns["INTERIOR_MULTIPLE_OWNERS"] = (
+                        failure_patterns.get("INTERIOR_MULTIPLE_OWNERS", 0) + 1
+                    )
+            else:
+                non_manifold += 1
+                non_manifold_lengths.append(float(segment.length))
+                failure_patterns["OUTSIDE_ROOFPRINT"] = (
+                    failure_patterns.get("OUTSIDE_ROOFPRINT", 0) + 1
+                )
+    if dangling or non_manifold:
+        raise UnreliableGeometryError(
+            "FACET_GLOBAL_ARRANGEMENT_NON_MANIFOLD",
+            "The global facet arrangement is not a watertight two-manifold.",
+            details={
+                "danglingInteriorSegmentCount": dangling,
+                "nonManifoldSegmentCount": non_manifold,
+                "danglingInteriorFeet": round(sum(dangling_lengths) * 3.280839895, 3),
+                "nonManifoldFeet": round(sum(non_manifold_lengths) * 3.280839895, 3),
+                "maximumNonManifoldSegmentFeet": round(
+                    max(non_manifold_lengths, default=0.0) * 3.280839895, 3
+                ),
+                "failurePatterns": failure_patterns,
+                "exteriorSegmentCount": exterior_segments,
+                "interiorSegmentCount": interior_segments,
+            },
+        )
+    return {
+        "validation": "PASSED",
+        "facetCount": len(polygons),
+        "interiorRingCount": sum(len(polygon.interiors) for polygon in polygons),
+        "interiorRingAreasSquareMeters": sorted(
+            round(float(Polygon(ring).area), 6)
+            for polygon in polygons
+            for ring in polygon.interiors
+        ),
+        "gapAreaSquareMeters": round(gap_area, 9),
+        "outsideAreaSquareMeters": round(outside_area, 9),
+        "overlapAreaSquareMeters": round(overlap_area, 9),
+        "exteriorSegmentCount": exterior_segments,
+        "interiorSegmentCount": interior_segments,
+        "suppressedRedundantSegmentCount": redundant_segment_count,
+        "suppressedRedundantSegmentFeet": round(
+            redundant_segment_length * 3.280839895, 3
+        ),
+        "exteriorOwnership": 1,
+        "interiorOwnership": 2,
+    }
+
+
 def _solar_plane_audit(
-    planes: list[ConsolidatedPlane], solar_reference: Any, settings: Any
+    planes: list[ConsolidatedPlane],
+    solar_reference: Any,
+    settings: Any,
+    *,
+    enforce_conflicts: bool = True,
 ) -> tuple[list[ConsolidatedPlane], dict[str, Any]]:
     solar_facets = list(getattr(solar_reference, "facets", []) or [])
     if not solar_facets:
@@ -935,7 +1424,7 @@ def _solar_plane_audit(
     maximum_rejected_support_fraction = float(
         getattr(settings, "facet_consolidation_maximum_solar_rejected_support_fraction", 0.05)
     )
-    if rejected_support_fraction > maximum_rejected_support_fraction:
+    if enforce_conflicts and rejected_support_fraction > maximum_rejected_support_fraction:
         raise UnreliableGeometryError(
             "FACET_CONSOLIDATION_SOLAR_PITCH_CONFLICT",
             "Material independent plane support disagrees with Google Solar pitch evidence.",
@@ -947,24 +1436,50 @@ def _solar_plane_audit(
                 "rejectedPlanes": rejected,
             },
         )
-    return accepted, {
+    return (accepted if enforce_conflicts else planes), {
         "solarFacetCount": len(solar_facets),
         "reconstructedPlaneCount": len(planes),
-        "acceptedPlaneCount": len(accepted),
+        "acceptedPlaneCount": len(accepted if enforce_conflicts else planes),
         "rejectedNoisePlaneCount": len(rejected),
         "rejectedNoiseSupportFraction": round(rejected_support_fraction, 4),
+        "conflictsEnforced": enforce_conflicts,
         "matches": matches,
         "rejectedNoisePlanes": rejected,
     }
 
 
-def validate_solar_dsm_support(
+def _temporal_evidence_role(
+    solar_imagery_date: str | None,
+    lidar_reference_date: str | None,
+) -> dict[str, Any]:
+    """Decide whether Solar evidence may veto the selected LiDAR geometry."""
+
+    try:
+        solar_date = date.fromisoformat(str(solar_imagery_date or ""))
+        lidar_date = date.fromisoformat(str(lidar_reference_date or ""))
+    except ValueError as error:
+        raise UnreliableGeometryError(
+            "FACET_EVIDENCE_DATE_INVALID",
+            "Facet reconciliation requires dated Solar and LiDAR evidence.",
+        ) from error
+    historical_only = solar_date < lidar_date
+    return {
+        "solarImageryDate": solar_date.isoformat(),
+        "lidarReferenceDate": lidar_date.isoformat(),
+        "role": "HISTORICAL_CORROBORATION_ONLY" if historical_only else "VALIDATION",
+        "mayVetoNewerLidar": not historical_only,
+    }
+
+
+def _reconcile_solar_dsm_support(
     planes: list[ConsolidatedPlane],
     dsm_path: Path,
     input_crs: str,
     settings: Any,
-) -> dict[str, Any]:
-    """Require the dated Google Solar DSM to support the consolidated surface shape."""
+    *,
+    lidar_points: np.ndarray | None = None,
+) -> tuple[list[ConsolidatedPlane], dict[str, Any]]:
+    """Validate and, only with dual support, refine planes using Solar DSM."""
 
     try:
         gdal = importlib.import_module("osgeo.gdal")
@@ -998,9 +1513,39 @@ def validate_solar_dsm_support(
             "The Google Solar DSM georeference could not be reconciled with LiDAR.",
         ) from error
 
-    proposed: list[tuple[int, float, float]] = []
+    proposed: list[tuple[int, int, float, float, float]] = []
     for plane_index, plane in enumerate(planes, start=1):
-        coordinates = [(row[0], row[1]) for row in plane.support_coordinates]
+        indexed_coordinates: list[tuple[int, float, float, float]] = []
+        if lidar_points is not None:
+            valid_indexes = [
+                int(point_index)
+                for point_index in plane.point_indexes
+                if 0 <= int(point_index) < len(lidar_points)
+            ]
+            valid_indexes.sort(
+                key=lambda point_index: tuple(
+                    float(value) for value in lidar_points[point_index]
+                )
+            )
+            if len(valid_indexes) > 96:
+                offsets = np.linspace(
+                    0, len(valid_indexes) - 1, 96, dtype=np.int32
+                )
+                valid_indexes = [valid_indexes[int(offset)] for offset in offsets]
+            indexed_coordinates = [
+                (
+                    point_index,
+                    float(lidar_points[point_index][0]),
+                    float(lidar_points[point_index][1]),
+                    float(lidar_points[point_index][2]),
+                )
+                for point_index in valid_indexes
+            ]
+        if not indexed_coordinates:
+            indexed_coordinates = [
+                (-1, float(row[0]), float(row[1]), float(row[2]))
+                for row in plane.support_coordinates
+            ]
         # Prefer actual support returns away from mixed pixels at eaves,
         # rakes, ridges, and valleys. Progressively relax the interior margin
         # only for physically small facets.
@@ -1013,25 +1558,32 @@ def validate_solar_dsm_support(
             if interior.is_empty:
                 continue
             filtered = [
-                (x, y)
-                for x, y in coordinates
+                (point_index, x, y, z)
+                for point_index, x, y, z in indexed_coordinates
                 if interior.covers(Point(float(x), float(y)))
             ]
             if len(filtered) >= 5 or (margin == 0.0 and filtered):
-                coordinates = filtered
+                indexed_coordinates = filtered
                 break
-        if not coordinates:
+        if not indexed_coordinates:
             center = plane.support_hull.representative_point()
-            coordinates = [(center.x, center.y)]
-        for x, y in coordinates:
-            proposed.append((plane_index, float(x), float(y)))
+            indexed_coordinates = [
+                (
+                    -1,
+                    float(center.x),
+                    float(center.y),
+                    _plane_height(plane, float(center.x), float(center.y)),
+                )
+            ]
+        for point_index, x, y, z in indexed_coordinates:
+            proposed.append((plane_index, point_index, x, y, z))
 
-    samples: list[tuple[int, float]] = []
+    samples: list[DsmResidualSample] = []
     per_plane_counts: dict[int, int] = {}
     proposed_pixels: set[tuple[int, int, int]] = set()
     sampled_pixels: set[tuple[int, int, int]] = set()
     geotransform = dataset.GetGeoTransform()
-    for plane_index, x, y in proposed:
+    for plane_index, point_index, x, y, measured_lidar_height in proposed:
         try:
             target_x, target_y, _ = transformer.TransformPoint(x, y)
             pixel_x, pixel_y = gdal.ApplyGeoTransform(inverse, target_x, target_y)
@@ -1056,13 +1608,22 @@ def validate_solar_dsm_support(
             lidar_x, lidar_y, _ = reverse_transformer.TransformPoint(
                 pixel_center_x, pixel_center_y
             )
-            lidar_height = _plane_height(
+            fitted_lidar_height = _plane_height(
                 planes[plane_index - 1], float(lidar_x), float(lidar_y)
             )
         except (RuntimeError, TypeError, ValueError, OverflowError):
             continue
         sampled_pixels.add(pixel_key)
-        samples.append((plane_index, dsm_height - lidar_height))
+        samples.append(
+            DsmResidualSample(
+                plane_index=plane_index,
+                point_index=point_index,
+                x=float(lidar_x),
+                y=float(lidar_y),
+                lidar_height=float(measured_lidar_height),
+                dsm_minus_lidar=dsm_height - fitted_lidar_height,
+            )
+        )
         per_plane_counts[plane_index] = per_plane_counts.get(plane_index, 0) + 1
 
     coverage = len(sampled_pixels) / max(len(proposed_pixels), 1)
@@ -1093,38 +1654,231 @@ def validate_solar_dsm_support(
                 "underSampledFacetCount": len(under_sampled_planes),
             },
         )
-    offsets = np.asarray([offset for _, offset in samples], dtype=float)
+    offsets = np.asarray(
+        [sample.dsm_minus_lidar for sample in samples], dtype=float
+    )
     vertical_offset = float(np.median(offsets))
     facet_offsets: dict[int, float] = {}
     facet_rmses: dict[int, float] = {}
     centered_values = []
     rejected_outlier_count = 0
+    scattered_obstruction_count = 0
+    coherent_conflict_count = 0
+    coherent_component_audit: list[dict[str, Any]] = []
+    split_planes_by_ordinal: dict[int, list[ConsolidatedPlane]] = {}
     maximum_outlier_fraction = 0.20
+    maximum_scattered_obstruction_fraction = 0.35
     for plane_index in sorted(per_plane_counts):
+        plane_scattered_obstruction_count = 0
+        plane_samples = [
+            sample for sample in samples if sample.plane_index == plane_index
+        ]
         plane_offsets = np.asarray(
-            [offset for sample_plane, offset in samples if sample_plane == plane_index],
+            [sample.dsm_minus_lidar for sample in plane_samples],
             dtype=float,
         )
         facet_offset = float(np.median(plane_offsets))
         facet_centered = plane_offsets - facet_offset
         median_absolute_deviation = float(np.median(np.abs(facet_centered)))
-        robust_limit = max(1.50, 3.5 * 1.4826 * median_absolute_deviation)
+        robust_limit = max(0.35, 3.5 * 1.4826 * median_absolute_deviation)
         inlier_mask = np.abs(facet_centered) <= robust_limit
         minimum_inliers = max(
             minimum_facet_samples,
             math.ceil((1.0 - maximum_outlier_fraction) * len(plane_offsets)),
         )
-        if int(np.count_nonzero(inlier_mask)) < minimum_inliers:
+        spatial_components = _spatial_dsm_residual_components(
+            plane_samples,
+            facet_centered,
+            residual_threshold_meters=robust_limit,
+            maximum_gap_meters=max(
+                0.50,
+                float(
+                    getattr(
+                        settings,
+                        "facet_consolidation_neighbor_radius_meters",
+                        0.40,
+                    )
+                )
+                * 2.0,
+            ),
+        )
+        coherent_sample_indexes: set[int] = set()
+        minimum_coherent_samples = max(5, math.ceil(len(plane_samples) * 0.15))
+        source_plane = planes[plane_index - 1]
+        for component in spatial_components:
+            component_points = [
+                Point(plane_samples[index].x, plane_samples[index].y)
+                for index in component
+            ]
+            component_hull = MultiPoint(component_points).convex_hull
+            component_area = float(getattr(component_hull, "area", 0.0))
+            edge_samples = sum(
+                source_plane.support_hull.boundary.distance(point) <= 0.25
+                for point in component_points
+            )
+            edge_fraction = edge_samples / max(len(component), 1)
+            coherent = (
+                len(component) >= minimum_coherent_samples
+                and component_area >= 0.25
+                and edge_fraction < 0.60
+            )
+            component_record = {
+                "facetOrdinal": plane_index,
+                "sampleCount": len(component),
+                "areaSquareMeters": round(component_area, 4),
+                "edgeSampleFraction": round(edge_fraction, 4),
+                "classification": "SCATTERED_OR_EDGE_OBSTRUCTION",
+            }
+            if not coherent:
+                scattered_obstruction_count += len(component)
+                plane_scattered_obstruction_count += len(component)
+                coherent_component_audit.append(component_record)
+                continue
+            coherent_sample_indexes.update(component)
+
+            # A DSM residual becomes a new roof surface only when the LiDAR
+            # returns in the same coherent region independently fit a second
+            # supported plane.  Otherwise it is an obstruction/change signal,
+            # never a fabricated facet.
+            dual_supported = False
+            if lidar_points is not None:
+                support_region = component_hull.buffer(0.15)
+                split_indexes = np.asarray(
+                    sorted(
+                        point_index
+                        for point_index in source_plane.point_indexes
+                        if support_region.covers(
+                            Point(
+                                float(lidar_points[point_index][0]),
+                                float(lidar_points[point_index][1]),
+                            )
+                        )
+                    ),
+                    dtype=np.int32,
+                )
+                remainder_indexes = np.asarray(
+                    sorted(set(source_plane.point_indexes) - set(split_indexes)),
+                    dtype=np.int32,
+                )
+                minimum_plane_points = int(
+                    getattr(settings, "facet_consolidation_minimum_points", 20)
+                )
+                if (
+                    len(split_indexes) >= minimum_plane_points
+                    and len(remainder_indexes) >= minimum_plane_points
+                ):
+                    split_normal, split_centroid, split_rmse = _fit_plane(
+                        lidar_points, split_indexes
+                    )
+                    base_normal, base_centroid, base_rmse = _fit_plane(
+                        lidar_points, remainder_indexes
+                    )
+                    split_angle = _normal_angle_degrees(split_normal, base_normal)
+                    split_separation = abs(
+                        float(
+                            np.dot(
+                                split_normal,
+                                split_centroid - base_centroid,
+                            )
+                        )
+                    )
+                    maximum_fit_rmse = float(
+                        getattr(
+                            settings,
+                            "facet_consolidation_maximum_plane_rmse_meters",
+                            0.15,
+                        )
+                    )
+                    dual_supported = (
+                        split_rmse <= maximum_fit_rmse
+                        and base_rmse <= maximum_fit_rmse
+                        and (split_angle >= 1.0 or split_separation >= 0.12)
+                        and split_normal[2] >= math.cos(math.radians(60.0))
+                    )
+                    component_record.update(
+                        {
+                            "lidarSplitAngleDegrees": round(split_angle, 4),
+                            "lidarSplitSeparationMeters": round(
+                                split_separation, 4
+                            ),
+                            "lidarSplitRmseMeters": round(split_rmse, 4),
+                            "lidarRemainderRmseMeters": round(base_rmse, 4),
+                        }
+                    )
+                    if dual_supported:
+                        split_planes_by_ordinal[plane_index] = [
+                            ConsolidatedPlane(
+                                point_indexes=tuple(map(int, remainder_indexes)),
+                                normal=tuple(map(float, base_normal)),
+                                centroid=tuple(map(float, base_centroid)),
+                                rmse_meters=base_rmse,
+                                support_hull=_support_hull(
+                                    lidar_points, remainder_indexes
+                                ),
+                                support_coordinates=_support_coordinate_sample(
+                                    lidar_points, remainder_indexes
+                                ),
+                            ),
+                            ConsolidatedPlane(
+                                point_indexes=tuple(map(int, split_indexes)),
+                                normal=tuple(map(float, split_normal)),
+                                centroid=tuple(map(float, split_centroid)),
+                                rmse_meters=split_rmse,
+                                support_hull=_support_hull(
+                                    lidar_points, split_indexes
+                                ),
+                                support_coordinates=_support_coordinate_sample(
+                                    lidar_points, split_indexes
+                                ),
+                            ),
+                        ]
+            component_record["classification"] = (
+                "DUAL_SUPPORTED_SECONDARY_ROOF_SURFACE"
+                if dual_supported
+                else "COHERENT_DSM_WITHOUT_LIDAR_PLANE_SUPPORT"
+            )
+            coherent_component_audit.append(component_record)
+            if not dual_supported:
+                coherent_conflict_count += 1
+
+        if coherent_conflict_count:
             raise UnreliableGeometryError(
-                "SOLAR_DSM_SHAPE_CONFLICT",
-                "Google Solar DSM elevations disagree with the consolidated LiDAR roof shape.",
+                "SOLAR_DSM_COHERENT_CONFLICT",
+                "A coherent DSM surface lacks independent LiDAR plane support.",
                 details={
                     "facetOrdinal": plane_index,
-                    "sampleCount": int(len(plane_offsets)),
-                    "inlierSampleCount": int(np.count_nonzero(inlier_mask)),
-                    "maximumOutlierFraction": maximum_outlier_fraction,
+                    "coherentConflictCount": coherent_conflict_count,
+                    "components": coherent_component_audit,
                 },
             )
+        # Scattered, boundary-dominated, wall-like, and unsupported steep
+        # samples are treated as obstructions only; they cannot become facets.
+        if int(np.count_nonzero(inlier_mask)) < minimum_inliers:
+            outlier_fraction = int(np.count_nonzero(~inlier_mask)) / max(
+                len(plane_offsets), 1
+            )
+            scattered_only = (
+                plane_scattered_obstruction_count
+                == int(np.count_nonzero(~inlier_mask))
+            )
+            if (
+                not scattered_only
+                or outlier_fraction > maximum_scattered_obstruction_fraction
+            ):
+                raise UnreliableGeometryError(
+                    "SOLAR_DSM_SHAPE_CONFLICT",
+                    "Google Solar DSM elevations disagree with the consolidated LiDAR roof shape.",
+                    details={
+                        "facetOrdinal": plane_index,
+                        "sampleCount": int(len(plane_offsets)),
+                        "inlierSampleCount": int(np.count_nonzero(inlier_mask)),
+                        "maximumOutlierFraction": maximum_outlier_fraction,
+                        "maximumScatteredObstructionFraction": (
+                            maximum_scattered_obstruction_fraction
+                        ),
+                        "outlierFraction": round(outlier_fraction, 4),
+                    },
+                )
         inlier_offsets = plane_offsets[inlier_mask]
         facet_offset = float(np.median(inlier_offsets))
         facet_centered = inlier_offsets - facet_offset
@@ -1167,18 +1921,51 @@ def validate_solar_dsm_support(
                 "facetCount": len(facet_offsets),
             },
         )
-    return {
+    refined_planes: list[ConsolidatedPlane] = []
+    for plane_index, plane in enumerate(planes, start=1):
+        refined_planes.extend(
+            replace(
+                refined,
+                dsm_residual_rmse_meters=facet_rmses.get(plane_index),
+            )
+            for refined in split_planes_by_ordinal.get(plane_index, [plane])
+        )
+    return refined_planes, {
         "validation": "PASSED",
         "sampleCount": len(samples),
         "sampleCoverage": round(coverage, 4),
         "supportedFacetCount": supported_planes,
         "centeredRmseMeters": round(rmse, 4),
         "maximumFacetCenteredRmseMeters": round(maximum_facet_rmse, 4),
+        "facetCenteredRmseMeters": {
+            str(key): round(value, 4) for key, value in sorted(facet_rmses.items())
+        },
         "facetOffsetRangeMeters": round(facet_offset_range, 4),
         "verticalDatumOffsetMeters": round(vertical_offset, 4),
+        "verticalDatumNormalization": "GLOBAL_MEDIAN_DSM_MINUS_LIDAR",
         "rejectedOutlierCount": rejected_outlier_count,
+        "scatteredObstructionSampleCount": scattered_obstruction_count,
+        "coherentResidualComponents": coherent_component_audit,
+        "dualSupportedSplitCount": len(split_planes_by_ordinal),
         "maximumOutlierFraction": maximum_outlier_fraction,
+        "maximumScatteredObstructionFraction": (
+            maximum_scattered_obstruction_fraction
+        ),
     }
+
+
+def validate_solar_dsm_support(
+    planes: list[ConsolidatedPlane],
+    dsm_path: Path,
+    input_crs: str,
+    settings: Any,
+) -> dict[str, Any]:
+    """Compatibility wrapper for validation-only callers and tests."""
+
+    _, audit = _reconcile_solar_dsm_support(
+        planes, dsm_path, input_crs, settings
+    )
+    return audit
 
 
 def consolidate_roofer_feature(
@@ -1190,6 +1977,8 @@ def consolidate_roofer_feature(
     *,
     solar_dsm_path: Path | None = None,
     projected_crs: str | None = None,
+    solar_imagery_date: str | None = None,
+    lidar_reference_date: str | None = None,
 ) -> tuple[dict[str, Any], None, dict[str, Any]]:
     """Return a point-supported roof-only CityJSON feature and audit record."""
 
@@ -1213,8 +2002,24 @@ def consolidate_roofer_feature(
             "FACET_CONSOLIDATION_ROOFPRINT_INVALID",
             "Roofer roof facets do not form valid planimetric coverage.",
         )
+    temporal_audit = _temporal_evidence_role(
+        solar_imagery_date or getattr(solar_reference, "imageryDate", None),
+        lidar_reference_date,
+    )
+    enforce_solar = bool(temporal_audit["mayVetoNewerLidar"])
     planes, audit = discover_consolidated_planes(points, roofprint, settings)
-    planes, solar_audit = _solar_plane_audit(planes, solar_reference, settings)
+    crop_buffer = float(
+        getattr(settings, "facet_consolidation_crop_buffer_meters", 0.20)
+    )
+    consolidation_lidar_points = points[
+        contains_xy(roofprint.buffer(crop_buffer), points[:, 0], points[:, 1])
+    ]
+    planes, solar_audit = _solar_plane_audit(
+        planes,
+        solar_reference,
+        settings,
+        enforce_conflicts=enforce_solar,
+    )
     dsm_audit: dict[str, Any] | None = None
     if getattr(settings, "solar_dsm_enabled", False):
         if solar_dsm_path is None or projected_crs is None:
@@ -1222,91 +2027,90 @@ def consolidate_roofer_feature(
                 "SOLAR_DSM_EVIDENCE_MISSING",
                 "Facet consolidation requires the dated Google Solar DSM evidence.",
             )
-        dsm_audit = validate_solar_dsm_support(
-            planes, solar_dsm_path, projected_crs, settings
-        )
+        if enforce_solar:
+            planes, dsm_audit = _reconcile_solar_dsm_support(
+                planes,
+                solar_dsm_path,
+                projected_crs,
+                settings,
+                lidar_points=consolidation_lidar_points,
+            )
+            planes, post_dsm_solar_audit = _solar_plane_audit(
+                planes,
+                solar_reference,
+                settings,
+                enforce_conflicts=True,
+            )
+            solar_audit["postDsmRefinement"] = post_dsm_solar_audit
+        else:
+            dsm_audit = {
+                "validation": "HISTORICAL_CORROBORATION_ONLY",
+                "conflictsEnforced": False,
+                "solarImageryDate": temporal_audit["solarImageryDate"],
+                "lidarReferenceDate": temporal_audit["lidarReferenceDate"],
+                "verticalDatumNormalization": "NOT_APPLIED_TO_NEWER_LIDAR",
+            }
+    active_matches = list(
+        (solar_audit.get("postDsmRefinement") or solar_audit).get("matches", [])
+    )
+    plane_evidence: dict[int, dict[str, float | None]] = {}
+    if len(active_matches) == len(planes):
+        for plane, match in zip(planes, active_matches):
+            plane_evidence[id(plane)] = {
+                "dsmRmseMeters": plane.dsm_residual_rmse_meters,
+                "solarPitchVarianceDegrees": match.get("pitchVarianceDegrees"),
+                "solarAzimuthVarianceDegrees": match.get(
+                    "azimuthVarianceDegrees"
+                ),
+            }
+    else:
+        for plane in planes:
+            plane_evidence[id(plane)] = {
+                "dsmRmseMeters": plane.dsm_residual_rmse_meters,
+                "solarPitchVarianceDegrees": None,
+                "solarAzimuthVarianceDegrees": None,
+            }
     plane_indexes = {id(plane): index for index, plane in enumerate(planes)}
 
     regions_by_plane: dict[int, list[BaseGeometry]] = {}
-    supported_roofer_facets = 0
-    nearest_plane_fallback_count = 0
     candidate_counts: list[int] = []
     partition_counts: list[int] = []
+    cell_assignment_audit: list[dict[str, Any]] = []
     assignment_gap = float(
         getattr(settings, "facet_consolidation_assignment_gap_meters", 1.0)
     )
-    for polygon, roofer_facet in zip(roofer_polygons, roofer_facets):
-        ranked: list[tuple[Any, ...]] = []
-        for plane_index, plane in enumerate(planes):
-            overlap_area = float(plane.support_hull.intersection(polygon.buffer(0.05)).area)
-            hull_distance = float(plane.support_hull.distance(polygon))
-            if overlap_area <= 0.05 and hull_distance > assignment_gap:
-                continue
-            ranked.append(
-                (
-                    0 if overlap_area > 0.05 else 1,
-                    round(hull_distance, 9),
-                    -round(overlap_area, 9),
-                    -len(plane.point_indexes),
-                    plane_index,
-                    plane,
-                )
-            )
-        ranked.sort(key=lambda item: item[:-1])
-        candidates = [item[-1] for item in ranked]
-        if not candidates:
-            nearby = []
-            original_normal = np.asarray(roofer_facet.normal)
-            centroid = roofer_facet.centroid
-            for plane_index, plane in enumerate(planes):
-                angle = _normal_angle_degrees(original_normal, np.asarray(plane.normal))
-                elevation_distance = abs(
-                    _plane_height(plane, centroid[0], centroid[1]) - centroid[2]
-                )
-                hull_distance = float(plane.support_hull.distance(polygon))
-                if angle <= 5.0 and elevation_distance <= 0.60 and hull_distance <= 2.0:
-                    nearby.append(
-                        (
-                            round(elevation_distance, 9),
-                            round(angle, 9),
-                            round(hull_distance, 9),
-                            -len(plane.point_indexes),
-                            plane_index,
-                            plane,
-                        )
-                    )
-            if not nearby:
-                raise UnreliableGeometryError(
-                    "FACET_CONSOLIDATION_FACET_UNSUPPORTED",
-                    "A Roofer facet has no independent plane support.",
-                )
-            candidates = [min(nearby)[-1]]
-            nearest_plane_fallback_count += 1
-        # Sparse normalized returns often stop just short of a real ridge,
-        # hip, or valley.  Retain both material overlaps and spatially
-        # adjacent support so the fitted 3-D planes can split a coarse Roofer
-        # face at their actual intersection.  The partitioner still rejects a
-        # pair whose equations do not meet inside this face; proximity never
-        # invents an edge by itself.
-        material = [
+    global_components = _polygon_parts(roofprint)
+    for polygon in global_components:
+        candidates = [
             plane
-            for plane in candidates
-            if float(plane.support_hull.intersection(polygon).area)
-            / max(float(polygon.area), 0.01)
-            >= 0.02
-            or float(plane.support_hull.distance(polygon)) <= assignment_gap
+            for plane in planes
+            if not plane.support_hull.intersection(
+                polygon.buffer(assignment_gap)
+            ).is_empty
         ]
-        candidates = material or candidates[:1]
-        candidates = candidates[:12]
+        if not candidates:
+            raise UnreliableGeometryError(
+                "FACET_GLOBAL_ARRANGEMENT_UNSUPPORTED",
+                "A connected roof component has no independent plane support.",
+            )
+        candidates.sort(
+            key=lambda plane: (
+                tuple(round(value, 6) for value in plane.centroid),
+                tuple(round(value, 6) for value in plane.normal),
+            )
+        )
         candidate_counts.append(len(candidates))
         partitions = _partition_roofer_facet(
-            polygon, candidates, adjacency_gap_meters=assignment_gap
+            polygon,
+            candidates,
+            adjacency_gap_meters=assignment_gap,
+            plane_evidence=plane_evidence,
+            assignment_audit=cell_assignment_audit,
         )
         partition_counts.append(len(partitions))
         for region, plane in partitions:
             plane_index = plane_indexes[id(plane)]
             regions_by_plane.setdefault(plane_index, []).append(region)
-        supported_roofer_facets += 1
 
     piece_assignments: list[tuple[BaseGeometry, int]] = []
     for plane_index, regions in regions_by_plane.items():
@@ -1341,8 +2145,8 @@ def consolidate_roofer_feature(
             )
         piece_assignments[index] = (piece, min(rankings)[-1])
 
-    # A sliver can survive at a Roofer-face boundary even after the local
-    # arrangement cleanup.  Resolve it against the complete roof partition so
+    # A sliver can survive where two global intersection lines nearly coincide.
+    # Resolve it against the complete roof partition so
     # no sub-threshold CityJSON facet is emitted and no roofprint area is
     # discarded.
     for index, (piece, plane_index) in enumerate(piece_assignments):
@@ -1384,7 +2188,13 @@ def consolidate_roofer_feature(
         )
         for piece in merged_pieces:
             if piece.geom_type == "Polygon" and piece.area > 0.25:
-                corrected.append((piece, planes[plane_index]))
+                material_holes = [
+                    list(ring.coords)
+                    for ring in piece.interiors
+                    if Polygon(ring).area > 1e-8
+                ]
+                cleaned = Polygon(list(piece.exterior.coords), material_holes)
+                corrected.append((cleaned, planes[plane_index]))
     corrected.sort(
         key=lambda item: (
             round(item[0].centroid.x, 6),
@@ -1398,24 +2208,41 @@ def consolidate_roofer_feature(
             "FACET_CONSOLIDATION_OUTPUT_EMPTY",
             "Facet consolidation produced no valid roof surfaces.",
         )
+    corrected, final_merge_audit = _merge_adjacent_supported_fragments(
+        corrected, consolidation_lidar_points, settings
+    )
+    corrected.sort(
+        key=lambda item: (
+            round(item[0].centroid.x, 6),
+            round(item[0].centroid.y, 6),
+            round(item[1].pitch_degrees, 6),
+        )
+    )
+    manifold_audit = _validate_watertight_partition(corrected, roofprint)
 
     vertices: list[list[float]] = []
     vertex_ids: dict[tuple[float, float, float], int] = {}
     boundaries: list[list[list[int]]] = []
     surfaces: list[dict[str, Any]] = []
     for polygon, plane in corrected:
-        coordinates = list(polygon.exterior.coords)[:-1]
-        if len(coordinates) < 3:
+        polygon_rings = [polygon.exterior, *polygon.interiors]
+        rings: list[list[int]] = []
+        for polygon_ring in polygon_rings:
+            coordinates = list(polygon_ring.coords)[:-1]
+            if len(coordinates) < 3:
+                continue
+            ring = []
+            for x, y in coordinates:
+                z = _plane_height(plane, float(x), float(y))
+                key = (round(float(x), 8), round(float(y), 8), round(float(z), 8))
+                if key not in vertex_ids:
+                    vertex_ids[key] = len(vertices)
+                    vertices.append(list(key))
+                ring.append(vertex_ids[key])
+            rings.append(ring)
+        if not rings:
             continue
-        ring = []
-        for x, y in coordinates:
-            z = _plane_height(plane, float(x), float(y))
-            key = (round(float(x), 8), round(float(y), 8), round(float(z), 8))
-            if key not in vertex_ids:
-                vertex_ids[key] = len(vertices)
-                vertices.append(list(key))
-            ring.append(vertex_ids[key])
-        boundaries.append([ring])
+        boundaries.append(rings)
         surfaces.append(
             {
                 "type": "RoofSurface",
@@ -1428,6 +2255,12 @@ def consolidate_roofer_feature(
         )
     attributes = dict(attributes)
     attributes["rf_facet_consolidation"] = "OPEN3D_CONNECTED_PLANE_AGGLOMERATION"
+    # Every ring above is emitted from the single, validated planar
+    # arrangement.  Tell the canonical reader not to apply Roofer's broad
+    # near-coordinate repair tolerance a second time: doing so can collapse a
+    # legitimate short edge at a three-facet junction and fabricate a
+    # non-manifold shared edge.
+    attributes["rf_exact_planar_arrangement"] = True
     corrected_feature = {
         "type": "CityJSONFeature",
         "id": str(feature.get("id") or "roof"),
@@ -1453,15 +2286,18 @@ def consolidate_roofer_feature(
     audit.update(
         {
             "inputRooferFacetCount": len(roofer_facets),
-            "supportedRooferFacetCount": supported_roofer_facets,
-            "nearestSupportedPlaneFallbackCount": nearest_plane_fallback_count,
+            "globalRoofComponentCount": len(global_components),
             "correctedFacetCount": len(boundaries),
             "usedConsolidatedPlaneCount": len(regions_by_plane),
-            "rooferFacetCandidateCounts": candidate_counts,
-            "rooferFacetPartitionCounts": partition_counts,
+            "globalComponentCandidateCounts": candidate_counts,
+            "globalComponentPartitionCounts": partition_counts,
+            "globalCellAssignments": cell_assignment_audit,
             "assignmentGapMeters": assignment_gap,
+            "temporalEvidence": temporal_audit,
             "solarReconciliation": solar_audit,
             "solarDsmReconciliation": dsm_audit,
+            "evidenceBasedFinalMerging": final_merge_audit,
+            "watertightManifold": manifold_audit,
             "fedToCanonicalTopology": True,
         }
     )

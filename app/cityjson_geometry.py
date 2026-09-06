@@ -1563,9 +1563,16 @@ def extract_roof_geometry(
         attributes, minimum_density, maximum_nodata_fraction, maximum_rmse_meters
     )
 
+    exact_planar_arrangement = bool(
+        attributes.get("rf_exact_planar_arrangement") is True
+    )
     edge_uses = _noded_edge_uses(
         facets,
-        edge_node_tolerance_meters,
+        # A consolidated feature has already passed an exact 2-D manifold
+        # gate.  Use only rounding-scale tolerance for its shared vertices;
+        # the wider tolerance remains necessary for independent raw Roofer
+        # rings that can miss one another slightly.
+        1e-7 if exact_planar_arrangement else edge_node_tolerance_meters,
         # Build one deterministic planar arrangement first.  Elevation is
         # validated below per paired segment so vertically separated roof
         # levels are recorded as measured transitions instead of leaking into

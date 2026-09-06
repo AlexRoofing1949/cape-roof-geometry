@@ -11,10 +11,15 @@ from shapely.geometry import Polygon
 
 from app.facet_consolidation import (
     ConsolidatedPlane,
+    DsmResidualSample,
     _partition_roofer_facet,
+    _spatial_dsm_residual_components,
+    _temporal_evidence_role,
+    _validate_watertight_partition,
     discover_consolidated_planes,
     validate_solar_dsm_support,
 )
+from app.errors import UnreliableGeometryError
 
 try:
     from osgeo import gdal, osr
@@ -50,6 +55,43 @@ def _gable_points() -> np.ndarray:
 
 
 class FacetConsolidationTests(unittest.TestCase):
+    def test_dsm_residuals_cluster_only_spatially_coherent_same_sign_samples(self):
+        samples = [
+            DsmResidualSample(1, index, x, y, 3.0, residual)
+            for index, (x, y, residual) in enumerate(
+                [
+                    (0.0, 0.0, 0.8),
+                    (0.3, 0.0, 0.9),
+                    (0.3, 0.3, 0.85),
+                    (4.0, 4.0, 0.9),
+                    (0.1, 0.1, -0.8),
+                    (2.0, 2.0, 0.1),
+                ]
+            )
+        ]
+        components = _spatial_dsm_residual_components(
+            samples,
+            np.asarray([sample.dsm_minus_lidar for sample in samples]),
+            residual_threshold_meters=0.35,
+            maximum_gap_meters=0.50,
+        )
+        self.assertEqual(components, [[0, 1, 2], [4], [3]])
+
+    def test_older_solar_evidence_cannot_veto_newer_lidar(self):
+        result = _temporal_evidence_role("2018-01-15", "2019-03-31")
+        self.assertEqual(result["role"], "HISTORICAL_CORROBORATION_ONLY")
+        self.assertFalse(result["mayVetoNewerLidar"])
+
+    def test_same_day_solar_evidence_may_validate_lidar(self):
+        result = _temporal_evidence_role("2019-03-31", "2019-03-31")
+        self.assertEqual(result["role"], "VALIDATION")
+        self.assertTrue(result["mayVetoNewerLidar"])
+
+    def test_undated_facet_evidence_fails_closed(self):
+        with self.assertRaises(UnreliableGeometryError) as context:
+            _temporal_evidence_role(None, "2019-03-31")
+        self.assertEqual(context.exception.code, "FACET_EVIDENCE_DATE_INVALID")
+
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "GDAL is not installed")
     def test_solar_dsm_shape_is_reconciled_after_vertical_offset(self):
         normal = np.asarray((-0.2, 0.0, 1.0), dtype=float)
@@ -180,6 +222,27 @@ class FacetConsolidationTests(unittest.TestCase):
         regions = _partition_roofer_facet(roof, [first, second])
         self.assertEqual(len(regions), 2)
         self.assertAlmostEqual(sum(region.area for region, _ in regions), roof.area)
+        manifold = _validate_watertight_partition(regions, roof)
+        self.assertEqual(manifold["validation"], "PASSED")
+        self.assertEqual(manifold["interiorOwnership"], 2)
+
+    def test_watertight_gate_rejects_overlapping_facets(self):
+        plane = ConsolidatedPlane(
+            point_indexes=tuple(range(20)),
+            normal=(0.0, 0.0, 1.0),
+            centroid=(1.0, 1.0, 0.0),
+            rmse_meters=0.0,
+            support_hull=Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+        )
+        roof = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
+        with self.assertRaises(UnreliableGeometryError) as context:
+            _validate_watertight_partition(
+                [(roof, plane), (Polygon([(1, 0), (2, 0), (2, 2), (1, 2)]), plane)],
+                roof,
+            )
+        self.assertEqual(
+            context.exception.code, "FACET_GLOBAL_ARRANGEMENT_INCOMPLETE"
+        )
 
 
 if __name__ == "__main__":

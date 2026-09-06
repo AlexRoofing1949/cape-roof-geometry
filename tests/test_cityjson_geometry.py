@@ -1050,6 +1050,18 @@ class CityJsonGeometryTests(unittest.TestCase):
             ) * 3.280839895013123
             self.assertAlmostEqual(edge["lengthFeet"], expected_length, delta=0.01)
 
+    def test_exact_planar_arrangement_is_not_reclustered_with_roofer_tolerance(self):
+        feature, transform = load_cityjson_feature(
+            FIXTURES / "simple_gable.city.jsonl"
+        )
+        building = next(iter(feature["CityObjects"].values()))
+        building.setdefault("attributes", {})["rf_exact_planar_arrangement"] = True
+        with patch(
+            "app.cityjson_geometry._noded_edge_uses", wraps=_noded_edge_uses
+        ) as noded:
+            extract_roof_geometry(feature, transform)
+        self.assertEqual(noded.call_args.args[1], 1e-7)
+
     def test_facet_ids_and_edges_are_independent_of_roofer_surface_order(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         expected = extract_roof_geometry(feature, transform)
