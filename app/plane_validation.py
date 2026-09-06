@@ -245,13 +245,12 @@ def validate_facet_points(
     }
 
 
-def validate_roofer_planes(
+def load_normalized_roof_points(
     pointcloud_path: Path,
-    facet_models: list[dict[str, Any]],
     workspace: Path,
     settings: Any,
-) -> dict[str, Any]:
-    """Export normalized roof XYZ values and independently validate every Roofer facet."""
+) -> np.ndarray:
+    """Export the exact normalized roof XYZ values once for reconstruction and validation."""
 
     o3d = _open3d()
     if o3d.__version__ != settings.open3d_version:
@@ -316,4 +315,19 @@ def validate_roofer_planes(
         raise UnreliableGeometryError(
             "OPEN3D_POINT_CLOUD_EMPTY", "No normalized roof returns were available for independent validation."
         )
+    return points
+
+
+def validate_roofer_planes(
+    pointcloud_path: Path,
+    facet_models: list[dict[str, Any]],
+    workspace: Path,
+    settings: Any,
+    *,
+    points: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Independently validate every reconstructed facet against normalized roof returns."""
+
+    if points is None:
+        points = load_normalized_roof_points(pointcloud_path, workspace, settings)
     return validate_facet_points(points, facet_models, settings)

@@ -59,6 +59,10 @@ class Settings:
     solar_mask_maximum_bytes: int
     solar_mask_maximum_ground_area_variance_percent: float
     solar_mask_simplification_tolerance_meters: float
+    solar_dsm_enabled: bool
+    solar_dsm_maximum_bytes: int
+    solar_dsm_minimum_sample_coverage: float
+    solar_dsm_maximum_centered_rmse_meters: float
     roof_edge_node_tolerance_meters: float
     roof_edge_vertical_node_tolerance_meters: float
     roof_plane_intersection_maximum_displacement_meters: float
@@ -118,6 +122,21 @@ class Settings:
     open3d_maximum_normal_variance_degrees: float
     open3d_maximum_plane_rmse_meters: float
     open3d_ransac_iterations: int
+    facet_consolidation_enabled: bool
+    facet_consolidation_crop_buffer_meters: float
+    facet_consolidation_normal_radius_meters: float
+    facet_consolidation_neighbor_radius_meters: float
+    facet_consolidation_maximum_normal_angle_degrees: float
+    facet_consolidation_maximum_local_residual_meters: float
+    facet_consolidation_minimum_points: int
+    facet_consolidation_maximum_plane_rmse_meters: float
+    facet_consolidation_merge_angle_degrees: float
+    facet_consolidation_merge_plane_distance_meters: float
+    facet_consolidation_merge_gap_meters: float
+    facet_consolidation_minimum_support_fraction: float
+    facet_consolidation_maximum_solar_rejected_support_fraction: float
+    facet_calibration_approved: bool
+    facet_calibration_dataset_version: str
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -164,6 +183,15 @@ class Settings:
             ),
             solar_mask_simplification_tolerance_meters=_float(
                 "SOLAR_MASK_SIMPLIFICATION_TOLERANCE_METERS", 0.15
+            ),
+            solar_dsm_enabled=os.getenv("SOLAR_DSM_ENABLED", "true").strip().lower()
+            in {"1", "true", "yes"},
+            solar_dsm_maximum_bytes=_int("SOLAR_DSM_MAXIMUM_BYTES", 40_000_000),
+            solar_dsm_minimum_sample_coverage=_float(
+                "SOLAR_DSM_MINIMUM_SAMPLE_COVERAGE", 0.80
+            ),
+            solar_dsm_maximum_centered_rmse_meters=_float(
+                "SOLAR_DSM_MAXIMUM_CENTERED_RMSE_METERS", 0.75
             ),
             roof_edge_node_tolerance_meters=_float(
                 "ROOF_EDGE_NODE_TOLERANCE_METERS", 0.10
@@ -263,6 +291,51 @@ class Settings:
             ),
             open3d_maximum_plane_rmse_meters=_float("OPEN3D_MAXIMUM_PLANE_RMSE_METERS", 0.15),
             open3d_ransac_iterations=_int("OPEN3D_RANSAC_ITERATIONS", 1000),
+            facet_consolidation_enabled=os.getenv(
+                "FACET_CONSOLIDATION_ENABLED", "true"
+            ).strip().lower() in {"1", "true", "yes"},
+            facet_consolidation_crop_buffer_meters=_float(
+                "FACET_CONSOLIDATION_CROP_BUFFER_METERS", 0.20
+            ),
+            facet_consolidation_normal_radius_meters=_float(
+                "FACET_CONSOLIDATION_NORMAL_RADIUS_METERS", 0.45
+            ),
+            facet_consolidation_neighbor_radius_meters=_float(
+                "FACET_CONSOLIDATION_NEIGHBOR_RADIUS_METERS", 0.40
+            ),
+            facet_consolidation_maximum_normal_angle_degrees=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_NORMAL_ANGLE_DEGREES", 4.0
+            ),
+            facet_consolidation_maximum_local_residual_meters=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_LOCAL_RESIDUAL_METERS", 0.06
+            ),
+            facet_consolidation_minimum_points=_int(
+                "FACET_CONSOLIDATION_MINIMUM_POINTS", 20
+            ),
+            facet_consolidation_maximum_plane_rmse_meters=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_PLANE_RMSE_METERS", 0.15
+            ),
+            facet_consolidation_merge_angle_degrees=_float(
+                "FACET_CONSOLIDATION_MERGE_ANGLE_DEGREES", 4.0
+            ),
+            facet_consolidation_merge_plane_distance_meters=_float(
+                "FACET_CONSOLIDATION_MERGE_PLANE_DISTANCE_METERS", 0.18
+            ),
+            facet_consolidation_merge_gap_meters=_float(
+                "FACET_CONSOLIDATION_MERGE_GAP_METERS", 2.0
+            ),
+            facet_consolidation_minimum_support_fraction=_float(
+                "FACET_CONSOLIDATION_MINIMUM_SUPPORT_FRACTION", 0.75
+            ),
+            facet_consolidation_maximum_solar_rejected_support_fraction=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_SOLAR_REJECTED_SUPPORT_FRACTION", 0.05
+            ),
+            facet_calibration_approved=os.getenv(
+                "FACET_CALIBRATION_APPROVED", "false"
+            ).strip().lower() in {"1", "true", "yes"},
+            facet_calibration_dataset_version=os.getenv(
+                "FACET_CALIBRATION_DATASET_VERSION", ""
+            ).strip(),
         )
         settings.validate()
         return settings
@@ -310,6 +383,9 @@ class Settings:
             and 1_000_000 <= self.solar_mask_maximum_bytes <= 50_000_000
             and 1 <= self.solar_mask_maximum_ground_area_variance_percent <= 10
             and 0.10 <= self.solar_mask_simplification_tolerance_meters <= 0.20
+            and 1_000_000 <= self.solar_dsm_maximum_bytes <= 100_000_000
+            and 0.50 <= self.solar_dsm_minimum_sample_coverage <= 1.0
+            and 0.10 <= self.solar_dsm_maximum_centered_rmse_meters <= 1.0
             and 0.02 <= self.roof_edge_node_tolerance_meters <= 0.15
             and 0.10 <= self.roof_edge_vertical_node_tolerance_meters <= 0.40
             and 0.10
@@ -452,5 +528,32 @@ class Settings:
             raise ConfigurationError(
                 "OPEN3D_GEOMETRY_THRESHOLD_INVALID",
                 "Open3D geometry thresholds are outside the supported fail-closed range.",
+            )
+        if not (
+            0 <= self.facet_consolidation_crop_buffer_meters <= 0.50
+            and 0.20 <= self.facet_consolidation_normal_radius_meters <= 1.0
+            and 0.20 <= self.facet_consolidation_neighbor_radius_meters <= 1.0
+            and 1.0 <= self.facet_consolidation_maximum_normal_angle_degrees <= 10.0
+            and 0.02 <= self.facet_consolidation_maximum_local_residual_meters <= 0.20
+            and 10 <= self.facet_consolidation_minimum_points <= 200
+            and 0.02 <= self.facet_consolidation_maximum_plane_rmse_meters <= 0.30
+            and 1.0 <= self.facet_consolidation_merge_angle_degrees <= 10.0
+            and 0.02 <= self.facet_consolidation_merge_plane_distance_meters <= 0.30
+            and 0.20 <= self.facet_consolidation_merge_gap_meters <= 3.0
+            and 0.50 <= self.facet_consolidation_minimum_support_fraction <= 1.0
+            and 0.0
+            <= self.facet_consolidation_maximum_solar_rejected_support_fraction
+            <= 0.10
+        ):
+            raise ConfigurationError(
+                "FACET_CONSOLIDATION_CONFIG_INVALID",
+                "Facet-consolidation thresholds are outside the supported fail-closed range.",
+            )
+        if self.facet_calibration_approved and not re.fullmatch(
+            r"CCR-EV-[0-9a-f]{16}", self.facet_calibration_dataset_version
+        ):
+            raise ConfigurationError(
+                "FACET_CALIBRATION_VERSION_INVALID",
+                "An approved facet calibration requires its immutable private dataset version.",
             )
         self.work_root.mkdir(parents=True, exist_ok=True)

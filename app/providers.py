@@ -90,6 +90,7 @@ class FootprintResult:
     consensus_status: str = "SINGLE_SOURCE"
     consensus_records: tuple[dict[str, Any], ...] = ()
     lineage_group: str = "OPEN_MAP_FAMILY"
+    solar_dsm_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -914,6 +915,77 @@ def fetch_google_solar_roofprint(
         timeout=settings.provider_timeout_seconds,
         maximum_bytes=settings.solar_mask_maximum_bytes,
     )
+    dsm_path: Path | None = None
+    if getattr(settings, "solar_dsm_enabled", False):
+        dsm_query = urllib.parse.urlencode(
+            {
+                "location.latitude": latitude,
+                "location.longitude": longitude,
+                "radiusMeters": settings.solar_data_layer_radius_meters,
+                "view": "DSM_LAYER",
+                "requiredQuality": "HIGH",
+                "exactQualityRequired": "true",
+                "pixelSizeMeters": 0.1,
+                "key": settings.solar_api_key,
+            }
+        )
+        dsm_request = urllib.request.Request(
+            f"https://solar.googleapis.com/v1/dataLayers:get?{dsm_query}",
+            headers={"User-Agent": "CapeRoofGeometry/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(
+                dsm_request, timeout=settings.provider_timeout_seconds
+            ) as response:
+                dsm_payload = json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code >= 500 or error.code in {408, 429}:
+                raise TransientProviderError(
+                    "SOLAR_DSM_HTTP_ERROR",
+                    "Google Solar DSM evidence is temporarily unavailable.",
+                ) from error
+            raise NoCoverageError(
+                "SOLAR_DSM_NOT_FOUND",
+                "Google Solar has no authorized high-quality DSM for this property.",
+            ) from error
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            raise TransientProviderError(
+                "SOLAR_DSM_UNAVAILABLE",
+                "Google Solar DSM evidence is temporarily unavailable.",
+            ) from error
+        if not isinstance(dsm_payload, dict):
+            dsm_payload = {}
+        dsm_imagery = dsm_payload.get("imageryDate")
+        try:
+            dsm_imagery_date = (
+                f"{int(dsm_imagery['year']):04d}-{int(dsm_imagery['month']):02d}-"
+                f"{int(dsm_imagery['day']):02d}"
+            )
+        except (KeyError, TypeError, ValueError):
+            dsm_imagery_date = ""
+        dsm_url = str(dsm_payload.get("dsmUrl") or "").strip()
+        if (
+            str(dsm_payload.get("imageryQuality") or "").upper() != "HIGH"
+            or dsm_imagery_date != imagery_date
+            or not dsm_url.startswith("https://solar.googleapis.com/")
+        ):
+            raise UnreliableGeometryError(
+                "SOLAR_DSM_EVIDENCE_INVALID",
+                "Google Solar DSM evidence is missing, undated, or inconsistent with the roof mask.",
+                details={
+                    "maskImageryDate": imagery_date,
+                    "dsmImageryDate": dsm_imagery_date,
+                    "dsmImageryQuality": str(dsm_payload.get("imageryQuality") or "").upper(),
+                },
+            )
+        dsm_path = workspace / "google-solar-dsm.tif"
+        separator = "&" if "?" in dsm_url else "?"
+        _download_file(
+            f"{dsm_url}{separator}{urllib.parse.urlencode({'key': settings.solar_api_key})}",
+            dsm_path,
+            timeout=settings.provider_timeout_seconds,
+            maximum_bytes=settings.solar_dsm_maximum_bytes,
+        )
     polygons = _polygonize_google_solar_mask(mask_path)
     features = [
         {
@@ -1019,12 +1091,14 @@ def fetch_google_solar_roofprint(
                 "imageryDate": imagery_date,
                 "imageryQuality": imagery_quality,
                 "pixelSizeMeters": 0.1,
+                "dsmReconciliationRequired": bool(dsm_path),
                 "maskSimplification": simplification_audit,
             }
         ],
         consensus_status="ROOF_MASK_CORROBORATED",
         consensus_records=tuple(audit),
         lineage_group="GOOGLE_SOLAR_ROOF_MASK",
+        solar_dsm_path=dsm_path,
     )
 
 

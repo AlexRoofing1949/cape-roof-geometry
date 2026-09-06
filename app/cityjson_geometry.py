@@ -23,6 +23,7 @@ METERS_TO_FEET = 3.280839895013123
 SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
 EDGE_NODE_TOLERANCE_METERS = 0.10
 EDGE_NODE_VERTICAL_TOLERANCE_METERS = 0.30
+MAXIMUM_COSINE_FORMULA_ERROR_PERCENT = 0.000001
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,15 @@ def _norm(value: tuple[float, float, float]) -> float:
 
 def _newell(ring: Iterable[tuple[float, float, float]]) -> tuple[float, float, float]:
     points = list(ring)
+    # Translate projected coordinates into a local frame before accumulating.
+    # Southwest Florida UTM coordinates otherwise subtract products near 1e12,
+    # which is large enough to violate the production 1e-6% cosine identity
+    # even when every vertex lies on one fitted plane.
+    origin = points[0]
+    points = [
+        (point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])
+        for point in points
+    ]
     nx = ny = nz = 0.0
     for current, following in zip(points, points[1:] + points[:1]):
         nx += (current[1] - following[1]) * (current[2] + following[2])
@@ -118,6 +128,11 @@ def _projected_edge_direction_variance_degrees(
 
 def _horizontal_ring_area(points: Iterable[tuple[float, float, float]]) -> float:
     values = list(points)
+    origin = values[0]
+    values = [
+        (point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])
+        for point in values
+    ]
     return abs(
         sum(
             current[0] * following[1] - following[0] * current[1]
@@ -1301,7 +1316,12 @@ def load_cityjson_feature(feature_path: Path, metadata_path: Path | None = None)
     return features[0], transform
 
 
-def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> tuple[list[Facet], dict[str, Any]]:
+def _roof_facets(
+    feature: dict[str, Any],
+    transform: dict[str, Any] | None,
+    *,
+    maximum_formula_error_percent: float = MAXIMUM_COSINE_FORMULA_ERROR_PERCENT,
+) -> tuple[list[Facet], dict[str, Any]]:
     vertices = _decode_vertices(feature.get("vertices", []), transform)
     if not vertices:
         raise UnreliableGeometryError("CITYJSON_VERTICES_MISSING", "Roofer returned no reconstructed vertices.")
@@ -1429,7 +1449,7 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
         cosine = math.cos(math.radians(pitch))
         slope_area_from_projection = horizontal_area / cosine
         area_variance = abs(slope_area_from_projection - area) / area * 100
-        if area_variance > 0.5:
+        if area_variance > maximum_formula_error_percent:
             raise UnreliableGeometryError(
                 "ROOF_AREA_FORMULA_MISMATCH",
                 "The reconstructed 3D facet area does not reconcile with horizontal area divided by cosine of pitch.",
@@ -1534,7 +1554,11 @@ def extract_roof_geometry(
 ) -> dict[str, Any]:
     """Return measured facets and classified roof lines from one Roofer model."""
 
-    facets, attributes = _roof_facets(feature, transform)
+    facets, attributes = _roof_facets(
+        feature,
+        transform,
+        maximum_formula_error_percent=MAXIMUM_COSINE_FORMULA_ERROR_PERCENT,
+    )
     quality_confidence, quality_components = _quality_confidence(
         attributes, minimum_density, maximum_nodata_fraction, maximum_rmse_meters
     )
@@ -2017,6 +2041,18 @@ def extract_roof_geometry(
                     / math.cos(math.radians(facet.pitch_degrees))
                 )
                 * SQUARE_METERS_TO_SQUARE_FEET
+            ),
+            "slopeAreaFormulaErrorPercent": _round(
+                abs(
+                    (
+                        facet.horizontal_area_square_meters
+                        / math.cos(math.radians(facet.pitch_degrees))
+                    )
+                    - facet.area_square_meters
+                )
+                / facet.area_square_meters
+                * 100,
+                9,
             ),
             "pitchDegrees": _round(facet.pitch_degrees),
             "pitchRisePer12": _round(12 * math.tan(math.radians(facet.pitch_degrees))),

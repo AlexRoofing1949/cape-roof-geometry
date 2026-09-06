@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from .cityjson_geometry import extract_roof_geometry, load_cityjson_feature
+from .facet_consolidation import consolidate_roofer_feature
 from .config import Settings
 from .errors import TransientProviderError, UnreliableGeometryError
 from .imagery_validation import validate_current_structure
 from .models import GeometryRequest
-from .plane_validation import validate_roofer_planes
+from .plane_validation import load_normalized_roof_points, validate_roofer_planes
 from .providers import (
     fetch_best_footprint,
     fetch_google_solar_roofprint,
@@ -766,6 +767,20 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     settings,
                 )
                 feature, transform = load_cityjson_feature(feature_path, metadata_path)
+                normalized_roof_points = load_normalized_roof_points(
+                    pointcloud, workspace, settings
+                )
+                facet_consolidation: dict[str, Any] | None = None
+                if settings.facet_consolidation_enabled:
+                    feature, transform, facet_consolidation = consolidate_roofer_feature(
+                        feature,
+                        transform,
+                        normalized_roof_points,
+                        request.solarReference,
+                        settings,
+                        solar_dsm_path=footprint.solar_dsm_path,
+                        projected_crs=f"EPSG:{target_epsg}",
+                    )
                 geometry = extract_roof_geometry(
                     feature,
                     transform,
@@ -789,6 +804,8 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
                     include_validation_facets=True,
                 )
+                if facet_consolidation is not None:
+                    geometry["facetConsolidation"] = facet_consolidation
                 _enforce_shared_boundary_completeness(
                     geometry,
                     settings.maximum_unmatched_interior_boundary_feet,
@@ -800,7 +817,11 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 )
                 validation_facets = geometry.pop("_validationFacets")
                 plane_validation = validate_roofer_planes(
-                    pointcloud, validation_facets, workspace, settings
+                    pointcloud,
+                    validation_facets,
+                    workspace,
+                    settings,
+                    points=normalized_roof_points,
                 )
                 geometry["independentPlaneValidation"] = plane_validation
                 reconciliation = _solar_reconciliation(geometry, request, settings)
@@ -886,19 +907,28 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
             "NOAA-PUBLIC-DATASET" if lidar_component == "NOAA/DigitalCoast" else "USGS-PUBLIC-DOMAIN"
         )
 
+        pricing_allowed = bool(imagery_decision["pricingAllowed"])
+        status = imagery_decision["status"]
+        hold_reason = imagery_decision["holdReason"]
+        if not settings.facet_calibration_approved:
+            pricing_allowed = False
+            status = "FACET_CALIBRATION_HOLD"
+            hold_reason = "FACET_CALIBRATION_NOT_APPROVED"
+
         return {
             "schemaVersion": "1.1",
             "coordinateReferenceSystem": f"EPSG:{target_epsg}",
             "available": True,
             "verificationStatus": imagery_decision["verificationStatus"],
-            "pricingAllowed": imagery_decision["pricingAllowed"],
-            "status": imagery_decision["status"],
-            "holdReason": imagery_decision["holdReason"],
-            "provider": f"3DBAG Roofer + PDAL + {lidar.provider}",
+            "pricingAllowed": pricing_allowed,
+            "status": status,
+            "holdReason": hold_reason,
+            "provider": f"3DBAG Roofer + Open3D + PDAL + {lidar.provider}",
             "provenance": {
                 "serviceLicense": "GPL-3.0",
                 "sourceCodeUrl": settings.service_source_url,
                 "modelVersion": f"service:{settings.service_commit};roofer:{settings.roofer_commit}",
+                "facetCalibrationDatasetVersion": settings.facet_calibration_dataset_version,
                 "registryIds": [
                     "3DBAG/roofer",
                     "PDAL/PDAL",
@@ -978,6 +1008,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "license": "BSD-3-Clause",
                 },
                 "planeValidation": geometry["independentPlaneValidation"],
+                "facetConsolidation": geometry.get("facetConsolidation"),
                 "footprintClient": {
                     "provider": "overturemaps-py",
                     "version": settings.overturemaps_version,
@@ -1010,6 +1041,12 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                         settings.maximum_unmatched_interior_boundary_feet
                     ),
                     "minimumServiceConfidence": settings.minimum_service_confidence,
+                    "facetConsolidationEnabled": settings.facet_consolidation_enabled,
+                    "facetCalibrationApproved": settings.facet_calibration_approved,
+                    "facetCalibrationDatasetVersion": (
+                        settings.facet_calibration_dataset_version
+                    ),
+                    "solarDsmEnabled": settings.solar_dsm_enabled,
                 },
                 "warnings": imagery_decision["warnings"],
             },

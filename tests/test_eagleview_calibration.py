@@ -17,6 +17,71 @@ SPEC.loader.exec_module(calibration)
 
 
 class EagleViewCalibrationTests(unittest.TestCase):
+    @staticmethod
+    def _candidate(topology_hash: str = "a" * 64):
+        pitch = math.degrees(math.atan(0.5))
+        return {
+            "geometry": {
+                "roofAreaSqFt": 100.0,
+                "averagePitchDegrees": pitch,
+                "facets": [
+                    {
+                        "areaSqFt": 100.0,
+                        "horizontalAreaSqFt": 100.0 * math.cos(math.radians(pitch)),
+                        "pitchDegrees": pitch,
+                    }
+                ],
+                "ridgesFeet": 10.0,
+                "hipsFeet": 20.0,
+                "valleysFeet": 5.0,
+                "rakesFeet": 12.0,
+                "eavesFeet": 30.0,
+                "topology": {"topologyHash": topology_hash},
+            }
+        }
+
+    @staticmethod
+    def _reference():
+        return calibration.ReferenceMeasurements(
+            report_id="73026931",
+            roof_area_sq_ft=100.0,
+            facet_count=1,
+            predominant_pitch_rise=6.0,
+            ridges_ft=10.0,
+            hips_ft=20.0,
+            valleys_ft=5.0,
+            rakes_ft=12.0,
+            eaves_ft=30.0,
+        )
+
+    def test_candidate_requires_edges_and_repeatable_topology(self):
+        candidate = self._candidate()
+        result = calibration.evaluate_candidate_runs(
+            self._reference(), [candidate, candidate]
+        )
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["topologyHashDeterministic"])
+        self.assertFalse(result["inspectionRequired"])
+
+    def test_candidate_edge_error_is_a_mandatory_gate(self):
+        first = self._candidate()
+        second = self._candidate()
+        first["geometry"]["hipsFeet"] = 22.0
+        result = calibration.evaluate_candidate_runs(
+            self._reference(), [first, second], maximum_edge_error_feet=1.0
+        )
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("HIPS_ERROR_EXCEEDED", result["runs"][0]["failures"])
+        self.assertTrue(result["inspectionRequired"])
+
+    def test_candidate_topology_hash_must_repeat_exactly(self):
+        result = calibration.evaluate_candidate_runs(
+            self._reference(), [self._candidate("a" * 64), self._candidate("b" * 64)]
+        )
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(result["topologyHashDeterministic"])
+        self.assertIn("TOPOLOGY_HASH_NOT_DETERMINISTIC", result["runs"][0]["failures"])
+
     def test_parse_summary_and_edges(self):
         result = calibration.parse_eagleview_text(
             """
