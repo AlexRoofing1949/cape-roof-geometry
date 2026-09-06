@@ -133,6 +133,7 @@ class Settings:
     facet_consolidation_merge_angle_degrees: float
     facet_consolidation_merge_plane_distance_meters: float
     facet_consolidation_merge_gap_meters: float
+    facet_consolidation_assignment_gap_meters: float
     facet_consolidation_minimum_support_fraction: float
     facet_consolidation_maximum_solar_rejected_support_fraction: float
     facet_calibration_approved: bool
@@ -323,6 +324,9 @@ class Settings:
             ),
             facet_consolidation_merge_gap_meters=_float(
                 "FACET_CONSOLIDATION_MERGE_GAP_METERS", 2.0
+            ),
+            facet_consolidation_assignment_gap_meters=_float(
+                "FACET_CONSOLIDATION_ASSIGNMENT_GAP_METERS", 1.0
             ),
             facet_consolidation_minimum_support_fraction=_float(
                 "FACET_CONSOLIDATION_MINIMUM_SUPPORT_FRACTION", 0.75
@@ -540,6 +544,7 @@ class Settings:
             and 1.0 <= self.facet_consolidation_merge_angle_degrees <= 10.0
             and 0.02 <= self.facet_consolidation_merge_plane_distance_meters <= 0.30
             and 0.20 <= self.facet_consolidation_merge_gap_meters <= 3.0
+            and 0.20 <= self.facet_consolidation_assignment_gap_meters <= 2.0
             and 0.50 <= self.facet_consolidation_minimum_support_fraction <= 1.0
             and 0.0
             <= self.facet_consolidation_maximum_solar_rejected_support_fraction

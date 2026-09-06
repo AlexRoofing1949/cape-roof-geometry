@@ -428,7 +428,20 @@ def _clip_to_plane_side(
             "FACET_CONSOLIDATION_SIDE_AMBIGUOUS",
             "A plane candidate's own support lies on a proposed split boundary.",
         )
-    origin = np.asarray((-a * c / denominator, -b * c / denominator))
+    # Anchor the infinite intersection line at the point nearest this small
+    # roof region, not at the point nearest global coordinate (0, 0).  In UTM
+    # that global anchor can be hundreds of kilometres away along the same
+    # line, so a finite segment centred there never reaches the property.
+    region_center = region.representative_point()
+    signed_offset = (
+        a * region_center.x + b * region_center.y + c
+    ) / denominator
+    origin = np.asarray(
+        (
+            region_center.x - a * signed_offset,
+            region_center.y - b * signed_offset,
+        )
+    )
     direction = np.asarray((-b, a))
     direction /= max(float(np.linalg.norm(direction)), 1e-12)
     bounds = region.bounds
@@ -453,18 +466,23 @@ def _clip_to_plane_side(
 def _partition_roofer_facet(
     polygon: Polygon,
     candidates: list[ConsolidatedPlane],
+    adjacency_gap_meters: float = 1.25,
+    minimum_interior_clearance_meters: float = 0.20,
 ) -> list[tuple[BaseGeometry, ConsolidatedPlane]]:
     if len(candidates) == 1:
         return [(polygon, candidates[0])]
-    # If two extrapolated plane equations never meet inside this Roofer face,
-    # they cannot create a supported edge here.  Keep the candidate with the
-    # strongest local hull support.  This removes distant fragments whose
-    # convex hull merely brushes the face without inventing a seam.
-    active = list(candidates)
-    dominated: set[int] = set()
-    for left in range(len(active)):
-        for right in range(left + 1, len(active)):
-            first, second = active[left], active[right]
+    # Build an arrangement only from spatially adjacent fitted planes whose
+    # true 3-D intersection crosses this Roofer face.  Classifying the
+    # resulting cells is more robust than repeatedly clipping a face against
+    # every candidate: a non-adjacent third plane can no longer erase two
+    # otherwise valid neighbouring facets.
+    relations: list[dict[str, Any]] = []
+    lines: list[LineString] = []
+    bounds = polygon.bounds
+    extent = max(bounds[2] - bounds[0], bounds[3] - bounds[1], 1.0) * 8 + 100
+    for left in range(len(candidates)):
+        for right in range(left + 1, len(candidates)):
+            first, second = candidates[left], candidates[right]
             n1, n2 = np.asarray(first.normal), np.asarray(second.normal)
             c1, c2 = np.asarray(first.centroid), np.asarray(second.centroid)
             a1, b1 = -n1[0] / n1[2], -n1[1] / n1[2]
@@ -473,46 +491,248 @@ def _partition_roofer_facet(
             z2 = c2[2] - a2 * c2[0] - b2 * c2[1]
             a, b, c = a1 - a2, b1 - b2, z1 - z2
             denominator = a * a + b * b
-            intersects = False
-            if denominator > 1e-12:
-                origin = np.asarray((-a * c / denominator, -b * c / denominator))
-                direction = np.asarray((-b, a))
-                direction /= max(float(np.linalg.norm(direction)), 1e-12)
-                bounds = polygon.bounds
-                extent = max(bounds[2] - bounds[0], bounds[3] - bounds[1], 1.0) * 8 + 100
-                line = LineString(
-                    [origin - direction * extent, origin + direction * extent]
-                )
-                intersects = not line.intersection(polygon).is_empty
-            if intersects:
+            if denominator <= 1e-12:
                 continue
-            scores = []
-            for index, candidate in ((left, first), (right, second)):
-                scores.append(
-                    (
-                        float(candidate.support_hull.intersection(polygon).area),
-                        len(candidate.point_indexes),
-                        -candidate.rmse_meters,
-                        -index,
-                        index,
+            polygon_center = polygon.representative_point()
+            signed_offset = (
+                a * polygon_center.x + b * polygon_center.y + c
+            ) / denominator
+            origin = np.asarray(
+                (
+                    polygon_center.x - a * signed_offset,
+                    polygon_center.y - b * signed_offset,
+                )
+            )
+            direction = np.asarray((-b, a))
+            direction /= max(float(np.linalg.norm(direction)), 1e-12)
+            line = LineString([origin - direction * extent, origin + direction * extent])
+            clipped_line = line.intersection(polygon)
+            if clipped_line.is_empty:
+                continue
+            if (
+                clipped_line.centroid.distance(polygon.boundary)
+                <= minimum_interior_clearance_meters
+            ):
+                continue
+            if (
+                line.distance(first.support_hull) > adjacency_gap_meters
+                or line.distance(second.support_hull) > adjacency_gap_meters
+                or first.support_hull.distance(second.support_hull)
+                > adjacency_gap_meters
+            ):
+                continue
+            first_probe = first.support_hull.representative_point()
+            second_probe = second.support_hull.representative_point()
+            first_side = a * first_probe.x + b * first_probe.y + c
+            second_side = a * second_probe.x + b * second_probe.y + c
+            if abs(first_side) <= 0.02 or abs(second_side) <= 0.02:
+                continue
+            if first_side * second_side >= 0:
+                continue
+            unit_a, unit_b = a / math.sqrt(denominator), b / math.sqrt(denominator)
+            first_distance = first_side / math.sqrt(denominator)
+            second_distance = second_side / math.sqrt(denominator)
+            first_on_line = (
+                first_probe.x - unit_a * first_distance,
+                first_probe.y - unit_b * first_distance,
+            )
+            second_on_line = (
+                second_probe.x - unit_a * second_distance,
+                second_probe.y - unit_b * second_distance,
+            )
+            first_height_delta = _plane_height(
+                first, first_probe.x, first_probe.y
+            ) - _plane_height(first, *first_on_line)
+            second_height_delta = _plane_height(
+                second, second_probe.x, second_probe.y
+            ) - _plane_height(second, *second_on_line)
+            if first_height_delta * second_height_delta <= 0:
+                continue
+            relations.append(
+                {
+                    "left": left,
+                    "right": right,
+                    "a": a,
+                    "b": b,
+                    "c": c,
+                    "leftSide": first_side,
+                    "rightSide": second_side,
+                    "junctionShape": (
+                        "CONCAVE" if first_height_delta > 0 else "CONVEX"
+                    ),
+                }
+            )
+            normalized_length = math.sqrt(denominator)
+            normalized = np.asarray((a, b, c), dtype=float) / normalized_length
+            if normalized[0] < 0 or (
+                abs(normalized[0]) <= 1e-12 and normalized[1] < 0
+            ):
+                normalized = -normalized
+            duplicate = False
+            for existing in relations[:-1]:
+                existing_line = existing["normalizedLine"]
+                direction_agreement = abs(
+                    float(np.dot(normalized[:2], existing_line[:2]))
+                )
+                line_separation = abs(
+                    float(
+                        (normalized[0] - existing_line[0]) * polygon_center.x
+                        + (normalized[1] - existing_line[1]) * polygon_center.y
+                        + normalized[2]
+                        - existing_line[2]
                     )
                 )
-            winner = max(scores)[-1]
-            dominated.add(right if winner == left else left)
-    candidates = [
-        candidate for index, candidate in enumerate(active) if index not in dominated
-    ]
-    if len(candidates) == 1:
-        return [(polygon, candidates[0])]
-    regions: list[tuple[BaseGeometry, ConsolidatedPlane]] = []
-    for first in candidates:
+                if direction_agreement >= math.cos(math.radians(2.0)) and line_separation <= 0.10:
+                    duplicate = True
+                    break
+            relations[-1]["normalizedLine"] = normalized
+            if not duplicate:
+                lines.append(line)
+
+    if not relations:
+        strongest = max(
+            enumerate(candidates),
+            key=lambda item: (
+                float(item[1].support_hull.intersection(polygon).area),
+                len(item[1].point_indexes),
+                -item[1].rmse_meters,
+                -item[0],
+            ),
+        )[1]
+        return [(polygon, strongest)]
+
+    active_indexes = sorted(
+        {
+            int(relation[index_name])
+            for relation in relations
+            for index_name in ("left", "right")
+        }
+    )
+    halfspace_regions: list[tuple[BaseGeometry, ConsolidatedPlane]] = []
+    for index in active_indexes:
         region: BaseGeometry = polygon
-        for second in candidates:
-            if first is second or region.is_empty:
+        for relation in relations:
+            if index == relation["left"]:
+                other_index = int(relation["right"])
+            elif index == relation["right"]:
+                other_index = int(relation["left"])
+            else:
                 continue
-            region = _clip_to_plane_side(region, first, second)
-        if not region.is_empty and region.area > 0.05:
-            regions.append((region, first))
+            region = _clip_to_plane_side(
+                region, candidates[index], candidates[other_index]
+            )
+            if region.is_empty:
+                break
+        if not region.is_empty and region.area > 0.25:
+            halfspace_regions.append((region, candidates[index]))
+    halfspace_union = (
+        unary_union([region for region, _ in halfspace_regions])
+        if halfspace_regions
+        else Polygon()
+    )
+    halfspace_coverage = float(halfspace_union.intersection(polygon).area) / max(
+        float(polygon.area), 0.01
+    )
+    halfspace_summed = sum(float(region.area) for region, _ in halfspace_regions)
+    halfspace_overlap = max(
+        0.0, halfspace_summed - float(halfspace_union.area)
+    ) / max(float(polygon.area), 0.01)
+    if halfspace_coverage >= 0.995 and halfspace_overlap <= 0.005:
+        return halfspace_regions
+
+    cells: list[BaseGeometry] = [polygon]
+    for line in lines:
+        next_cells: list[BaseGeometry] = []
+        for cell in cells:
+            try:
+                pieces = split(cell, line)
+            except (ValueError, TypeError) as error:
+                raise UnreliableGeometryError(
+                    "FACET_CONSOLIDATION_SPLIT_INVALID",
+                    "A supported plane intersection could not split the roof coverage.",
+                ) from error
+            next_cells.extend(
+                piece
+                for piece in pieces.geoms
+                if not piece.is_empty and piece.area > 1e-8
+            )
+        cells = next_cells
+
+    cell_assignments: list[tuple[BaseGeometry, int]] = []
+    for cell in cells:
+        probe = cell.representative_point()
+        rankings = []
+        for index, candidate in enumerate(candidates):
+            mismatches = 0
+            for relation in relations:
+                if index not in {relation["left"], relation["right"]}:
+                    continue
+                expected_side = (
+                    relation["leftSide"]
+                    if index == relation["left"]
+                    else relation["rightSide"]
+                )
+                actual_side = (
+                    relation["a"] * probe.x
+                    + relation["b"] * probe.y
+                    + relation["c"]
+                )
+                if actual_side * expected_side < -1e-8:
+                    mismatches += 1
+            rankings.append(
+                (
+                    mismatches,
+                    round(float(candidate.support_hull.distance(probe)), 9),
+                    -round(float(candidate.support_hull.intersection(cell).area), 9),
+                    -len(candidate.point_indexes),
+                    index,
+                )
+            )
+        winner = min(rankings)[-1]
+        cell_assignments.append((cell, winner))
+
+    # Arrangement lines can intersect within centimetres of one another and
+    # create numerical sliver cells.  Preserve complete coverage while
+    # preventing those artefacts from becoming fabricated roof facets by
+    # assigning each sliver to the non-sliver cell sharing its longest edge.
+    minimum_partition_area = 0.25
+    regular_indexes = [
+        index
+        for index, (cell, _) in enumerate(cell_assignments)
+        if cell.area >= minimum_partition_area
+    ]
+    for index, (cell, winner) in enumerate(cell_assignments):
+        if cell.area >= minimum_partition_area:
+            continue
+        neighbours = []
+        for other_index in regular_indexes:
+            other_cell, other_winner = cell_assignments[other_index]
+            shared = float(cell.boundary.intersection(other_cell.boundary).length)
+            if shared > 1e-8:
+                neighbours.append(
+                    (
+                        -round(shared, 9),
+                        round(float(cell.distance(other_cell)), 9),
+                        other_index,
+                        other_winner,
+                    )
+                )
+        if neighbours:
+            cell_assignments[index] = (cell, min(neighbours)[-1])
+
+    assigned: dict[int, list[BaseGeometry]] = {}
+    for cell, winner in cell_assignments:
+        assigned.setdefault(winner, []).append(cell)
+
+    regions: list[tuple[BaseGeometry, ConsolidatedPlane]] = []
+    for index, assigned_cells in sorted(assigned.items()):
+        combined = unary_union(assigned_cells)
+        pieces = [combined] if combined.geom_type == "Polygon" else list(combined.geoms)
+        regions.extend(
+            (piece, candidates[index])
+            for piece in pieces
+            if piece.geom_type == "Polygon" and piece.area > 1e-8
+        )
     union = unary_union([region for region, _ in regions]) if regions else Polygon()
     coverage = float(union.intersection(polygon).area) / max(float(polygon.area), 0.01)
     summed = sum(float(region.area) for region, _ in regions)
@@ -772,15 +992,28 @@ def consolidate_roofer_feature(
     nearest_plane_fallback_count = 0
     candidate_counts: list[int] = []
     partition_counts: list[int] = []
+    assignment_gap = float(
+        getattr(settings, "facet_consolidation_assignment_gap_meters", 1.0)
+    )
     for polygon, roofer_facet in zip(roofer_polygons, roofer_facets):
-        ranked: list[tuple[int, int, ConsolidatedPlane]] = []
+        ranked: list[tuple[Any, ...]] = []
         for plane_index, plane in enumerate(planes):
             overlap_area = float(plane.support_hull.intersection(polygon.buffer(0.05)).area)
-            if overlap_area <= 0.05:
+            hull_distance = float(plane.support_hull.distance(polygon))
+            if overlap_area <= 0.05 and hull_distance > assignment_gap:
                 continue
-            ranked.append((len(plane.point_indexes), plane_index, plane))
-        ranked.sort(key=lambda item: (-item[0], item[1]))
-        candidates = [item[2] for item in ranked]
+            ranked.append(
+                (
+                    0 if overlap_area > 0.05 else 1,
+                    round(hull_distance, 9),
+                    -round(overlap_area, 9),
+                    -len(plane.point_indexes),
+                    plane_index,
+                    plane,
+                )
+            )
+        ranked.sort(key=lambda item: item[:-1])
+        candidates = [item[-1] for item in ranked]
         if not candidates:
             nearby = []
             original_normal = np.asarray(roofer_facet.normal)
@@ -809,33 +1042,109 @@ def consolidate_roofer_feature(
                 )
             candidates = [min(nearby)[-1]]
             nearest_plane_fallback_count += 1
-        # A hull sliver can touch a neighbouring face.  Retain candidates that
-        # materially occupy this face, plus the strongest candidate.
+        # Sparse normalized returns often stop just short of a real ridge,
+        # hip, or valley.  Retain both material overlaps and spatially
+        # adjacent support so the fitted 3-D planes can split a coarse Roofer
+        # face at their actual intersection.  The partitioner still rejects a
+        # pair whose equations do not meet inside this face; proximity never
+        # invents an edge by itself.
         material = [
             plane
             for plane in candidates
             if float(plane.support_hull.intersection(polygon).area)
             / max(float(polygon.area), 0.01)
             >= 0.02
+            or float(plane.support_hull.distance(polygon)) <= assignment_gap
         ]
         candidates = material or candidates[:1]
         candidates = candidates[:12]
         candidate_counts.append(len(candidates))
-        partitions = _partition_roofer_facet(polygon, candidates)
+        partitions = _partition_roofer_facet(
+            polygon, candidates, adjacency_gap_meters=assignment_gap
+        )
         partition_counts.append(len(partitions))
         for region, plane in partitions:
             plane_index = plane_indexes[id(plane)]
             regions_by_plane.setdefault(plane_index, []).append(region)
         supported_roofer_facets += 1
 
-    corrected: list[tuple[Polygon, ConsolidatedPlane]] = []
+    piece_assignments: list[tuple[BaseGeometry, int]] = []
     for plane_index, regions in regions_by_plane.items():
         combined = unary_union(regions)
         pieces = [combined] if combined.geom_type == "Polygon" else list(combined.geoms)
         for piece in pieces:
-            if piece.geom_type != "Polygon" or piece.area <= 0.05:
+            if piece.geom_type != "Polygon" or piece.area <= 1e-8:
                 continue
-            corrected.append((piece, planes[plane_index]))
+            piece_assignments.append((piece, plane_index))
+
+    # A half-space can extend a plane into a disconnected Roofer section that
+    # contains none of that plane's LiDAR support.  Reassign such extrapolated
+    # pieces to the plane with the strongest local support evidence before
+    # disconnected components are finalized as separate physical facets.
+    for index, (piece, plane_index) in enumerate(piece_assignments):
+        assigned_overlap = float(
+            planes[plane_index].support_hull.intersection(piece).area
+        )
+        if assigned_overlap > 0.05:
+            continue
+        rankings = []
+        probe = piece.representative_point()
+        for candidate_index, plane in enumerate(planes):
+            overlap = float(plane.support_hull.intersection(piece).area)
+            rankings.append(
+                (
+                    -round(overlap, 9),
+                    round(float(plane.support_hull.distance(probe)), 9),
+                    -len(plane.point_indexes),
+                    candidate_index,
+                )
+            )
+        piece_assignments[index] = (piece, min(rankings)[-1])
+
+    # A sliver can survive at a Roofer-face boundary even after the local
+    # arrangement cleanup.  Resolve it against the complete roof partition so
+    # no sub-threshold CityJSON facet is emitted and no roofprint area is
+    # discarded.
+    for index, (piece, plane_index) in enumerate(piece_assignments):
+        if piece.area > 0.25:
+            continue
+        neighbours = []
+        for other_index, (other_piece, other_plane_index) in enumerate(piece_assignments):
+            if other_index == index or other_piece.area <= 0.25:
+                continue
+            distance = float(piece.distance(other_piece))
+            if distance > 1e-6:
+                continue
+            shared = float(
+                piece.boundary.buffer(1e-7).intersection(other_piece.boundary).length
+            )
+            neighbours.append(
+                (
+                    round(distance, 9),
+                    -round(shared, 9),
+                    other_index,
+                    other_plane_index,
+                )
+            )
+        if not neighbours:
+            raise UnreliableGeometryError(
+                "FACET_CONSOLIDATION_SLIVER_UNRESOLVED",
+                "A numerical partition sliver could not be joined to a supported facet.",
+            )
+        piece_assignments[index] = (piece, min(neighbours)[-1])
+
+    regrouped: dict[int, list[BaseGeometry]] = {}
+    for piece, plane_index in piece_assignments:
+        regrouped.setdefault(plane_index, []).append(piece)
+    corrected: list[tuple[Polygon, ConsolidatedPlane]] = []
+    for plane_index, pieces in regrouped.items():
+        combined = unary_union(pieces)
+        merged_pieces = (
+            [combined] if combined.geom_type == "Polygon" else list(combined.geoms)
+        )
+        for piece in merged_pieces:
+            if piece.geom_type == "Polygon" and piece.area > 0.25:
+                corrected.append((piece, planes[plane_index]))
     corrected.sort(
         key=lambda item: (
             round(item[0].centroid.x, 6),
@@ -907,8 +1216,10 @@ def consolidate_roofer_feature(
             "supportedRooferFacetCount": supported_roofer_facets,
             "nearestSupportedPlaneFallbackCount": nearest_plane_fallback_count,
             "correctedFacetCount": len(boundaries),
+            "usedConsolidatedPlaneCount": len(regions_by_plane),
             "rooferFacetCandidateCounts": candidate_counts,
             "rooferFacetPartitionCounts": partition_counts,
+            "assignmentGapMeters": assignment_gap,
             "solarReconciliation": solar_audit,
             "solarDsmReconciliation": dsm_audit,
             "fedToCanonicalTopology": True,

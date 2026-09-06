@@ -109,18 +109,39 @@ class FacetConsolidationTests(unittest.TestCase):
         first = ConsolidatedPlane(
             point_indexes=tuple(range(100)),
             normal=(-0.4472135955, 0.0, 0.894427191),
-            centroid=(1.0, 2.0, 0.5),
+            centroid=(500001.0, 2900002.0, 0.5),
             rmse_meters=0.0,
-            support_hull=Polygon([(0, 0), (2, 0), (2, 4), (0, 4)]),
+            support_hull=Polygon(
+                [
+                    (500000, 2900000),
+                    (500002, 2900000),
+                    (500002, 2900004),
+                    (500000, 2900004),
+                ]
+            ),
         )
         second = ConsolidatedPlane(
             point_indexes=tuple(range(100, 200)),
             normal=(0.4472135955, 0.0, 0.894427191),
-            centroid=(3.0, 2.0, 0.5),
+            centroid=(500003.0, 2900002.0, 0.5),
             rmse_meters=0.0,
-            support_hull=Polygon([(2, 0), (4, 0), (4, 4), (2, 4)]),
+            support_hull=Polygon(
+                [
+                    (500002, 2900000),
+                    (500004, 2900000),
+                    (500004, 2900004),
+                    (500002, 2900004),
+                ]
+            ),
         )
-        roof = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])
+        roof = Polygon(
+            [
+                (500000, 2900000),
+                (500004, 2900000),
+                (500004, 2900004),
+                (500000, 2900004),
+            ]
+        )
         regions = _partition_roofer_facet(roof, [first, second])
         self.assertEqual(len(regions), 2)
         self.assertAlmostEqual(sum(region.area for region, _ in regions), roof.area)
