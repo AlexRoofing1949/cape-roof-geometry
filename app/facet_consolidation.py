@@ -670,6 +670,7 @@ def _partition_roofer_facet(
     minimum_interior_clearance_meters: float = 0.20,
     plane_evidence: dict[int, dict[str, float | None]] | None = None,
     assignment_audit: list[dict[str, Any]] | None = None,
+    lidar_points: np.ndarray | None = None,
 ) -> list[tuple[BaseGeometry, ConsolidatedPlane]]:
     if len(candidates) == 1:
         return [(polygon, candidates[0])]
@@ -826,9 +827,17 @@ def _partition_roofer_facet(
         ) from error
 
     cell_assignments: list[tuple[BaseGeometry, int]] = []
+    cell_label_costs: list[dict[int, float]] = []
     for cell in cells:
         probe = cell.representative_point()
+        cell_points = np.empty((0, 3), dtype=float)
+        if lidar_points is not None and len(lidar_points):
+            local_mask = contains_xy(
+                cell.buffer(0.02), lidar_points[:, 0], lidar_points[:, 1]
+            )
+            cell_points = lidar_points[local_mask]
         rankings = []
+        ranking_evidence: dict[int, dict[str, float | int | bool]] = {}
         for index, candidate in enumerate(candidates):
             mismatches = 0
             for relation in relations:
@@ -850,7 +859,40 @@ def _partition_roofer_facet(
             spatial_distance = float(candidate.support_hull.distance(probe))
             support_overlap = float(candidate.support_hull.intersection(cell).area)
             overlap_ratio = support_overlap / max(float(cell.area), 0.01)
-            lidar_rmse = float(candidate.rmse_meters)
+            local_lidar_rmse = float(candidate.rmse_meters)
+            local_lidar_median = float(candidate.rmse_meters)
+            local_lidar_support = 0
+            local_lidar_inlier_ratio = 0.0
+            if len(cell_points):
+                predicted_heights = np.asarray(
+                    [
+                        _plane_height(candidate, float(point[0]), float(point[1]))
+                        for point in cell_points
+                    ],
+                    dtype=float,
+                )
+                residuals = np.abs(cell_points[:, 2] - predicted_heights)
+                # This is an assignment gate, not a plane-fit gate.  The later
+                # Open3D validator still performs independent RANSAC.  Here we
+                # only keep a cell from being labelled with a plane that has no
+                # local LiDAR support.
+                local_inliers = residuals <= 0.25
+                local_lidar_support = int(np.count_nonzero(local_inliers))
+                local_lidar_inlier_ratio = local_lidar_support / len(cell_points)
+                if local_lidar_support:
+                    supported_residuals = residuals[local_inliers]
+                    local_lidar_rmse = float(
+                        np.sqrt(np.mean(np.square(supported_residuals)))
+                    )
+                    local_lidar_median = float(np.median(supported_residuals))
+                else:
+                    local_lidar_rmse = math.inf
+                    local_lidar_median = math.inf
+            minimum_local_support = min(10, max(3, math.ceil(len(cell_points) * 0.20)))
+            locally_unsupported = bool(
+                len(cell_points) >= 3
+                and local_lidar_support < minimum_local_support
+            )
             dsm_rmse = float(evidence.get("dsmRmseMeters") or 0.0)
             solar_pitch_variance = float(
                 evidence.get("solarPitchVarianceDegrees") or 0.0
@@ -860,7 +902,8 @@ def _partition_roofer_facet(
             )
             evidence_score = (
                 spatial_distance
-                + lidar_rmse
+                + local_lidar_median
+                + local_lidar_rmse
                 + dsm_rmse
                 + solar_pitch_variance / 10.0
                 + solar_azimuth_variance / 180.0
@@ -868,6 +911,7 @@ def _partition_roofer_facet(
             )
             rankings.append(
                 (
+                    int(locally_unsupported),
                     mismatches,
                     round(evidence_score, 9),
                     round(spatial_distance, 9),
@@ -876,17 +920,42 @@ def _partition_roofer_facet(
                     index,
                 )
             )
+            ranking_evidence[index] = {
+                "cellLidarPointCount": int(len(cell_points)),
+                "cellLidarSupportPoints": local_lidar_support,
+                "cellLidarInlierRatio": round(local_lidar_inlier_ratio, 6),
+                "cellLidarResidualMedianMeters": (
+                    None if not math.isfinite(local_lidar_median) else round(local_lidar_median, 6)
+                ),
+                "cellLidarResidualRmseMeters": (
+                    None if not math.isfinite(local_lidar_rmse) else round(local_lidar_rmse, 6)
+                ),
+                "cellLidarSupportRequired": minimum_local_support,
+                "cellLidarSupported": not locally_unsupported,
+            }
         winner = min(rankings)[-1]
         cell_assignments.append((cell, winner))
+        cell_label_costs.append(
+            {
+                int(ranking[-1]): (
+                    float(ranking[0]) * 100000.0
+                    + float(ranking[1]) * 1000.0
+                    + min(100.0, float(ranking[2]))
+                    + max(0.0, float(ranking[3]))
+                )
+                for ranking in rankings
+            }
+        )
         if assignment_audit is not None:
             winner_plane = candidates[winner]
             winner_evidence = (plane_evidence or {}).get(id(winner_plane), {})
+            winner_lidar_evidence = ranking_evidence[winner]
             assignment_audit.append(
                 {
                     "cellAreaSquareMeters": round(float(cell.area), 6),
                     "winnerPlaneOrdinal": winner + 1,
-                    "relationMismatchCount": int(min(rankings)[0]),
-                    "evidenceScore": round(float(min(rankings)[1]), 6),
+                    "relationMismatchCount": int(min(rankings)[1]),
+                    "evidenceScore": round(float(min(rankings)[2]), 6),
                     "spatialSupportDistanceMeters": round(
                         float(winner_plane.support_hull.distance(probe)), 6
                     ),
@@ -905,12 +974,134 @@ def _partition_roofer_facet(
                     "solarAzimuthVarianceDegrees": winner_evidence.get(
                         "solarAzimuthVarianceDegrees"
                     ),
+                    **winner_lidar_evidence,
                 }
             )
 
+    # A cell-wise minimum can put two different planes on opposite sides of a
+    # line created by an unrelated plane pair.  Such a seam is not the 3-D
+    # intersection of its incident planes and cannot be classified safely as
+    # ridge, hip, or valley.  Optimize labels across the complete arrangement
+    # with a hard geometric compatibility penalty, then reject any unresolved
+    # seam before CityJSON edge classification.
+    adjacency: list[tuple[int, int, BaseGeometry, float]] = []
+    for left in range(len(cell_assignments)):
+        left_cell = cell_assignments[left][0]
+        for right in range(left + 1, len(cell_assignments)):
+            right_cell = cell_assignments[right][0]
+            shared = left_cell.boundary.intersection(right_cell.boundary)
+            shared_length = float(shared.length)
+            if shared_length > 1e-6:
+                adjacency.append((left, right, shared, shared_length))
+
+    def labels_compatible(
+        left_label: int, right_label: int, shared: BaseGeometry
+    ) -> bool:
+        if left_label == right_label:
+            return True
+        left_plane = candidates[left_label]
+        right_plane = candidates[right_label]
+        intersection_direction = np.cross(
+            np.asarray(left_plane.normal), np.asarray(right_plane.normal)
+        )
+        horizontal_length = math.hypot(
+            float(intersection_direction[0]), float(intersection_direction[1])
+        )
+        if horizontal_length <= 1e-8:
+            return False
+        shared_lines = _line_parts(shared)
+        if not shared_lines:
+            return False
+        longest = max(shared_lines, key=lambda line: float(line.length))
+        start, end = longest.coords[0], longest.coords[-1]
+        edge_x, edge_y = float(end[0] - start[0]), float(end[1] - start[1])
+        edge_length = math.hypot(edge_x, edge_y)
+        if edge_length <= 1e-8:
+            return False
+        alignment = math.degrees(
+            math.acos(
+                min(
+                    1.0,
+                    abs(
+                        (
+                            edge_x * float(intersection_direction[0])
+                            + edge_y * float(intersection_direction[1])
+                        )
+                        / (edge_length * horizontal_length)
+                    ),
+                )
+            )
+        )
+        midpoint = longest.interpolate(0.5, normalized=True)
+        height_delta = abs(
+            _plane_height(left_plane, midpoint.x, midpoint.y)
+            - _plane_height(right_plane, midpoint.x, midpoint.y)
+        )
+        return alignment <= 5.0 and height_delta <= 0.10
+
+    initial_labels = [label for _, label in cell_assignments]
+    labels = list(initial_labels)
+    incident: dict[int, list[tuple[int, BaseGeometry, float]]] = {
+        index: [] for index in range(len(cell_assignments))
+    }
+    for left, right, shared, shared_length in adjacency:
+        incident[left].append((right, shared, shared_length))
+        incident[right].append((left, shared, shared_length))
+    order = sorted(
+        range(len(cell_assignments)),
+        key=lambda index: (
+            -round(float(cell_assignments[index][0].area), 9),
+            round(float(cell_assignments[index][0].centroid.x), 9),
+            round(float(cell_assignments[index][0].centroid.y), 9),
+            index,
+        ),
+    )
+    for _ in range(30):
+        changed = False
+        for cell_index in order:
+            scored_labels = []
+            for label, unary_cost in cell_label_costs[cell_index].items():
+                conflict_cost = 0.0
+                for neighbour, shared, shared_length in incident[cell_index]:
+                    if not labels_compatible(label, labels[neighbour], shared):
+                        conflict_cost += 1000000.0 + shared_length * 10000.0
+                scored_labels.append((unary_cost + conflict_cost, label))
+            winner = min(scored_labels)[1]
+            if winner != labels[cell_index]:
+                labels[cell_index] = winner
+                changed = True
+        if not changed:
+            break
+    unresolved = []
+    for left, right, shared, shared_length in adjacency:
+        if not labels_compatible(labels[left], labels[right], shared):
+            unresolved.append(
+                {
+                    "leftCell": left,
+                    "rightCell": right,
+                    "lengthMeters": round(shared_length, 6),
+                }
+            )
+    if unresolved:
+        raise UnreliableGeometryError(
+            "FACET_GLOBAL_LABEL_INCONSISTENT",
+            "The global planar arrangement has an edge unsupported by its incident planes.",
+            details={
+                "unresolvedEdgeCount": len(unresolved),
+                "unresolvedEdgeLengthMeters": round(
+                    sum(item["lengthMeters"] for item in unresolved), 6
+                ),
+            },
+        )
+    cell_assignments = [
+        (cell, labels[index]) for index, (cell, _) in enumerate(cell_assignments)
+    ]
     if assignment_audit is not None:
-        for record, (_, final_label) in zip(assignment_audit, cell_assignments):
+        for index, (record, (_, final_label)) in enumerate(
+            zip(assignment_audit, cell_assignments)
+        ):
             record["finalWinnerPlaneOrdinal"] = final_label + 1
+            record["globalLabelAdjusted"] = final_label != initial_labels[index]
 
     # Arrangement lines can intersect within centimetres of one another and
     # create numerical sliver cells.  Preserve complete coverage while
@@ -1268,7 +1459,15 @@ def _validate_watertight_partition(
     exterior_segments = 0
     interior_segments = 0
     tolerance = 1e-6
-    side_probe_distance = 1e-5
+    # The arrangement has already been noded by GEOS.  Validate ownership on
+    # the resulting boundary segments themselves instead of probing two tiny
+    # offsets from each segment.  Offset probes become numerically unstable at
+    # Florida State Plane coordinate magnitudes and previously reported
+    # sub-millimetre ``INTERIOR_SIDE_UNOWNED`` seams even though the same
+    # segment was present on both facet boundaries.  Boundary ownership is the
+    # direct two-manifold invariant: one owner on the roofprint exterior and
+    # exactly two owners everywhere else.
+    boundary_tolerance = 1e-7
     for line in _line_parts(noded):
         coordinates = list(line.coords)
         for start, end in zip(coordinates, coordinates[1:]):
@@ -1276,48 +1475,31 @@ def _validate_watertight_partition(
             if segment.length <= tolerance:
                 continue
             midpoint = segment.interpolate(0.5, normalized=True)
-            dx = float(end[0] - start[0])
-            dy = float(end[1] - start[1])
-            length = math.hypot(dx, dy)
-            normal_x = -dy / length * side_probe_distance
-            normal_y = dx / length * side_probe_distance
-            probes = (
-                Point(midpoint.x + normal_x, midpoint.y + normal_y),
-                Point(midpoint.x - normal_x, midpoint.y - normal_y),
-            )
-            roof_sides = [roofprint.covers(probe) for probe in probes]
-            side_owners = [
-                [index for index, polygon in enumerate(polygons) if polygon.covers(probe)]
-                for probe in probes
+            boundary_owners = [
+                index
+                for index, polygon in enumerate(polygons)
+                if polygon.boundary.distance(midpoint) <= boundary_tolerance
             ]
-            if sum(roof_sides) == 1:
+            on_roofprint_boundary = (
+                roofprint.boundary.distance(midpoint) <= boundary_tolerance
+            )
+            if on_roofprint_boundary:
                 exterior_segments += 1
-                roof_side = roof_sides.index(True)
-                if len(side_owners[roof_side]) != 1 or side_owners[1 - roof_side]:
+                if len(boundary_owners) != 1:
                     non_manifold += 1
                     non_manifold_lengths.append(float(segment.length))
                     failure_patterns["EXTERIOR_OWNERSHIP"] = (
                         failure_patterns.get("EXTERIOR_OWNERSHIP", 0) + 1
                     )
-            elif all(roof_sides):
+            elif roofprint.covers(midpoint):
                 interior_segments += 1
-                if not side_owners[0] or not side_owners[1]:
+                if len(boundary_owners) < 2:
                     dangling += 1
                     dangling_lengths.append(float(segment.length))
                     failure_patterns["INTERIOR_SIDE_UNOWNED"] = (
                         failure_patterns.get("INTERIOR_SIDE_UNOWNED", 0) + 1
                     )
-                elif (
-                    len(side_owners[0]) == 1
-                    and len(side_owners[1]) == 1
-                    and side_owners[0][0] == side_owners[1][0]
-                ):
-                    # GEOS can retain a zero-width cut after cells with the
-                    # same label are dissolved. It separates no surfaces and
-                    # therefore is not a manifold edge.
-                    redundant_segment_count += 1
-                    redundant_segment_length += float(segment.length)
-                elif len(side_owners[0]) != 1 or len(side_owners[1]) != 1:
+                elif len(boundary_owners) > 2:
                     non_manifold += 1
                     non_manifold_lengths.append(float(segment.length))
                     failure_patterns["INTERIOR_MULTIPLE_OWNERS"] = (
@@ -2112,6 +2294,7 @@ def consolidate_roofer_feature(
             adjacency_gap_meters=assignment_gap,
             plane_evidence=plane_evidence,
             assignment_audit=cell_assignment_audit,
+            lidar_points=consolidation_lidar_points,
         )
         partition_counts.append(len(partitions))
         for region, plane in partitions:

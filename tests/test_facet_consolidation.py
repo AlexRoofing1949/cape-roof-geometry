@@ -219,9 +219,28 @@ class FacetConsolidationTests(unittest.TestCase):
                 (500000, 2900004),
             ]
         )
-        regions = _partition_roofer_facet(roof, [first, second])
+        lidar_points = np.asarray(
+            [
+                (500000.5, 2900001.0, 0.25),
+                (500001.5, 2900003.0, 0.75),
+                (500002.5, 2900001.0, 0.75),
+                (500003.5, 2900003.0, 0.25),
+            ],
+            dtype=float,
+        )
+        assignment_audit = []
+        regions = _partition_roofer_facet(
+            roof,
+            [first, second],
+            lidar_points=lidar_points,
+            assignment_audit=assignment_audit,
+        )
         self.assertEqual(len(regions), 2)
         self.assertAlmostEqual(sum(region.area for region, _ in regions), roof.area)
+        self.assertTrue(assignment_audit)
+        self.assertTrue(
+            all("cellLidarResidualRmseMeters" in item for item in assignment_audit)
+        )
         manifold = _validate_watertight_partition(regions, roof)
         self.assertEqual(manifold["validation"], "PASSED")
         self.assertEqual(manifold["interiorOwnership"], 2)
@@ -243,6 +262,54 @@ class FacetConsolidationTests(unittest.TestCase):
         self.assertEqual(
             context.exception.code, "FACET_GLOBAL_ARRANGEMENT_INCOMPLETE"
         )
+
+    def test_watertight_gate_uses_boundary_ownership_at_large_coordinates(self):
+        plane = ConsolidatedPlane(
+            point_indexes=tuple(range(20)),
+            normal=(0.0, 0.0, 1.0),
+            centroid=(500002.0, 2900002.0, 0.0),
+            rmse_meters=0.0,
+            support_hull=Polygon(
+                [
+                    (500000, 2900000),
+                    (500004, 2900000),
+                    (500004, 2900004),
+                    (500000, 2900004),
+                ]
+            ),
+        )
+        roof = plane.support_hull
+        # Deliberately node the common boundary into sub-millimetre pieces.
+        split_y = 2900002.00015
+        regions = [
+            (
+                Polygon(
+                    [
+                        (500000, 2900000),
+                        (500002, 2900000),
+                        (500002, split_y),
+                        (500002, 2900004),
+                        (500000, 2900004),
+                    ]
+                ),
+                plane,
+            ),
+            (
+                Polygon(
+                    [
+                        (500002, 2900000),
+                        (500004, 2900000),
+                        (500004, 2900004),
+                        (500002, 2900004),
+                        (500002, split_y),
+                    ]
+                ),
+                plane,
+            ),
+        ]
+        manifold = _validate_watertight_partition(regions, roof)
+        self.assertEqual(manifold["validation"], "PASSED")
+        self.assertEqual(manifold["interiorOwnership"], 2)
 
 
 if __name__ == "__main__":
