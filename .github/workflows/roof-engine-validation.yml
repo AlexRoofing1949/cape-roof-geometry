@@ -11,75 +11,50 @@ permissions:
   contents: read
 
 jobs:
-  runtime-validation:
+  container-validation:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash -el {0}
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
-      - name: Install the pinned Python, GDAL, and PDAL environment
-        uses: mamba-org/setup-micromamba@v3
-        with:
-          environment-file: environment.yml
-          environment-name: roof-engine
-          micromamba-version: 2.3.3-0
-          init-shell: bash
-          cache-environment: false
-
-      - name: Install required system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libgl1 libgomp1 libx11-6
-
-      - name: Download and verify the pinned Roofer release
-        run: |
-          archive="$RUNNER_TEMP/roofer-linux-x86_64-v1.1.0-beta.1.tar.gz"
-          curl --fail --location --retry 3 \
-            --output "$archive" \
-            https://github.com/3DBAG/roofer/releases/download/v1.1.0-beta.1/roofer-linux-x86_64-v1.1.0-beta.1.tar.gz
-          echo '12096b4bc2f96d9134aba4b9a5d9268c06c69b873619a742b08c6f22ba2c2e99  '"$archive" | sha256sum --check
-          mkdir -p "$RUNNER_TEMP/roofer"
-          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP/roofer"
-          chmod +x "$RUNNER_TEMP/roofer/bin/roofer"
-          echo "$RUNNER_TEMP/roofer/bin" >> "$GITHUB_PATH"
-          echo "ROOFER_GDAL_DATA=$RUNNER_TEMP/roofer/share/gdal" >> "$GITHUB_ENV"
-          echo "ROOFER_PROJ_DATA=$RUNNER_TEMP/roofer/share/proj" >> "$GITHUB_ENV"
+      - name: Build the pinned runtime image
+        run: docker build --pull --tag cape-roof-geometry:ci .
 
       - name: Confirm Roofer exposes the configured reconstruction flags
         run: |
-          roofer --help-all > "$RUNNER_TEMP/roofer-help.txt"
-          grep -q -- '--plane-detect-k' "$RUNNER_TEMP/roofer-help.txt"
-          grep -q -- '--plane-detect-min-points' "$RUNNER_TEMP/roofer-help.txt"
-          grep -q -- '--plane-detect-epsilon' "$RUNNER_TEMP/roofer-help.txt"
+          docker run --rm --entrypoint roofer cape-roof-geometry:ci --help > roofer-help.txt
+          grep -q -- '--plane-detect-k' roofer-help.txt
+          grep -q -- '--plane-detect-min-points' roofer-help.txt
+          grep -q -- '--plane-detect-epsilon' roofer-help.txt
 
-      - name: Run the full suite with GDAL and PDAL available
-        run: python -m unittest discover -s tests -v
+      - name: Run the full suite inside the GDAL and PDAL image
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace:ro"
+          --workdir /workspace
+          --entrypoint python
+          cape-roof-geometry:ci
+          -m unittest discover -s tests -v
 
       - name: Start service and verify readiness
         env:
-          AUTH_BEARER_TOKEN: ci-only-roof-engine-token-00000000000000000000000000000000
-          SERVICE_SOURCE_URL: https://github.com/AlexRoofing1949/cape-roof-geometry
           SERVICE_COMMIT: ${{ github.sha }}
-          LIDAR_REGISTRY_PATH: ${{ github.workspace }}/config/lidar_sources.yaml
-          IMAGERY_REGISTRY_PATH: ${{ github.workspace }}/config/imagery_sources.yaml
         run: |
-          export GDAL_DATA="$CONDA_PREFIX/share/gdal"
-          export PROJ_DATA="$CONDA_PREFIX/share/proj"
-          export PROJ_LIB="$CONDA_PREFIX/share/proj"
-          uvicorn app.main:app --host 127.0.0.1 --port 8080 > "$RUNNER_TEMP/roof-engine.log" 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          docker run --detach --name cape-roof-geometry-smoke \
+            --publish 8080:8080 \
+            --env AUTH_BEARER_TOKEN=ci-only-roof-engine-token-00000000000000000000000000000000 \
+            --env SERVICE_SOURCE_URL=https://github.com/AlexRoofing1949/cape-roof-geometry \
+            --env SERVICE_COMMIT="$SERVICE_COMMIT" \
+            cape-roof-geometry:ci
+          trap 'docker rm --force cape-roof-geometry-smoke >/dev/null' EXIT
           ready=false
           for attempt in $(seq 1 30); do
-            if curl --silent --show-error --fail http://127.0.0.1:8080/healthz --output "$RUNNER_TEMP/healthz.json"; then
+            if curl --silent --show-error --fail http://127.0.0.1:8080/healthz --output healthz.json; then
               ready=true
               break
             fi
             sleep 2
           done
           test "$ready" = true
-          python -c 'import json; data=json.load(open("'"$RUNNER_TEMP"'/healthz.json", encoding="utf-8")); assert data["status"] == "ready", data; assert data["configured"] is True, data; assert all(data["dependencies"].values()), data'
+          python -c 'import json; data=json.load(open("healthz.json", encoding="utf-8")); assert data["status"] == "ready", data; assert data["configured"] is True, data; assert all(data["dependencies"].values()), data'

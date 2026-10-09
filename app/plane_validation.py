@@ -331,4 +331,3 @@ def validate_roofer_planes(
     if points is None:
         points = load_normalized_roof_points(pointcloud_path, workspace, settings)
     return validate_facet_points(points, facet_models, settings)
-

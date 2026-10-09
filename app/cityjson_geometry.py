@@ -1485,7 +1485,14 @@ def _roof_facets(
     return facets, parent_attributes
 
 
-def _quality_confidence(attributes: dict[str, Any], minimum_density: float, maximum_nodata_fraction: float, maximum_rmse: float) -> tuple[float, dict[str, float]]:
+def _quality_confidence(
+    attributes: dict[str, Any],
+    minimum_density: float,
+    maximum_nodata_fraction: float,
+    maximum_rmse: float,
+    *,
+    observed_coverage_score: bool = False,
+) -> tuple[float, dict[str, float]]:
     if attributes.get("rf_success") is False or attributes.get("rf_pointcloud_unusable") is True:
         raise UnreliableGeometryError("ROOFER_RECONSTRUCTION_UNUSABLE", "Roofer marked the source point cloud or reconstruction unusable.")
     if str(attributes.get("rf_extrusion_mode", "standard")) != "standard":
@@ -1526,7 +1533,14 @@ def _quality_confidence(attributes: dict[str, Any], minimum_density: float, maxi
         )
     components = {
         "density": min(1.0, density / max(minimum_density * 1.5, 0.01)),
-        "coverage": max(0.0, min(1.0, 1 - nodata / max(maximum_nodata_fraction, 0.001))),
+        "coverage": (
+            max(0.0, min(1.0, 1 - nodata))
+            if observed_coverage_score
+            else max(
+                0.0,
+                min(1.0, 1 - nodata / max(maximum_nodata_fraction, 0.001)),
+            )
+        ),
         "rmse": max(0.0, min(1.0, 1 - rmse / max(maximum_rmse, 0.001))),
     }
     confidence = components["density"] * 0.35 + components["coverage"] * 0.35 + components["rmse"] * 0.30
@@ -1550,6 +1564,7 @@ def extract_roof_geometry(
     minimum_density: float = 8.0,
     maximum_nodata_fraction: float = 0.10,
     maximum_rmse_meters: float = 0.35,
+    observed_coverage_score: bool = False,
     include_validation_facets: bool = False,
 ) -> dict[str, Any]:
     """Return measured facets and classified roof lines from one Roofer model."""
@@ -1560,7 +1575,11 @@ def extract_roof_geometry(
         maximum_formula_error_percent=MAXIMUM_COSINE_FORMULA_ERROR_PERCENT,
     )
     quality_confidence, quality_components = _quality_confidence(
-        attributes, minimum_density, maximum_nodata_fraction, maximum_rmse_meters
+        attributes,
+        minimum_density,
+        maximum_nodata_fraction,
+        maximum_rmse_meters,
+        observed_coverage_score=observed_coverage_score,
     )
 
     exact_planar_arrangement = bool(
@@ -2197,4 +2216,3 @@ def extract_roof_geometry(
             for facet in facets
         ]
     return result
-

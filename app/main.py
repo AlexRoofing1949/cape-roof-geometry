@@ -137,4 +137,3 @@ async def roof_geometry(request: GeometryRequest, configured: Settings = Depends
         headers={"X-Request-ID": request.requestId},
         content=result,
     )
-

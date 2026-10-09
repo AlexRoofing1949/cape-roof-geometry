@@ -16,7 +16,11 @@ from typing import Any
 from .cityjson_geometry import extract_roof_geometry, load_cityjson_feature
 from .facet_consolidation import consolidate_roofer_feature
 from .config import Settings
-from .errors import TransientProviderError, UnreliableGeometryError
+from .errors import (
+    TransientProviderError,
+    UnreliableGeometryError,
+    command_failure_details,
+)
 from .imagery_validation import validate_current_structure
 from .models import GeometryRequest
 from .plane_validation import load_normalized_roof_points, validate_roofer_planes
@@ -115,12 +119,22 @@ def _run(
             env=environment,
         )
     except subprocess.TimeoutExpired as error:
-        raise TransientProviderError("GEOMETRY_COMMAND_TIMEOUT", "The roof reconstruction command timed out.") from error
+        raise TransientProviderError(
+            "GEOMETRY_COMMAND_TIMEOUT",
+            "The roof reconstruction command timed out.",
+            details={
+                "command": Path(command[0]).name if command else "unknown",
+                "timeoutSeconds": timeout,
+                "failureClass": "COMMAND_TIMEOUT",
+            },
+        ) from error
     except subprocess.CalledProcessError as error:
-        safe_tail = (error.stderr or error.stdout or "")[-500:].replace("\n", " ")
         raise UnreliableGeometryError(
             "GEOMETRY_COMMAND_FAILED",
-            f"The roof reconstruction command did not produce verified geometry: {safe_tail}",
+            "The roof reconstruction command did not produce verified geometry; see sanitized command diagnostics.",
+            details=command_failure_details(
+                command, error.returncode, error.stderr or error.stdout
+            ),
         ) from error
 
 
@@ -307,13 +321,25 @@ def _classification_histogram(metadata_path: Path) -> dict[str, int]:
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
+        try:
+            metadata_bytes = metadata_path.stat().st_size
+        except OSError:
+            metadata_bytes = None
         raise UnreliableGeometryError(
-            "LIDAR_CLASSIFICATION_AUDIT_MISSING", "PDAL did not produce a readable classification audit."
+            "LIDAR_CLASSIFICATION_AUDIT_MISSING",
+            "PDAL did not produce a readable classification audit.",
+            details={
+                "auditReadable": False,
+                "metadataBytes": metadata_bytes,
+                "parseErrorType": type(error).__name__,
+            },
         ) from error
 
     histogram: dict[str, int] = {}
     classification_seen = False
     classification_point_count = 0
+    classification_node_keys: set[str] = set()
+    classification_count_shapes: set[str] = set()
 
     def visit(node: Any) -> None:
         nonlocal classification_seen, classification_point_count
@@ -321,11 +347,18 @@ def _classification_histogram(metadata_path: Path) -> dict[str, int]:
             name = str(node.get("name") or node.get("dimension") or "")
             if name.lower() == "classification":
                 classification_seen = True
+                classification_node_keys.update(str(key) for key in node)
                 try:
                     classification_point_count += int(node.get("count") or 0)
                 except (TypeError, ValueError):
                     pass
                 counts = node.get("counts") or node.get("enumeration") or node.get("values")
+                if counts is not None:
+                    classification_count_shapes.add(type(counts).__name__)
+                    if isinstance(counts, list) and counts:
+                        classification_count_shapes.update(
+                            f"item:{type(item).__name__}" for item in counts[:5]
+                        )
                 if isinstance(counts, list):
                     for item in counts:
                         # PDAL serializes repeated ``counts`` metadata children as
@@ -370,6 +403,18 @@ def _classification_histogram(metadata_path: Path) -> dict[str, int]:
         raise UnreliableGeometryError(
             "LIDAR_CLASSIFICATION_AUDIT_MISSING",
             "PDAL did not report an enumerated LAS classification histogram.",
+            details={
+                "auditReadable": True,
+                "classificationStatisticFound": classification_seen,
+                "classificationPointCount": classification_point_count,
+                "classificationStatisticKeys": sorted(classification_node_keys),
+                "classificationCountShapes": sorted(classification_count_shapes),
+                "metadataRootKeys": (
+                    sorted(str(key) for key in payload)[:20]
+                    if isinstance(payload, dict)
+                    else []
+                ),
+            },
         )
     return histogram
 
@@ -531,6 +576,56 @@ def _combined_confidence(
         + components["solarReconciliation"] * 0.25
     )
     return round(score, 3), {key: round(value, 3) for key, value in components.items()}
+
+
+def _extract_roof_geometry_with_coverage_recovery(
+    feature: dict[str, Any],
+    transform: dict[str, Any] | None,
+    settings: Settings,
+    **geometry_options: Any,
+) -> dict[str, Any]:
+    """Retry only a marginal Roofer no-data rejection, retaining every later gate."""
+
+    strict_limit = float(settings.maximum_nodata_fraction)
+    recovery_limit = float(
+        getattr(settings, "maximum_recoverable_nodata_fraction", strict_limit)
+    )
+    try:
+        return extract_roof_geometry(
+            feature,
+            transform,
+            maximum_nodata_fraction=strict_limit,
+            **geometry_options,
+        )
+    except UnreliableGeometryError as strict_error:
+        if strict_error.code != "LIDAR_COVERAGE_INCOMPLETE":
+            raise
+        try:
+            observed_fraction = float(
+                (strict_error.details or {}).get("noDataFraction")
+            )
+        except (TypeError, ValueError):
+            raise strict_error
+        if not strict_limit < recovery_limit <= 0.20 or observed_fraction > recovery_limit:
+            raise strict_error
+
+        geometry = extract_roof_geometry(
+            feature,
+            transform,
+            maximum_nodata_fraction=recovery_limit,
+            observed_coverage_score=True,
+            **geometry_options,
+        )
+        quality = geometry.setdefault("quality", {})
+        quality["coverageRecovery"] = {
+            "status": "BOUNDED_RECOVERY",
+            "strictMaximumNoDataFraction": round(strict_limit, 4),
+            "recoveryMaximumNoDataFraction": round(recovery_limit, 4),
+            "observedNoDataFraction": round(observed_fraction, 4),
+            "coverageConfidenceMethod": "OBSERVED_COVERED_FRACTION",
+            "downstreamValidationRequired": True,
+        }
+        return geometry
 
 
 def _confidence_diagnostics(
@@ -783,9 +878,10 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                             lidar.tile_acquisition_date or lidar.acquired_end
                         ),
                     )
-                geometry = extract_roof_geometry(
+                geometry = _extract_roof_geometry_with_coverage_recovery(
                     feature,
                     transform,
+                    settings,
                     flat_pitch_degrees=settings.flat_pitch_degrees,
                     edge_node_tolerance_meters=settings.roof_edge_node_tolerance_meters,
                     edge_node_vertical_tolerance_meters=(
@@ -802,7 +898,6 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                         settings.roof_exterior_boundary_maximum_distance_meters
                     ),
                     minimum_density=settings.minimum_point_density,
-                    maximum_nodata_fraction=settings.maximum_nodata_fraction,
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
                     include_validation_facets=True,
                 )
@@ -1028,6 +1123,9 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "sourceMinimumPointDensityPpsm": lidar.minimum_density_ppsm,
                     "minimumCoverageRatio": settings.minimum_lidar_coverage_ratio,
                     "maximumNoDataFraction": settings.maximum_nodata_fraction,
+                    "maximumRecoverableNoDataFraction": (
+                        settings.maximum_recoverable_nodata_fraction
+                    ),
                     "maximumRooferRmseMeters": settings.maximum_roofer_rmse_meters,
                     "rooferPlaneDetectMinimumPoints": (
                         settings.roofer_plane_detect_min_points
@@ -1071,4 +1169,3 @@ def runtime_dependencies() -> dict[str, bool]:
     except (ImportError, OSError):
         dependencies["gdalPython"] = False
     return dependencies
-

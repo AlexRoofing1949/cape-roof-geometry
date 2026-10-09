@@ -1267,6 +1267,21 @@ class CityJsonGeometryTests(unittest.TestCase):
             {"noDataFraction": 0.25, "maximumNoDataFraction": 0.10},
         )
 
+    def test_bounded_nodata_recovery_scores_observed_coverage(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        feature["CityObjects"]["TEST-GABLE"]["attributes"]["rf_nodata_frac"] = 0.1433
+
+        result = extract_roof_geometry(
+            feature,
+            transform,
+            maximum_nodata_fraction=0.15,
+            observed_coverage_score=True,
+        )
+
+        self.assertEqual(result["quality"]["nodataFraction"], 0.1433)
+        self.assertEqual(result["quality"]["components"]["coverage"], 0.857)
+        self.assertGreater(result["confidence"], 0.80)
+
     def test_zero_nodata_and_zero_rmse_are_preserved_as_perfect_metrics(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         attributes = feature["CityObjects"]["TEST-GABLE"]["attributes"]
@@ -1509,4 +1524,3 @@ class CityJsonGeometryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

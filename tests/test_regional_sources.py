@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.errors import ConfigurationError
+from app.errors import ConfigurationError, TransientProviderError
 from app.source_registry import load_registries
 
 try:
@@ -411,7 +411,10 @@ sources:
         self.assertFalse(result.consensus_records[-1]["independent"])
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
-    @patch("app.providers._require_pinned_overture_release", side_effect=["2026-08-19.0", "2026-08-19.0"])
+    @patch(
+        "app.providers._require_pinned_overture_release",
+        return_value="2026-08-19.0",
+    )
     @patch("app.providers._run")
     def test_overture_download_works_around_absolute_catalog_link_bug(self, run, _release):
         observed = {}
@@ -459,17 +462,29 @@ sources:
                 -81.95855, 26.63265, Path(directory), configured
             )
         self.assertEqual(result.overture_release, "2026-08-19.0")
-        self.assertFalse(any(value.startswith("--release") for value in observed["command"]))
+        self.assertIn("--release=2026-08-19.0", observed["command"])
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
-    @patch("app.providers._current_overture_release", return_value="2026-09-16.0")
-    def test_overture_release_mismatch_fails_closed(self, _release):
+    @patch(
+        "app.providers._overture_release_catalog",
+        return_value=("2026-09-23.1", ("2026-09-23.0", "2026-09-23.1")),
+    )
+    def test_expired_overture_pin_rolls_forward_to_available_latest(self, _catalog):
         from app.providers import _require_pinned_overture_release
 
         configured = SimpleNamespace(overture_release="2026-08-19.0")
-        with self.assertRaises(UnreliableGeometryError) as raised:
-            _require_pinned_overture_release(configured)
-        self.assertEqual(raised.exception.code, "OVERTURE_RELEASE_MISMATCH")
+        self.assertEqual(_require_pinned_overture_release(configured), "2026-09-23.1")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch(
+        "app.providers._overture_release_catalog",
+        return_value=("2026-09-23.1", ("2026-08-19.0", "2026-09-23.0", "2026-09-23.1")),
+    )
+    def test_overture_uses_configured_pin_while_release_is_available(self, _catalog):
+        from app.providers import _require_pinned_overture_release
+
+        configured = SimpleNamespace(overture_release="2026-08-19.0")
+        self.assertEqual(_require_pinned_overture_release(configured), "2026-08-19.0")
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers._cached_json_url")
@@ -758,6 +773,57 @@ sources:
             )
             self.assertEqual(_classification_histogram(path), {})
 
+    def test_missing_classification_audit_reports_safe_schema_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "filters.stats": {
+                                "statistic": [
+                                    {
+                                        "name": "Classification",
+                                        "count": 120,
+                                        "bins": ["not-a-supported-histogram"],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(UnreliableGeometryError) as context:
+                _classification_histogram(path)
+
+        self.assertEqual(context.exception.code, "LIDAR_CLASSIFICATION_AUDIT_MISSING")
+        self.assertTrue(context.exception.details["classificationStatisticFound"])
+        self.assertEqual(context.exception.details["classificationPointCount"], 120)
+        self.assertIn("bins", context.exception.details["classificationStatisticKeys"])
+        self.assertNotIn("not-a-supported-histogram", str(context.exception.details))
+
+    @patch("app.providers.subprocess.run")
+    def test_failed_open_command_has_sanitized_diagnostics(self, run):
+        from subprocess import CalledProcessError
+
+        run.side_effect = CalledProcessError(
+            2,
+            ["ogr2ogr", "private-argument"],
+            stderr="HTTP 503 https://private.example/path?token=secret",
+        )
+        from app.providers import _run
+
+        with self.assertRaises(TransientProviderError) as context:
+            _run(["ogr2ogr", "private-argument"], timeout=10)
+
+        self.assertEqual(context.exception.code, "OPEN_DATA_COMMAND_FAILED")
+        self.assertEqual(context.exception.details["command"], "ogr2ogr")
+        self.assertEqual(context.exception.details["failureClass"], "UPSTREAM_UNAVAILABLE")
+        self.assertNotIn("private-argument", str(context.exception.details))
+        self.assertNotIn("secret", str(context.exception))
+        self.assertEqual(len(context.exception.details["diagnosticFingerprintSha256"]), 64)
+
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.pipeline._run")
     def test_unclassified_roof_returns_are_normalized_after_audit(self, run):
@@ -892,4 +958,3 @@ sources:
 
 if __name__ == "__main__":
     unittest.main()
-

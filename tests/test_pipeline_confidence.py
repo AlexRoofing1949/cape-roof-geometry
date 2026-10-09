@@ -1,10 +1,12 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.errors import UnreliableGeometryError
 from app.pipeline import (
     _combined_confidence,
     _confidence_diagnostics,
+    _extract_roof_geometry_with_coverage_recovery,
     _enforce_roofprint_perimeter_consistency,
     _enforce_shared_boundary_completeness,
 )
@@ -181,7 +183,73 @@ class PipelineConfidenceTests(unittest.TestCase):
             {"BOUNDARY_DIRECTION_MISMATCH": 5},
         )
 
+    def test_marginal_coverage_failure_retries_once_with_audited_limit(self):
+        recovered = {"quality": {}, "confidence": 0.91}
+        with patch(
+            "app.pipeline.extract_roof_geometry",
+            side_effect=[
+                UnreliableGeometryError(
+                    "LIDAR_COVERAGE_INCOMPLETE",
+                    "missing coverage",
+                    details={"noDataFraction": 0.1019, "maximumNoDataFraction": 0.10},
+                ),
+                recovered,
+            ],
+        ) as extract:
+            result = _extract_roof_geometry_with_coverage_recovery(
+                {"CityObjects": {}},
+                None,
+                SimpleNamespace(
+                    maximum_nodata_fraction=0.10,
+                    maximum_recoverable_nodata_fraction=0.15,
+                ),
+            )
+
+        self.assertIs(result, recovered)
+        self.assertEqual(extract.call_count, 2)
+        self.assertEqual(extract.call_args_list[0].kwargs["maximum_nodata_fraction"], 0.10)
+        self.assertEqual(extract.call_args_list[1].kwargs["maximum_nodata_fraction"], 0.15)
+        self.assertTrue(extract.call_args_list[1].kwargs["observed_coverage_score"])
+        self.assertEqual(
+            result["quality"]["coverageRecovery"]["status"], "BOUNDED_RECOVERY"
+        )
+        self.assertEqual(
+            result["quality"]["coverageRecovery"]["observedNoDataFraction"], 0.1019
+        )
+
+    def test_coverage_recovery_does_not_retry_other_or_excessive_failures(self):
+        other = UnreliableGeometryError("ROOFER_RMSE_TOO_HIGH", "rmse")
+        with patch("app.pipeline.extract_roof_geometry", side_effect=other) as extract:
+            with self.assertRaises(UnreliableGeometryError) as context:
+                _extract_roof_geometry_with_coverage_recovery(
+                    {},
+                    None,
+                    SimpleNamespace(
+                        maximum_nodata_fraction=0.10,
+                        maximum_recoverable_nodata_fraction=0.15,
+                    ),
+                )
+        self.assertIs(context.exception, other)
+        extract.assert_called_once()
+
+        excessive = UnreliableGeometryError(
+            "LIDAR_COVERAGE_INCOMPLETE",
+            "missing coverage",
+            details={"noDataFraction": 0.2001, "maximumNoDataFraction": 0.10},
+        )
+        with patch("app.pipeline.extract_roof_geometry", side_effect=excessive) as extract:
+            with self.assertRaises(UnreliableGeometryError) as context:
+                _extract_roof_geometry_with_coverage_recovery(
+                    {},
+                    None,
+                    SimpleNamespace(
+                        maximum_nodata_fraction=0.10,
+                        maximum_recoverable_nodata_fraction=0.15,
+                    ),
+                )
+        self.assertIs(context.exception, excessive)
+        extract.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
-

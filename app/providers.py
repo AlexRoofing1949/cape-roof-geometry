@@ -27,7 +27,12 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 
 from .config import Settings
-from .errors import NoCoverageError, TransientProviderError, UnreliableGeometryError
+from .errors import (
+    NoCoverageError,
+    TransientProviderError,
+    UnreliableGeometryError,
+    command_failure_details,
+)
 from .source_registry import LidarSource, RegistryBundle, SERVICE_COUNTIES
 
 
@@ -136,15 +141,31 @@ def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str
     try:
         return subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
-        raise TransientProviderError("OPEN_DATA_COMMAND_TIMEOUT", "An open-data provider command timed out.") from error
-    except subprocess.CalledProcessError as error:
-        safe_tail = (error.stderr or error.stdout or "")[-500:].replace("\n", " ")
         raise TransientProviderError(
-            "OPEN_DATA_COMMAND_FAILED", f"An open-data provider command failed: {safe_tail}"
+            "OPEN_DATA_COMMAND_TIMEOUT",
+            "An open-data provider command timed out.",
+            details={
+                "command": Path(command[0]).name if command else "unknown",
+                "timeoutSeconds": timeout,
+                "failureClass": "COMMAND_TIMEOUT",
+            },
+        ) from error
+    except subprocess.CalledProcessError as error:
+        raise TransientProviderError(
+            "OPEN_DATA_COMMAND_FAILED",
+            "An open-data provider command failed; see sanitized command diagnostics.",
+            details=command_failure_details(
+                command, error.returncode, error.stderr or error.stdout
+            ),
         ) from error
     except OSError as error:
         raise TransientProviderError(
-            "OPEN_DATA_COMMAND_UNAVAILABLE", "An open-data provider command is unavailable."
+            "OPEN_DATA_COMMAND_UNAVAILABLE",
+            "An open-data provider command is unavailable.",
+            details={
+                "command": Path(command[0]).name if command else "unknown",
+                "launchErrorType": type(error).__name__,
+            },
         ) from error
 
 
@@ -261,7 +282,7 @@ def _footprint_iou(first: BaseGeometry, second: BaseGeometry) -> float:
     return _footprint_comparison(first, second)["intersectionOverUnion"]
 
 
-def _current_overture_release(settings: Settings) -> str:
+def _overture_release_catalog(settings: Settings) -> tuple[str, tuple[str, ...]]:
     request = urllib.request.Request(
         _OVERTURE_STAC_CATALOG_URL, headers={"User-Agent": "CapeRoofGeometry/1.0"}
     )
@@ -273,22 +294,44 @@ def _current_overture_release(settings: Settings) -> str:
             "OVERTURE_CATALOG_UNAVAILABLE", "The Overture release catalog is temporarily unavailable."
         ) from error
     latest = str(payload.get("latest") or "").strip() if isinstance(payload, dict) else ""
-    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", latest):
+    links = payload.get("links") if isinstance(payload, dict) else None
+    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", latest) or not isinstance(links, list):
         raise TransientProviderError(
-            "OVERTURE_CATALOG_INVALID", "The Overture release catalog did not identify a valid latest release."
+            "OVERTURE_CATALOG_INVALID", "The Overture release catalog did not identify valid releases."
         )
-    return latest
+    releases: set[str] = set()
+    for link in links:
+        if not isinstance(link, dict) or link.get("rel") != "child":
+            continue
+        href = str(link.get("href") or "").strip()
+        release = urllib.parse.urlparse(href).path.rstrip("/").split("/")[-1]
+        if release == "catalog.json":
+            path_parts = [part for part in urllib.parse.urlparse(href).path.split("/") if part]
+            release = path_parts[-2] if len(path_parts) >= 2 else ""
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", release):
+            releases.add(release)
+    if latest not in releases:
+        raise TransientProviderError(
+            "OVERTURE_CATALOG_INVALID", "The Overture release catalog latest release is absent from its release links."
+        )
+    return latest, tuple(sorted(releases))
+
+
+def _current_overture_release(settings: Settings) -> str:
+    return _overture_release_catalog(settings)[0]
 
 
 def _require_pinned_overture_release(settings: Settings) -> str:
-    latest = _current_overture_release(settings)
-    if latest != settings.overture_release:
-        raise UnreliableGeometryError(
-            "OVERTURE_RELEASE_MISMATCH",
-            "The configured Overture release is not the current published release.",
-            details={"configuredRelease": settings.overture_release, "currentRelease": latest},
-        )
-    return latest
+    """Keep a configured release while it is published, then roll forward safely.
+
+    Overture retains only a small number of monthly releases.  A stale
+    deployment pin must therefore not take every footprint lookup offline.
+    The selected release is always passed explicitly to the downloader so a
+    catalog update during the request cannot silently change the input data.
+    """
+
+    latest, available = _overture_release_catalog(settings)
+    return settings.overture_release if settings.overture_release in available else latest
 
 
 def fetch_overture_footprint(
@@ -307,16 +350,12 @@ def fetch_overture_footprint(
             "-f",
             "geojson",
             "--type=building",
+            f"--release={release}",
             "--output",
             str(output_path),
         ],
         timeout=settings.provider_timeout_seconds,
     )
-    if _require_pinned_overture_release(settings) != release:
-        raise UnreliableGeometryError(
-            "OVERTURE_RELEASE_CHANGED_DURING_DOWNLOAD",
-            "The Overture release changed while the building footprint was being downloaded.",
-        )
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -626,6 +665,7 @@ def fetch_best_footprint(
                     "provider": provider_name,
                     "decision": "UNAVAILABLE",
                     "errorCode": error.code,
+                    **({"errorDetails": error.details} if error.details else {}),
                 }
             )
     if primary is None:
@@ -652,6 +692,7 @@ def fetch_best_footprint(
                     "provider": provider_name,
                     "decision": "CORROBORATION_UNAVAILABLE",
                     "errorCode": error.code,
+                    **({"errorDetails": error.details} if error.details else {}),
                 }
             )
             continue
@@ -1456,4 +1497,3 @@ def select_regional_lidar(
     if not candidates:
         raise NoCoverageError("NO_LIDAR_COVERAGE", "No enabled registered LiDAR source completely covers this building.")
     return county, candidates, audit
-

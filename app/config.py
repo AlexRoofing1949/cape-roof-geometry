@@ -97,6 +97,7 @@ class Settings:
     minimum_lidar_acquisition_date: date
     minimum_point_density: float
     maximum_nodata_fraction: float
+    maximum_recoverable_nodata_fraction: float
     maximum_roofer_rmse_meters: float
     roofer_plane_detect_k: int
     roofer_plane_detect_min_points: int
@@ -262,6 +263,9 @@ class Settings:
             ),
             minimum_point_density=_float("MINIMUM_POINT_DENSITY", 8),
             maximum_nodata_fraction=_float("MAXIMUM_NODATA_FRACTION", 0.10),
+            maximum_recoverable_nodata_fraction=_float(
+                "MAXIMUM_RECOVERABLE_NODATA_FRACTION", 0.15
+            ),
             maximum_roofer_rmse_meters=_float("MAXIMUM_ROOFER_RMSE_METERS", 0.35),
             roofer_plane_detect_k=_int("ROOFER_PLANE_DETECT_K", 15),
             roofer_plane_detect_min_points=_int("ROOFER_PLANE_DETECT_MIN_POINTS", 20),
@@ -410,6 +414,16 @@ class Settings:
             raise ConfigurationError(
                 "SOLAR_ROOFPRINT_CONFIG_INVALID",
                 "Google Solar roof-mask limits are outside the supported fail-closed range.",
+            )
+        if not (
+            0.01 <= self.maximum_nodata_fraction <= 0.15
+            and self.maximum_nodata_fraction
+            <= self.maximum_recoverable_nodata_fraction
+            <= 0.20
+        ):
+            raise ConfigurationError(
+                "LIDAR_NODATA_THRESHOLD_INVALID",
+                "The strict LiDAR no-data threshold must be at most 0.15 and no greater than the recoverable threshold, which may not exceed 0.20.",
             )
         if not 2 <= self.maximum_roofprint_perimeter_variance_percent <= 15:
             raise ConfigurationError(
@@ -567,4 +581,3 @@ class Settings:
                 "An approved facet calibration requires its immutable private dataset version.",
             )
         self.work_root.mkdir(parents=True, exist_ok=True)
-

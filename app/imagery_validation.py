@@ -707,4 +707,3 @@ def validate_current_structure(
             warnings.append(marker)
         result["warnings"] = warnings
     return result
-

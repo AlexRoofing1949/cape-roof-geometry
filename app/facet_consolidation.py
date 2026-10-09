@@ -2509,4 +2509,3 @@ def consolidate_roofer_feature(
         }
     )
     return corrected_feature, None, audit
-
