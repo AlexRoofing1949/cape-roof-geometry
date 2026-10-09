@@ -33,7 +33,7 @@ jobs:
           docker run --rm
           --volume "$GITHUB_WORKSPACE:/workspace:ro"
           --workdir /workspace
-          --entrypoint python
+          --entrypoint /opt/conda/bin/python
           cape-roof-geometry:ci
           -m unittest discover -s tests -v
 
