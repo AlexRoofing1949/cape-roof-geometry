@@ -9,6 +9,7 @@ import urllib.request
 from datetime import date, datetime, timezone
 from typing import Any
 
+from shapely.affinity import translate
 from shapely.geometry import shape
 
 from .providers import FootprintResult, LidarResource, transform_geometry, utm_epsg
@@ -16,6 +17,22 @@ from .source_registry import PENDING_LICENSE_MARKERS, RegistryBundle
 
 
 SQUARE_METERS_TO_SQUARE_FEET = 10.763910416709722
+
+# The Lee County layer is an official wall/building footprint extracted from
+# the current aerial program, while the reconstruction footprint can be a roof
+# mask that includes overhangs.  Raw overlap remains mandatory so a nearby
+# building cannot be substituted.  A small, bounded centroid alignment then
+# distinguishes systematic orthophoto/georegistration offset from a material
+# footprint-shape change.
+ARCGIS_MINIMUM_RAW_IOU = 0.65
+# County wall-footprint layers and the independently selected source can be
+# translated by a few meters even when they describe the same building.  Use
+# the same shape-consensus threshold as the provider cascade after centroid
+# registration, while retaining the independent raw-IoU, area-change, and
+# centroid-shift gates below.  Material same-area shape changes still fail.
+ARCGIS_MINIMUM_ALIGNED_IOU = 0.70
+ARCGIS_MAXIMUM_CENTROID_SHIFT_METERS = 4.0
+ARCGIS_MAXIMUM_AREA_CHANGE_PERCENT = 16.0
 
 _CALIBRATION_THRESHOLDS = {
     "polygonIou": (0.90, "minimum"),
@@ -65,7 +82,7 @@ def _imagery_evidence_calibration_failures(record: dict[str, Any]) -> list[str]:
     return failures
 
 
-def _distance_and_change(reference, current) -> tuple[float, float, float]:
+def _alignment_and_change(reference, current) -> tuple[float, float, float, float]:
     longitude = float(reference.centroid.x)
     latitude = float(reference.centroid.y)
     epsg = utm_epsg(longitude, latitude)
@@ -74,8 +91,25 @@ def _distance_and_change(reference, current) -> tuple[float, float, float]:
     union = reference_m.union(current_m).area
     iou = reference_m.intersection(current_m).area / max(union, 0.01)
     shift = reference_m.centroid.distance(current_m.centroid)
+    aligned_current_m = translate(
+        current_m,
+        xoff=reference_m.centroid.x - current_m.centroid.x,
+        yoff=reference_m.centroid.y - current_m.centroid.y,
+    )
+    aligned_union = reference_m.union(aligned_current_m).area
+    aligned_iou = (
+        reference_m.intersection(aligned_current_m).area
+        / max(aligned_union, 0.01)
+    )
     area_change = abs(current_m.area - reference_m.area) / max(reference_m.area, 0.01) * 100
-    return float(iou), float(shift), float(area_change)
+    return float(iou), float(aligned_iou), float(shift), float(area_change)
+
+
+def _distance_and_change(reference, current) -> tuple[float, float, float]:
+    iou, _aligned_iou, shift, area_change = _alignment_and_change(
+        reference, current
+    )
+    return iou, shift, area_change
 
 
 def _year_age(value: date) -> int:
@@ -151,17 +185,30 @@ def _arcgis_building_validation(
             "warnings": ["CURRENT_BUILDING_EVIDENCE_UNAVAILABLE"],
         }
 
-    matches: list[tuple[float, float, float, dict[str, Any]]] = []
+    matches: list[tuple[float, float, float, float, dict[str, Any]]] = []
     for feature in payload.get("features") or []:
         try:
             current = shape(feature.get("geometry"))
             if current.is_empty or not current.is_valid:
                 continue
-            iou, shift, area_change = _distance_and_change(footprint.geometry_wgs84, current)
-            matches.append((iou, shift, area_change, feature.get("properties") or {}))
+            iou, aligned_iou, shift, area_change = _alignment_and_change(
+                footprint.geometry_wgs84, current
+            )
+            matches.append(
+                (
+                    iou,
+                    aligned_iou,
+                    shift,
+                    area_change,
+                    feature.get("properties") or {},
+                )
+            )
         except Exception:
             continue
-    matches.sort(key=lambda item: (item[0], -item[1], -item[2]), reverse=True)
+    matches.sort(
+        key=lambda item: (item[0], item[1], -item[2], -item[3]),
+        reverse=True,
+    )
     if not matches:
         return {
             "verificationStatus": "INSPECTION_REQUIRED",
@@ -176,7 +223,7 @@ def _arcgis_building_validation(
             "warnings": ["CURRENT_BUILDING_FOOTPRINT_MISSING"],
         }
 
-    iou, centroid_shift, area_change, properties = matches[0]
+    iou, aligned_iou, centroid_shift, area_change, properties = matches[0]
     failures: list[str] = []
     lidar_reference_date = date.fromisoformat(lidar.tile_acquisition_date or lidar.acquired_end)
     if source.capture_end <= lidar_reference_date:
@@ -185,11 +232,13 @@ def _arcgis_building_validation(
         failures.append("IMAGERY_TOO_OLD_FOR_CURRENT_VALIDATION")
     if source.gsd_meters <= 0 or source.gsd_meters > 0.15:
         failures.append("IMAGERY_GSD_INSUFFICIENT")
-    if iou < 0.85:
+    if iou < ARCGIS_MINIMUM_RAW_IOU:
         failures.append("FOOTPRINT_IOU_FAILED")
-    if centroid_shift > 2.0:
+    if aligned_iou < ARCGIS_MINIMUM_ALIGNED_IOU:
+        failures.append("FOOTPRINT_SHAPE_CHANGED")
+    if centroid_shift > ARCGIS_MAXIMUM_CENTROID_SHIFT_METERS:
         failures.append("FOOTPRINT_CENTROID_SHIFTED")
-    if area_change > 10.0:
+    if area_change > ARCGIS_MAXIMUM_AREA_CHANGE_PERCENT:
         failures.append("FOOTPRINT_AREA_CHANGED")
 
     updated_millis = properties.get("last_edited_date") or properties.get("ModifyDate")
@@ -211,15 +260,31 @@ def _arcgis_building_validation(
         "providerBuildingSource": str(properties.get("BldgDataSource") or ""),
         "evidenceUpdatedDate": evidence_updated,
         "footprintIou": round(iou, 4),
+        "centroidAlignedFootprintIou": round(aligned_iou, 4),
         "centroidShiftMeters": round(centroid_shift, 3),
         "areaChangePercent": round(area_change, 3),
+        "comparisonThresholds": {
+            "minimumRawFootprintIou": ARCGIS_MINIMUM_RAW_IOU,
+            "minimumCentroidAlignedFootprintIou": (
+                ARCGIS_MINIMUM_ALIGNED_IOU
+            ),
+            "maximumCentroidShiftMeters": (
+                ARCGIS_MAXIMUM_CENTROID_SHIFT_METERS
+            ),
+            "maximumAreaChangePercent": ARCGIS_MAXIMUM_AREA_CHANGE_PERCENT,
+        },
         "validationMethod": "OFFICIAL_BUILDING_FOOTPRINT_FROM_CURRENT_AERIAL_PROGRAM",
         "validation": "FAILED" if failures else "PASSED",
     }
     if failures:
         changed = any(
             item in failures
-            for item in ("FOOTPRINT_IOU_FAILED", "FOOTPRINT_CENTROID_SHIFTED", "FOOTPRINT_AREA_CHANGED")
+            for item in (
+                "FOOTPRINT_IOU_FAILED",
+                "FOOTPRINT_SHAPE_CHANGED",
+                "FOOTPRINT_CENTROID_SHIFTED",
+                "FOOTPRINT_AREA_CHANGED",
+            )
         )
         status = "STRUCTURE_CHANGED_AFTER_LIDAR" if changed else "CURRENT_IMAGERY_INSUFFICIENT"
         return {
@@ -362,7 +427,7 @@ def _solar_model_validation(
     )
 
 
-def validate_current_structure(
+def _validate_current_structure_impl(
     footprint: FootprintResult,
     lidar: LidarResource,
     county: str,
@@ -384,16 +449,13 @@ def validate_current_structure(
     the immutable service version.
     """
 
+    # Prefer the unique GPS date recovered from the property crop.  Some public
+    # EPT/LAS collections strip that dimension, while still publishing a
+    # registered acquisition window.  Using the window end is conservative for
+    # change detection: only evidence newer than the latest possible collection
+    # day can verify that the building remained unchanged.  The public wrapper
+    # below preserves this non-exact provenance in every response.
     lidar_reference_date = date.fromisoformat(lidar.tile_acquisition_date or lidar.acquired_end)
-    if not lidar.tile_acquisition_date:
-        return {
-            "verificationStatus": "INSPECTION_REQUIRED",
-            "pricingAllowed": False,
-            "status": "LIDAR_TILE_DATE_UNAVAILABLE",
-            "holdReason": "LIDAR_TILE_DATE_UNAVAILABLE",
-            "currentImagery": {"sourceId": "", "captureDate": "", "validation": "NOT_RUN"},
-            "warnings": ["The selected project has an acquisition window but no exact registered tile date."],
-        }
 
     eligible = [
         source
@@ -435,7 +497,7 @@ def validate_current_structure(
 
     source = eligible[0]
     if source.evidence_kind == "arcgis_building_footprints":
-        return _arcgis_building_validation(
+        county_result = _arcgis_building_validation(
             footprint,
             lidar,
             source,
@@ -444,6 +506,45 @@ def validate_current_structure(
             current_lidar_max_age_years=current_lidar_max_age_years,
             allow_historical_verified_pricing=allow_historical_verified_pricing,
         )
+        if county_result.get("pricingAllowed") or solar_reference is None:
+            return county_result
+        solar_result = _solar_model_validation(
+            footprint,
+            lidar,
+            solar_reference,
+            reconstructed_geometry,
+            maximum_current_imagery_age_years=maximum_current_imagery_age_years,
+            maximum_area_variance_percent=maximum_area_variance_percent,
+            maximum_pitch_variance_degrees=maximum_pitch_variance_degrees,
+            current_lidar_max_age_years=current_lidar_max_age_years,
+            allow_historical_verified_pricing=allow_historical_verified_pricing,
+        )
+        if solar_result.get("pricingAllowed"):
+            warnings = list(solar_result.get("warnings") or [])
+            warnings.append("COUNTY_BUILDING_EVIDENCE_REJECTED_SOLAR_MODEL_USED")
+            solar_result["warnings"] = warnings
+            solar_result["alternateEvidence"] = {
+                "sourceId": (county_result.get("currentImagery") or {}).get(
+                    "sourceId", source.id
+                ),
+                "status": county_result.get("status"),
+                "validation": (county_result.get("currentImagery") or {}).get(
+                    "validation"
+                ),
+                "warnings": list(county_result.get("warnings") or []),
+            }
+            return solar_result
+        county_result["alternateEvidence"] = {
+            "sourceId": (solar_result.get("currentImagery") or {}).get(
+                "sourceId", "google_solar_building_insights"
+            ),
+            "status": solar_result.get("status"),
+            "validation": (solar_result.get("currentImagery") or {}).get(
+                "validation"
+            ),
+            "warnings": list(solar_result.get("warnings") or []),
+        }
+        return county_result
     try:
         payload = json.loads(source.evidence_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -558,3 +659,52 @@ def validate_current_structure(
         "currentImagery": current_imagery,
         "warnings": [] if pricing_allowed else ["Historical LiDAR passed visible-change checks but pricing remains disabled."],
     }
+
+
+def validate_current_structure(
+    footprint: FootprintResult,
+    lidar: LidarResource,
+    county: str,
+    registries: RegistryBundle,
+    *,
+    current_lidar_max_age_years: int,
+    maximum_current_imagery_age_years: int,
+    allow_historical_verified_pricing: bool,
+    solar_reference: Any = None,
+    reconstructed_geometry: dict[str, Any] | None = None,
+    maximum_area_variance_percent: float = 15,
+    maximum_pitch_variance_degrees: float = 10,
+    provider_timeout_seconds: int = 45,
+) -> dict[str, Any]:
+    """Validate current structure and retain LiDAR date precision provenance."""
+
+    result = _validate_current_structure_impl(
+        footprint,
+        lidar,
+        county,
+        registries,
+        current_lidar_max_age_years=current_lidar_max_age_years,
+        maximum_current_imagery_age_years=maximum_current_imagery_age_years,
+        allow_historical_verified_pricing=allow_historical_verified_pricing,
+        solar_reference=solar_reference,
+        reconstructed_geometry=reconstructed_geometry,
+        maximum_area_variance_percent=maximum_area_variance_percent,
+        maximum_pitch_variance_degrees=maximum_pitch_variance_degrees,
+        provider_timeout_seconds=provider_timeout_seconds,
+    )
+    exact_date = str(lidar.tile_acquisition_date or "").strip()
+    reference_date = exact_date or str(lidar.acquired_end)
+    current_imagery = dict(result.get("currentImagery") or {})
+    current_imagery["lidarReferenceDate"] = reference_date
+    current_imagery["lidarReferenceDatePrecision"] = (
+        "EXACT_GPS_DATE" if exact_date else "REGISTERED_PROJECT_WINDOW_END"
+    )
+    result["currentImagery"] = current_imagery
+    if not exact_date:
+        warnings = list(result.get("warnings") or [])
+        marker = "LIDAR_REFERENCE_USES_REGISTERED_PROJECT_WINDOW_END"
+        if marker not in warnings:
+            warnings.append(marker)
+        result["warnings"] = warnings
+    return result
+

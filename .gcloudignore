@@ -1,0 +1,11 @@
+.gcloudignore
+.git/
+.gitignore
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+deploy/
+tmp/
+

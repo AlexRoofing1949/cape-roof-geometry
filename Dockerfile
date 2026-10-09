@@ -1,4 +1,4 @@
-ARG ROOFER_IMAGE=3dgi/roofer:v1.0.0@sha256:dd2c415aaee337502bde0dc1426dfa9c9f88e648f9d2f6340110c49932c251d2
+ARG ROOFER_IMAGE=3dgi/roofer:v1.1.0-beta.1@sha256:476b5f4bbaf4109c52fe7fba1e81a9ece0ef4ade557dbdadb79b318444689e99
 FROM ${ROOFER_IMAGE} AS roofer
 
 FROM mambaorg/micromamba:2.3.3@sha256:800e7ade3ffe29c9a9ac2026163131495f8197c3852e572c5835beb4e8a33cd6
@@ -35,3 +35,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--proxy-headers"]
+

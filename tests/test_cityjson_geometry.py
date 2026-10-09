@@ -1,12 +1,23 @@
 import math
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
+
+from shapely.geometry import LineString, Point, Polygon
 
 from app.cityjson_geometry import (
     EdgeUse,
     Facet,
+    _edge_direction_variance_degrees,
     _facet_side_height_delta,
     _noded_edge_uses,
+    _reconcile_offset_shared_boundaries,
+    _roofprint_local_tangent_direction,
+    _roof_facets,
+    _validated_coplanar_boundary_overlap,
+    _validated_plane_intersection_edge,
+    _validated_plane_supported_overlap,
     extract_roof_geometry,
     load_cityjson_feature,
 )
@@ -16,6 +27,523 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class CityJsonGeometryTests(unittest.TestCase):
+    def test_roofprint_tangent_smooths_pixel_stair_step_direction(self):
+        boundary = LineString(
+            [
+                (0.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 0.10),
+                (4.0, 0.10),
+                (4.0, 0.0),
+                (6.0, 0.0),
+            ]
+        )
+
+        tangent = _roofprint_local_tangent_direction(
+            boundary, Point(2.0, 0.05), sampling_radius_meters=0.75
+        )
+
+        self.assertIsNotNone(tangent)
+        self.assertGreater(abs(tangent[0]), 1.0)
+        self.assertLess(abs(tangent[1]), 0.2)
+
+    def test_pixel_stair_step_is_classified_from_smoothed_roofprint_tangent(self):
+        root_half = math.sqrt(0.5)
+        vertices = (
+            (2.0, 0.0, 1.0),
+            (2.0, 0.10, 1.10),
+            (3.0, 1.0, 2.0),
+        )
+        facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=vertices,
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=45.0,
+            azimuth_degrees=180.0,
+            centroid=tuple(
+                sum(point[axis] for point in vertices) / len(vertices)
+                for axis in range(3)
+            ),
+            normal=(0.0, -root_half, root_half),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        use = EdgeUse(facet, 0, 1, vertices[0], vertices[1])
+        attributes = {
+            "rf_success": True,
+            "rf_pointcloud_unusable": False,
+            "rf_extrusion_mode": "standard",
+            "rf_pt_density": 15,
+            "rf_nodata_frac": 0.01,
+            "rf_rmse_lod22": 0.1,
+        }
+        boundary = LineString(
+            [
+                (0.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 0.10),
+                (4.0, 0.10),
+                (4.0, 0.0),
+                (6.0, 0.0),
+            ]
+        )
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=([facet], attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"stair": [use]},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"stair": [use]}, {}, {}),
+            ),
+        ):
+            result = extract_roof_geometry(
+                {}, None, roofprint_boundary=boundary
+            )
+
+        self.assertEqual(result["rakesFeet"], 0.0)
+        self.assertGreater(result["eavesFeet"], 0.0)
+        self.assertEqual(
+            result["eaves"][0]["classificationEvidence"]["edgeDirectionSource"],
+            "LOCAL_ROOFPRINT_TANGENT",
+        )
+
+    def test_horizontal_low_side_is_eave_even_when_roofprint_tangent_points_downslope(self):
+        root_half = math.sqrt(0.5)
+        vertices = (
+            (0.0, 0.0, 1.0),
+            (0.0, 2.0, 1.0),
+            (2.0, 2.0, 3.0),
+        )
+        facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=vertices,
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=45.0,
+            azimuth_degrees=180.0,
+            centroid=tuple(
+                sum(point[axis] for point in vertices) / len(vertices)
+                for axis in range(3)
+            ),
+            normal=(0.0, -root_half, root_half),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        use = EdgeUse(facet, 0, 1, vertices[0], vertices[1])
+        attributes = {
+            "rf_success": True,
+            "rf_pointcloud_unusable": False,
+            "rf_extrusion_mode": "standard",
+            "rf_pt_density": 15,
+            "rf_nodata_frac": 0.01,
+            "rf_rmse_lod22": 0.1,
+        }
+        boundary = LineString([(0.0, -1.0), (0.0, 3.0)])
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=([facet], attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"horizontal-low": [use]},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"horizontal-low": [use]}, {}, {}),
+            ),
+        ):
+            result = extract_roof_geometry(
+                {}, None, roofprint_boundary=boundary
+            )
+
+        self.assertEqual(result["rakesFeet"], 0.0)
+        self.assertGreater(result["eavesFeet"], 0.0)
+        self.assertEqual(
+            result["eaves"][0]["classificationEvidence"]["classificationRule"],
+            "HORIZONTAL_LOW_SIDE_BOUNDARY",
+        )
+
+    @staticmethod
+    def _non_manifold_fixture(edge_length_meters):
+        root_half = math.sqrt(0.5)
+        normals = (
+            (0.0, -root_half, root_half),
+            (-root_half, 0.0, root_half),
+            (root_half, 0.0, root_half),
+        )
+        facets = []
+        uses = []
+        for index, normal in enumerate(normals, start=1):
+            vertices = (
+                (0.0, 0.0, 1.0),
+                (edge_length_meters, 0.0, 1.0),
+                (0.0, 1.0, 2.0),
+            )
+            facet = Facet(
+                facet_id=f"F{index}",
+                vertex_ids=(0, 1, 2),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[axis] for point in vertices) / len(vertices)
+                    for axis in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+            facets.append(facet)
+            uses.append(
+                EdgeUse(facet, 0, 1, vertices[0], vertices[1])
+            )
+        attributes = {
+            "rf_success": True,
+            "rf_pointcloud_unusable": False,
+            "rf_extrusion_mode": "standard",
+            "rf_pt_density": 15,
+            "rf_nodata_frac": 0.01,
+            "rf_rmse_lod22": 0.1,
+        }
+        return facets, uses, attributes
+
+    def test_sub_node_tolerance_non_manifold_fragment_is_suppressed_and_audited(self):
+        facets, uses, attributes = self._non_manifold_fixture(0.12)
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=(facets, attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"artifact": uses},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"artifact": uses}, {}, {}),
+            ),
+        ):
+            result = extract_roof_geometry(
+                {}, None, edge_node_tolerance_meters=0.15
+            )
+
+        topology = result["topology"]
+        self.assertEqual(topology["suppressedNonManifoldJunctionCount"], 1)
+        self.assertAlmostEqual(
+            topology["suppressedNonManifoldJunctionFeet"],
+            0.12 * 3.280839895013123,
+            delta=0.005,
+        )
+        self.assertEqual(
+            topology["suppressedNonManifoldJunctions"][0]["derivation"],
+            "SUPPRESSED_SUB_NODE_TOLERANCE_NON_MANIFOLD_JUNCTION",
+        )
+
+    def test_material_non_manifold_edge_still_fails_closed(self):
+        facets, uses, attributes = self._non_manifold_fixture(0.20)
+        with (
+            patch(
+                "app.cityjson_geometry._roof_facets",
+                return_value=(facets, attributes),
+            ),
+            patch(
+                "app.cityjson_geometry._noded_edge_uses",
+                return_value={"material": uses},
+            ),
+            patch(
+                "app.cityjson_geometry._reconcile_offset_shared_boundaries",
+                return_value=({"material": uses}, {}, {}),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                Exception, "More than two roof facets"
+            ) as context:
+                extract_roof_geometry(
+                    {}, None, edge_node_tolerance_meters=0.15
+                )
+
+        self.assertEqual(context.exception.code, "NON_MANIFOLD_ROOF_EDGE")
+
+    def test_coplanar_offset_fragments_are_validated_for_suppression(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=(0.0, -root_half, root_half),
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first_vertices = (
+            (0.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 1.0, 1.0),
+        )
+        second_vertices = (
+            (2.0, 0.16, 0.16),
+            (0.0, 0.16, 0.16),
+            (0.0, 1.0, 1.0),
+        )
+        first = EdgeUse(
+            facet("F1", first_vertices),
+            0,
+            1,
+            first_vertices[0],
+            first_vertices[1],
+        )
+        second = EdgeUse(
+            facet("F2", second_vertices),
+            0,
+            1,
+            second_vertices[0],
+            second_vertices[1],
+        )
+
+        evidence = _validated_coplanar_boundary_overlap(
+            first, second, 0.35, 0.80
+        )
+
+        self.assertEqual(
+            evidence["pairingDerivation"],
+            "MUTUAL_UNIQUE_COPLANAR_BOUNDARY_PAIR",
+        )
+        self.assertEqual(evidence["overlapRatio"], 1.0)
+        reconciled, repaired, audit = _reconcile_offset_shared_boundaries(
+            {(0, 1): [first], (2, 3): [second]},
+            roofprint_boundary=Polygon(
+                [(-1, -2), (3, -2), (3, 2), (-1, 2)]
+            ).boundary,
+            exterior_boundary_maximum_distance_meters=0.5,
+            maximum_displacement_meters=0.35,
+            coplanar_tolerance_degrees=3.0,
+        )
+        self.assertEqual(reconciled, {})
+        self.assertEqual(repaired, {})
+        self.assertEqual(audit["suppressedCoplanarBoundaryCount"], 1)
+        self.assertGreater(audit["suppressedCoplanarBoundaryFeet"], 6.5)
+
+    def test_fragmented_boundaries_use_common_plane_support_not_raw_angle(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first_vertices = (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 1.0),
+        )
+        second_vertices = (
+            (1.0, 0.30, 0.02),
+            (0.0, 0.16, 0.16),
+            (0.0, -1.0, 1.32),
+        )
+        first_facet = facet(
+            "F1", first_vertices, (0.0, -root_half, root_half)
+        )
+        second_facet = facet(
+            "F2", second_vertices, (0.0, root_half, root_half)
+        )
+        first = EdgeUse(
+            first_facet, 0, 1, first_vertices[0], first_vertices[1]
+        )
+        second = EdgeUse(
+            second_facet, 0, 1, second_vertices[0], second_vertices[1]
+        )
+
+        self.assertGreater(_edge_direction_variance_degrees(first, second), 5.0)
+        corrected, evidence = _validated_plane_supported_overlap(
+            first, second, 0.35, 0.80
+        )
+
+        self.assertEqual(
+            evidence["derivation"],
+            "PLANE_INTERSECTION_SUPPORTED_FRAGMENT_OVERLAP",
+        )
+        self.assertEqual(evidence["overlapRatio"], 1.0)
+        self.assertAlmostEqual(
+            math.dist(corrected[0].start, corrected[0].end), 1.0
+        )
+
+    def test_mutually_unique_offset_interior_boundaries_are_reconciled(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first_vertices = (
+            (0.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0),
+            (10.0, 5.0, 5.0),
+        )
+        second_vertices = (
+            (10.0, 0.16, 0.16),
+            (0.0, 0.16, 0.16),
+            (0.0, -5.0, 5.32),
+        )
+        first = facet("F1", first_vertices, (0.0, -root_half, root_half))
+        second = facet("F2", second_vertices, (0.0, root_half, root_half))
+        edge_uses = {
+            (0, 1): [
+                EdgeUse(first, 0, 1, first_vertices[0], first_vertices[1])
+            ],
+            (2, 3): [
+                EdgeUse(second, 0, 1, second_vertices[0], second_vertices[1])
+            ],
+        }
+
+        reconciled, evidence, audit = _reconcile_offset_shared_boundaries(
+            edge_uses,
+            roofprint_boundary=Polygon(
+                [(-1, -6), (11, -6), (11, 6), (-1, 6)]
+            ).boundary,
+            exterior_boundary_maximum_distance_meters=0.5,
+            maximum_displacement_meters=0.35,
+            coplanar_tolerance_degrees=3.0,
+        )
+
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(len(next(iter(reconciled.values()))), 2)
+        repaired_key = next(iter(reconciled))
+        self.assertEqual(
+            evidence[repaired_key]["pairingDerivation"],
+            "MUTUAL_UNIQUE_PLANE_SUPPORTED_BOUNDARY_PAIR",
+        )
+        self.assertEqual(audit["offsetBoundaryCandidateCount"], 1)
+        self.assertEqual(audit["repairedSharedBoundaryCount"], 1)
+        self.assertEqual(audit["unpairedInteriorBoundaryCount"], 0)
+        self.assertEqual(audit["offsetBoundaryRejectionCounts"], {})
+
+    def test_ambiguous_offset_boundary_candidates_remain_unmatched(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
+        second_vertices = ((10.0, 0.16, 0.16), (0.0, 0.16, 0.16), (0.0, -5.0, 5.32))
+        third_vertices = ((10.0, 0.18, 0.14), (0.0, 0.18, 0.14), (0.0, -5.0, 5.32))
+        first = facet("F1", first_vertices, (0.0, -root_half, root_half))
+        second = facet("F2", second_vertices, (0.0, root_half, root_half))
+        third = facet("F3", third_vertices, (0.0, root_half, root_half))
+        edge_uses = {
+            (0, 1): [EdgeUse(first, 0, 1, first_vertices[0], first_vertices[1])],
+            (2, 3): [EdgeUse(second, 0, 1, second_vertices[0], second_vertices[1])],
+            (4, 5): [EdgeUse(third, 0, 1, third_vertices[0], third_vertices[1])],
+        }
+
+        reconciled, evidence, audit = _reconcile_offset_shared_boundaries(
+            edge_uses,
+            roofprint_boundary=Polygon(
+                [(-1, -6), (11, -6), (11, 6), (-1, 6)]
+            ).boundary,
+            exterior_boundary_maximum_distance_meters=0.5,
+            maximum_displacement_meters=0.35,
+            coplanar_tolerance_degrees=3.0,
+        )
+
+        self.assertEqual(reconciled, edge_uses)
+        self.assertEqual(evidence, {})
+        self.assertEqual(audit["offsetBoundaryCandidateCount"], 3)
+        self.assertEqual(audit["repairedSharedBoundaryCount"], 0)
+        self.assertEqual(audit["suppressedCoplanarBoundaryCount"], 0)
+        self.assertEqual(audit["ambiguousOffsetBoundaryCount"], 3)
+        self.assertEqual(audit["unpairedInteriorBoundaryCount"], 3)
+        self.assertEqual(audit["offsetBoundaryRejectionCounts"], {})
+
+    def test_offset_boundaries_on_roofprint_remain_exterior(self):
+        feature, transform = load_cityjson_feature(
+            FIXTURES / "simple_gable.city.jsonl"
+        )
+        facets, _ = _roof_facets(feature, transform)
+        edge_uses = _noded_edge_uses(facets)
+
+        reconciled, evidence, audit = _reconcile_offset_shared_boundaries(
+            edge_uses,
+            roofprint_boundary=Polygon([(0, 0), (10, 0), (10, 6), (0, 6)]).boundary,
+            exterior_boundary_maximum_distance_meters=100.0,
+            maximum_displacement_meters=0.35,
+            coplanar_tolerance_degrees=3.0,
+        )
+
+        self.assertEqual(reconciled, edge_uses)
+        self.assertEqual(evidence, {})
+        self.assertEqual(audit["offsetBoundaryCandidateCount"], 0)
+
     def test_sub_decimetre_shared_edge_offsets_are_noded(self):
         first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
         second_vertices = ((10.0, 0.04, 0.03), (0.0, 0.04, 0.03), (0.0, -5.0, 5.0))
@@ -42,6 +570,401 @@ class CityJsonGeometryTests(unittest.TestCase):
         )
 
         self.assertTrue(any(len(uses) == 2 for uses in edge_uses.values()))
+
+    def test_plane_fit_height_residuals_do_not_duplicate_shared_edges(self):
+        first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
+        second_vertices = ((10.0, 0.04, 0.24), (0.0, 0.04, 0.24), (0.0, -5.0, 5.0))
+
+        def facet(facet_id, vertices):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=30.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(sum(point[i] for point in vertices) / 3 for i in range(3)),
+                normal=(0.0, 0.5, math.sqrt(0.75)),
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        edge_uses = _noded_edge_uses(
+            [facet("F1", first_vertices), facet("F2", second_vertices)],
+            tolerance_meters=0.10,
+            vertical_tolerance_meters=0.30,
+        )
+
+        self.assertTrue(any(len(uses) == 2 for uses in edge_uses.values()))
+
+    def test_shared_edge_is_corrected_to_facet_plane_intersection(self):
+        root_half = math.sqrt(0.5)
+        first_vertices = (
+            (0.0, 0.0, 0.0),
+            (10.0, 0.0, 0.0),
+            (10.0, 5.0, 5.0),
+        )
+        second_vertices = (
+            (10.0, 0.04, 0.24),
+            (0.0, 0.04, 0.24),
+            (0.0, -5.0, 5.28),
+        )
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[i] for point in vertices) / 3 for i in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first = facet("F1", first_vertices, (0.0, -root_half, root_half))
+        second = facet("F2", second_vertices, (0.0, root_half, root_half))
+        uses = [
+            EdgeUse(first, 0, 1, first_vertices[0], first_vertices[1]),
+            EdgeUse(second, 0, 1, second_vertices[0], second_vertices[1]),
+        ]
+
+        corrected, evidence = _validated_plane_intersection_edge(uses, 0.35)
+
+        self.assertEqual(evidence["derivation"], "PLANE_PLANE_BOUNDARY_INTERSECTION")
+        self.assertLessEqual(evidence["maximumCorrectionMeters"], 0.35)
+        self.assertEqual(evidence["originalBoundaryAlignmentDegrees"], [0.0, 0.0])
+        self.assertAlmostEqual(evidence["incidentPlaneAngleDegrees"], 90.0)
+        self.assertAlmostEqual(corrected[0].start[1], 0.14, delta=0.001)
+        self.assertAlmostEqual(corrected[0].start[2], 0.14, delta=0.001)
+        self.assertEqual(corrected[0].start, corrected[1].end)
+        self.assertEqual(corrected[0].end, corrected[1].start)
+        for use in corrected:
+            plane_origin = use.facet.vertices[0]
+            for point in (use.start, use.end):
+                self.assertAlmostEqual(
+                    sum(
+                        use.facet.normal[index]
+                        * (point[index] - plane_origin[index])
+                        for index in range(3)
+                    ),
+                    0.0,
+                    delta=1e-9,
+                )
+        self.assertGreater(_facet_side_height_delta(corrected[0]), 0)
+        self.assertGreater(_facet_side_height_delta(corrected[1]), 0)
+
+    def test_plan_coincident_seam_uses_bounded_endpoint_consensus(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "PLANAR-CONSENSUS-SEAM",
+            "vertices": [
+                [0, 0, 0], [10, 0, 0], [10, 5, 0.5], [0, 5, 0.5],
+                [10, 0, 0.2], [0, 0, 0.2], [0, -5, 0.7], [10, -5, 0.7],
+            ],
+            "CityObjects": {
+                "PLANAR-CONSENSUS-SEAM": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        self.assertEqual(
+            result["topology"]["planarConsensusSharedBoundaryCount"], 1
+        )
+        self.assertAlmostEqual(
+            result["topology"]["planarConsensusSharedBoundaryFeet"],
+            10 * 3.280839895013123,
+            delta=0.02,
+        )
+        consensus_edges = [
+            edge
+            for edge in result["edges"]
+            if edge["classificationEvidence"].get("derivation")
+            == "PLAN_COINCIDENT_ENDPOINT_CONSENSUS"
+        ]
+        self.assertEqual(len(consensus_edges), 1)
+        self.assertLessEqual(
+            consensus_edges[0]["classificationEvidence"]["maximumCorrectionMeters"],
+            0.35,
+        )
+
+    def test_facet_side_delta_uses_fitted_plane_not_consensus_edge_z(self):
+        root_half = math.sqrt(0.5)
+
+        def facet(facet_id, vertices, normal):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=45.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(
+                    sum(point[index] for point in vertices) / len(vertices)
+                    for index in range(3)
+                ),
+                normal=normal,
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        first = facet(
+            "F1",
+            ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0)),
+            (0.0, -root_half, root_half),
+        )
+        second = facet(
+            "F2",
+            ((10.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, -5.0, 5.0)),
+            (0.0, root_half, root_half),
+        )
+        consensus_start = (0.0, 0.0, -0.3)
+        consensus_end = (10.0, 0.0, 0.3)
+        uses = (
+            EdgeUse(first, 0, 1, consensus_start, consensus_end),
+            EdgeUse(second, 0, 1, consensus_end, consensus_start),
+        )
+
+        self.assertAlmostEqual(_facet_side_height_delta(uses[0]), 1.0)
+        self.assertAlmostEqual(_facet_side_height_delta(uses[1]), 1.0)
+
+    def test_misaligned_consensus_dihedral_conflict_is_audited_not_priced(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "MISALIGNED-CONSENSUS-CONFLICT",
+            "vertices": [
+                [0, 0, 0], [1, 0, 0], [1, 1, 1], [0, 1, 1],
+                [1, 0, 0.4], [0, 0, 0], [0, -1, -1], [1, -1, -0.6],
+            ],
+            "CityObjects": {
+                "MISALIGNED-CONSENSUS-CONFLICT": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        self.assertEqual(result["topology"]["rejectedNodedAdjacencyCount"], 1)
+        rejected = result["topology"]["rejectedNodedAdjacencies"][0]
+        self.assertEqual(
+            rejected["derivation"],
+            "SUPPRESSED_PLANAR_CONSENSUS_DIHEDRAL_CONFLICT",
+        )
+        self.assertAlmostEqual(
+            result["topology"]["suppressedCrossingArtifactFeet"],
+            math.sqrt(1.0**2 + 0.2**2) * 3.280839895,
+            delta=0.02,
+        )
+        self.assertEqual(result["ridges"], [])
+        self.assertEqual(result["hips"], [])
+        self.assertEqual(result["valleys"], [])
+
+    def test_crossing_corner_fragments_are_not_shared_boundaries(self):
+        first_facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=((0.0, 0.0, 0.0), (0.2, 0.0, 0.0), (0.0, 1.0, 1.0)),
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=45.0,
+            azimuth_degrees=180.0,
+            centroid=(0.067, 0.333, 0.333),
+            normal=(0.0, -math.sqrt(0.5), math.sqrt(0.5)),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        second_facet = Facet(
+            **{
+                **first_facet.__dict__,
+                "facet_id": "F2",
+            }
+        )
+        first = EdgeUse(
+            first_facet, 0, 1, (0.0, 0.0, 0.0), (0.2, 0.0, 0.0)
+        )
+        second = EdgeUse(
+            second_facet, 3, 4, (0.2, 0.04, 0.1), (0.0, 0.01, 0.1)
+        )
+
+        self.assertGreater(_edge_direction_variance_degrees(first, second), 5.0)
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        with patch(
+            "app.cityjson_geometry._noded_edge_uses",
+            return_value={(0, 1): [first, second]},
+        ):
+            result = extract_roof_geometry(feature, transform)
+
+        self.assertEqual(result["topology"]["sharedEdgeCount"], 0)
+        self.assertEqual(result["topology"]["exteriorEdgeCount"], 0)
+        self.assertEqual(result["topology"]["rejectedNodedAdjacencyCount"], 1)
+        self.assertEqual(result["topology"]["suppressedCrossingArtifactFeet"], 0.66)
+        self.assertEqual(result["eaves"], [])
+
+    def test_parallel_fragments_misaligned_with_plane_intersection_are_suppressed(self):
+        root_three_over_two = math.sqrt(3) / 2
+        first_facet = Facet(
+            facet_id="F1",
+            vertex_ids=(0, 1, 2),
+            vertices=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, -0.577)),
+            area_square_meters=1.0,
+            horizontal_area_square_meters=1.0,
+            pitch_degrees=30.0,
+            azimuth_degrees=90.0,
+            centroid=(0.333, 0.333, -0.192),
+            normal=(0.5, 0.0, root_three_over_two),
+            opening_count=0,
+            opening_perimeter_meters=0.0,
+            semantic_attributes={},
+        )
+        second_facet = Facet(
+            **{
+                **first_facet.__dict__,
+                "facet_id": "F2",
+                "normal": (-0.5, 0.0, root_three_over_two),
+            }
+        )
+        first = EdgeUse(first_facet, 0, 1, (0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+        second = EdgeUse(second_facet, 2, 3, (1.0, 0.04, 0.02), (0.0, 0.04, 0.02))
+
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        with patch(
+            "app.cityjson_geometry._noded_edge_uses",
+            return_value={(0, 1): [first, second]},
+        ):
+            result = extract_roof_geometry(feature, transform)
+
+        rejected = result["topology"]["rejectedNodedAdjacencies"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(
+            rejected[0]["derivation"],
+            "SUPPRESSED_PLANE_INTERSECTION_MISALIGNMENT",
+        )
+        self.assertGreater(min(rejected[0]["originalBoundaryAlignmentDegrees"]), 80)
+
+    def test_exterior_classification_uses_facet_slope_direction(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "JITTERED-EAVE",
+            "vertices": [[0, 0, 0], [1, 10, 1], [10, 10, 10], [10, 0, 10]],
+            "CityObjects": {
+                "JITTERED-EAVE": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [
+                        {
+                            "type": "MultiSurface",
+                            "lod": "2.2",
+                            "boundaries": [[[0, 1, 2, 3]]],
+                            "semantics": {
+                                "surfaces": [{"type": "RoofSurface", "rf_slope": 45}],
+                                "values": [0],
+                            },
+                        }
+                    ],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        long_eave = max(result["eaves"], key=lambda edge: edge["lengthFeet"])
+        self.assertGreater(
+            long_eave["classificationEvidence"]["edgeDirectionToDownslopeDegrees"],
+            80,
+        )
+        self.assertEqual(
+            long_eave["classificationEvidence"]["classificationRule"],
+            "FACET_SLOPE_DIRECTION",
+        )
+
+    def test_vertically_separated_edges_remain_distinct(self):
+        first_vertices = ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 5.0, 5.0))
+        second_vertices = ((10.0, 0.04, 0.80), (0.0, 0.04, 0.80), (0.0, -5.0, 5.0))
+
+        def facet(facet_id, vertices):
+            return Facet(
+                facet_id=facet_id,
+                vertex_ids=tuple(range(len(vertices))),
+                vertices=vertices,
+                area_square_meters=1.0,
+                horizontal_area_square_meters=1.0,
+                pitch_degrees=30.0,
+                azimuth_degrees=180.0,
+                centroid=tuple(sum(point[i] for point in vertices) / 3 for i in range(3)),
+                normal=(0.0, 0.5, math.sqrt(0.75)),
+                opening_count=0,
+                opening_perimeter_meters=0.0,
+                semantic_attributes={},
+            )
+
+        edge_uses = _noded_edge_uses(
+            [facet("F1", first_vertices), facet("F2", second_vertices)],
+            tolerance_meters=0.10,
+            vertical_tolerance_meters=0.30,
+        )
+
+        self.assertFalse(any(len(uses) == 2 for uses in edge_uses.values()))
 
     def test_shared_edge_uses_local_interior_side_for_concave_facet(self):
         vertices = (
@@ -107,6 +1030,94 @@ class CityJsonGeometryTests(unittest.TestCase):
         for facet in result["facets"]:
             self.assertAlmostEqual(facet["areaSqFt"], facet["slopeAreaFormulaSqFt"], delta=0.02)
             self.assertAlmostEqual(facet["pitchRisePer12"], 12, delta=0.01)
+        vertices = {vertex["vertexId"]: vertex for vertex in result["vertices"]}
+        self.assertEqual(result["topology"]["edgeCount"], len(result["edges"]))
+        self.assertEqual(result["topology"]["vertexCount"], len(vertices))
+        self.assertEqual(len(result["topology"]["topologyHash"]), 64)
+        for edge in result["edges"]:
+            start = vertices[edge["startVertexId"]]
+            end = vertices[edge["endVertexId"]]
+            self.assertEqual(
+                edge["geometryMeters"][0],
+                [start["x"], start["y"], start["z"]],
+            )
+            self.assertEqual(
+                edge["geometryMeters"][-1],
+                [end["x"], end["y"], end["z"]],
+            )
+            expected_length = math.dist(
+                edge["geometryMeters"][0], edge["geometryMeters"][-1]
+            ) * 3.280839895013123
+            self.assertAlmostEqual(edge["lengthFeet"], expected_length, delta=0.01)
+
+    def test_exact_planar_arrangement_is_not_reclustered_with_roofer_tolerance(self):
+        feature, transform = load_cityjson_feature(
+            FIXTURES / "simple_gable.city.jsonl"
+        )
+        building = next(iter(feature["CityObjects"].values()))
+        building.setdefault("attributes", {})["rf_exact_planar_arrangement"] = True
+        with patch(
+            "app.cityjson_geometry._noded_edge_uses", wraps=_noded_edge_uses
+        ) as noded:
+            extract_roof_geometry(feature, transform)
+        self.assertEqual(noded.call_args.args[1], 1e-7)
+
+    def test_facet_ids_and_edges_are_independent_of_roofer_surface_order(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        expected = extract_roof_geometry(feature, transform)
+        reordered = deepcopy(feature)
+        geometry = reordered["CityObjects"]["TEST-GABLE-0"]["geometry"][0]
+        geometry["boundaries"][0].reverse()
+        geometry["semantics"]["values"][0].reverse()
+        for surface in geometry["boundaries"][0]:
+            ring = surface[0]
+            surface[0] = list(reversed(ring[1:] + ring[:1]))
+
+        actual = extract_roof_geometry(reordered, transform)
+
+        self.assertEqual(actual, expected)
+
+    def test_exterior_edges_require_roofprint_boundary_corroboration(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        roofprint = Polygon([(0, 0), (10, 0), (10, 6), (0, 6)])
+
+        result = extract_roof_geometry(
+            feature,
+            transform,
+            roofprint_boundary=roofprint.boundary,
+            exterior_boundary_maximum_distance_meters=0.10,
+        )
+
+        self.assertEqual(result["topology"]["unmatchedInteriorBoundaryCount"], 0)
+        self.assertAlmostEqual(
+            result["eavesFeet"], 20 * 3.280839895013123, delta=0.02
+        )
+        self.assertAlmostEqual(
+            result["rakesFeet"],
+            4 * math.sqrt(18) * 3.280839895013123,
+            delta=0.03,
+        )
+        self.assertTrue(
+            all(
+                edge["classificationEvidence"]["derivation"]
+                == "ROOFPRINT_CORROBORATED_FACET_BOUNDARY"
+                for edge in result["eaves"] + result["rakes"]
+            )
+        )
+        self.assertTrue(
+            all(
+                edge["classificationEvidence"]["classificationRule"]
+                == "HORIZONTAL_LOW_SIDE_BOUNDARY"
+                for edge in result["eaves"]
+            )
+        )
+        self.assertTrue(
+            all(
+                edge["classificationEvidence"]["edgeDirectionSource"]
+                == "LOCAL_ROOFPRINT_TANGENT"
+                for edge in result["rakes"]
+            )
+        )
 
     def test_coincident_ids_and_t_junction_are_noded_before_edge_classification(self):
         feature = {
@@ -256,6 +1267,19 @@ class CityJsonGeometryTests(unittest.TestCase):
             {"noDataFraction": 0.25, "maximumNoDataFraction": 0.10},
         )
 
+    def test_zero_nodata_and_zero_rmse_are_preserved_as_perfect_metrics(self):
+        feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
+        attributes = feature["CityObjects"]["TEST-GABLE"]["attributes"]
+        attributes["rf_nodata_frac"] = 0
+        attributes["rf_rmse_lod22"] = 0
+
+        result = extract_roof_geometry(feature, transform)
+
+        self.assertEqual(result["quality"]["nodataFraction"], 0)
+        self.assertEqual(result["quality"]["rmseMeters"], 0)
+        self.assertEqual(result["quality"]["components"]["coverage"], 1)
+        self.assertEqual(result["quality"]["components"]["rmse"], 1)
+
     def test_roofer_multisurface_semantics_are_measured(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         geometry = feature["CityObjects"]["TEST-GABLE-0"]["geometry"][0]
@@ -368,6 +1392,114 @@ class CityJsonGeometryTests(unittest.TestCase):
             result["rakesFeet"], 2 * math.sqrt(10**2 + 2**2) * 3.280839895013123, delta=0.05
         )
 
+    def test_plan_coincident_separate_roof_levels_are_verified_transitions(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "ROOF-LEVEL-TRANSITION",
+            "vertices": [
+                [0, 0, 3], [10, 0, 3], [10, 5, 5], [0, 5, 5],
+                [0, 5, 10], [10, 5, 10], [10, 10, 12], [0, 10, 12],
+            ],
+            "CityObjects": {
+                "ROOF-LEVEL-TRANSITION": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+        roofprint = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+        result = extract_roof_geometry(
+            feature,
+            None,
+            roofprint_boundary=roofprint.boundary,
+            exterior_boundary_maximum_distance_meters=0.10,
+        )
+
+        self.assertEqual(result["topology"]["unmatchedInteriorBoundaryCount"], 0)
+        self.assertEqual(result["topology"]["verticalLevelTransitionCount"], 1)
+        self.assertAlmostEqual(
+            result["topology"]["verticalLevelTransitionFeet"],
+            10 * 3.280839895013123,
+            delta=0.02,
+        )
+        self.assertAlmostEqual(
+            result["highPerimeterFeet"],
+            20 * 3.280839895013123,
+            delta=0.02,
+        )
+        transition_edges = [
+            edge
+            for edge in result["highPerimeters"]
+            if edge["classificationEvidence"]["derivation"]
+            == "PLAN_COINCIDENT_VERTICAL_LEVEL_TRANSITION"
+        ]
+        self.assertEqual(len(transition_edges), 1)
+        transition = result["topology"]["verticalLevelTransitions"][0]
+        self.assertEqual(
+            transition["derivation"],
+            "PLAN_COINCIDENT_VERTICAL_LEVEL_TRANSITION",
+        )
+        self.assertGreater(transition["minimumVerticalSeparationMeters"], 4.9)
+
+    def test_converging_plan_coincident_edges_are_not_level_transitions(self):
+        feature = {
+            "type": "CityJSONFeature",
+            "id": "AMBIGUOUS-LEVEL-TRANSITION",
+            "vertices": [
+                [0, 0, 3], [10, 0, 3], [10, 5, 5], [0, 5, 5],
+                [0, 5, 5.1], [10, 5, 6], [10, 10, 8], [0, 10, 7.1],
+            ],
+            "CityObjects": {
+                "AMBIGUOUS-LEVEL-TRANSITION": {
+                    "type": "Building",
+                    "attributes": {
+                        "rf_success": True,
+                        "rf_pointcloud_unusable": False,
+                        "rf_extrusion_mode": "standard",
+                        "rf_pt_density": 15,
+                        "rf_nodata_frac": 0.01,
+                        "rf_rmse_lod22": 0.1,
+                    },
+                    "geometry": [{
+                        "type": "MultiSurface",
+                        "lod": "2.2",
+                        "boundaries": [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
+                        "semantics": {
+                            "surfaces": [
+                                {"type": "RoofSurface"},
+                                {"type": "RoofSurface"},
+                            ],
+                            "values": [0, 1],
+                        },
+                    }],
+                }
+            },
+        }
+
+        result = extract_roof_geometry(feature, None)
+
+        self.assertEqual(result["topology"]["verticalLevelTransitionCount"], 0)
+
     def test_missing_transform_is_allowed_for_unquantized_fixture(self):
         feature, transform = load_cityjson_feature(FIXTURES / "simple_gable.city.jsonl")
         self.assertIsNone(transform)
@@ -377,3 +1509,4 @@ class CityJsonGeometryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

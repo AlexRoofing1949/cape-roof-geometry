@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from .cityjson_geometry import extract_roof_geometry, load_cityjson_feature
+from .facet_consolidation import consolidate_roofer_feature
 from .config import Settings
 from .errors import TransientProviderError, UnreliableGeometryError
 from .imagery_validation import validate_current_structure
 from .models import GeometryRequest
-from .plane_validation import validate_roofer_planes
+from .plane_validation import load_normalized_roof_points, validate_roofer_planes
 from .providers import (
     fetch_best_footprint,
     fetch_google_solar_roofprint,
@@ -67,6 +68,29 @@ def _enforce_roofprint_perimeter_consistency(
         ),
         "variancePercent": round(variance_percent, 3),
         "maximumVariancePercent": round(maximum_variance_percent, 3),
+        "topology": {
+            key: (geometry.get("topology") or {}).get(key)
+            for key in (
+                "nodedEdgeCount",
+                "sharedEdgeCount",
+                "exteriorEdgeCount",
+                "rejectedNodedAdjacencyCount",
+                "suppressedCrossingArtifactFeet",
+                "unmatchedInteriorBoundaryCount",
+                "unmatchedInteriorBoundaryFeet",
+            )
+        },
+        "edgeTotalsFeet": {
+            key: round(float(geometry.get(key) or 0), 2)
+            for key in (
+                "rakesFeet",
+                "eavesFeet",
+                "highPerimeterFeet",
+                "ridgesFeet",
+                "hipsFeet",
+                "valleysFeet",
+            )
+        },
     }
     if variance_percent > maximum_variance_percent:
         raise UnreliableGeometryError(
@@ -170,6 +194,14 @@ def _pdal_crop(
                 "out_srs": f"EPSG:{target_epsg}",
             },
             {
+                # EPT nodes are fetched concurrently, so their arrival order is
+                # not a stable reconstruction input.  Canonical XY ordering
+                # makes every downstream neighbourhood/cluster calculation and
+                # Roofer invocation consume the same point sequence.
+                "type": "filters.mortonorder",
+                "reverse": False,
+            },
+            {
                 "type": "filters.expression",
                 "expression": class_expression,
             },
@@ -240,6 +272,11 @@ def _pdal_crop(
         "allowedClasses": list(lidar.allowed_classes),
         "roofClasses": list(lidar.roof_classes),
         "rooferClassNormalization": roofer_class_assignments,
+        "pointOrder": {
+            "provider": "PDAL filters.mortonorder",
+            "method": "XY Morton order",
+            "reverse": False,
+        },
         "noiseFilter": {
             "provider": "PDAL filters.outlier",
             "method": "statistical",
@@ -387,7 +424,7 @@ def _exact_gps_acquisition_date(metadata_path: Path, lidar: LidarResource) -> st
 def _run_roofer(pointcloud: Path, footprint: Path, output: Path, settings: Settings) -> tuple[Path, Path | None]:
     output.mkdir(parents=True, exist_ok=True)
     environment = dict(os.environ)
-    # Roofer's stable image carries a different PROJ database than the pinned
+    # Roofer's pinned image carries a different PROJ database than the pinned
     # conda GDAL/PDAL stack. Scope Roofer's paths to this subprocess so one
     # component cannot load the other component's incompatible data files.
     environment["GDAL_DATA"] = os.getenv("ROOFER_GDAL_DATA", "/opt/roofer/share/gdal")
@@ -400,6 +437,10 @@ def _run_roofer(pointcloud: Path, footprint: Path, output: Path, settings: Setti
             "request_id",
             "--split-cjseq",
             "--lod22",
+            "--plane-detect-k",
+            str(settings.roofer_plane_detect_k),
+            "--plane-detect-min-points",
+            str(settings.roofer_plane_detect_min_points),
             "--plane-detect-epsilon",
             str(settings.roofer_plane_detect_epsilon_meters),
             "--complexity-factor",
@@ -538,17 +579,50 @@ def _confidence_diagnostics(
                 for key in (
                     "sourceId",
                     "captureDate",
+                    "captureDatePrecision",
+                    "captureStart",
+                    "gsdMeters",
                     "validation",
                     "unchanged",
                     "method",
+                    "validationMethod",
+                    "providerFeatureId",
+                    "providerBuildingSource",
+                    "evidenceUpdatedDate",
+                    "footprintIou",
+                    "centroidAlignedFootprintIou",
+                    "centroidShiftMeters",
+                    "areaChangePercent",
+                    "comparisonThresholds",
+                    "imageryQuality",
+                    "imageryAgeYears",
+                    "solarGroundAreaSqFt",
+                    "overtureFootprintAreaSqFt",
+                    "footprintAreaVariancePercent",
+                    "solarRoofAreaSqFt",
+                    "lidarRoofAreaSqFt",
+                    "roofAreaVariancePercent",
+                    "pitchVarianceDegrees",
+                    "solarFacetCount",
+                    "lidarFacetCount",
                     "failureReasons",
                 )
             },
             "warnings": imagery_decision.get("warnings") or [],
+            "alternateEvidence": imagery_decision.get("alternateEvidence") or {},
         },
         "pointCloud": {
             "sourceId": lidar.source_id,
             "tileAcquisitionDate": point_audit.get("tileAcquisitionDate") or "",
+            "acquisitionReferenceDate": (
+                point_audit.get("tileAcquisitionDate")
+                or getattr(lidar, "acquired_end", "")
+            ),
+            "acquisitionDatePrecision": (
+                "EXACT_GPS_DATE"
+                if point_audit.get("tileAcquisitionDate")
+                else "REGISTERED_PROJECT_WINDOW_END"
+            ),
             "pointDensityPpsm": round(point_density, 3),
         },
     }
@@ -573,6 +647,50 @@ def _enforce_lidar_acquisition_floor(
             },
         )
     return acquired
+
+
+def _enforce_shared_boundary_completeness(
+    geometry: dict[str, Any], maximum_unmatched_feet: float
+) -> dict[str, Any]:
+    """Reject a model whose facet seams leaked into exterior measurements."""
+
+    topology = geometry.get("topology") or {}
+    unmatched_count = int(topology.get("unmatchedInteriorBoundaryCount") or 0)
+    unmatched_feet = float(topology.get("unmatchedInteriorBoundaryFeet") or 0)
+    result = {
+        "unmatchedInteriorBoundaryCount": unmatched_count,
+        "unmatchedInteriorBoundaryFeet": round(unmatched_feet, 2),
+        "maximumUnmatchedInteriorBoundaryFeet": round(maximum_unmatched_feet, 2),
+    }
+    for key in (
+        "rawNodedEdgeCount",
+        "eligibleOffsetBoundaryCount",
+        "offsetBoundaryPairCount",
+        "offsetBoundaryCandidateCount",
+        "repairedSharedBoundaryCount",
+        "repairedSharedBoundaryFeet",
+        "suppressedCoplanarBoundaryCount",
+        "suppressedCoplanarBoundaryFeet",
+        "nodingMode",
+        "verticalLevelTransitionCount",
+        "verticalLevelTransitionFeet",
+        "planarConsensusSharedBoundaryCount",
+        "planarConsensusSharedBoundaryFeet",
+        "ambiguousOffsetBoundaryCount",
+        "unpairedInteriorBoundaryCount",
+        "minimumBoundaryOverlapRatio",
+        "offsetBoundaryRejectionCounts",
+    ):
+        if key in topology:
+            result[key] = topology[key]
+    if unmatched_count and unmatched_feet > maximum_unmatched_feet:
+        raise UnreliableGeometryError(
+            "ROOF_TOPOLOGY_SHARED_BOUNDARY_INCOMPLETE",
+            "Reconstructed facet seams could not be distinguished safely from exterior roof edges.",
+            details=result,
+        )
+    geometry["sharedBoundaryCompleteness"] = result
+    return result
 
 
 def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, Any]:
@@ -647,15 +765,52 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     settings,
                 )
                 feature, transform = load_cityjson_feature(feature_path, metadata_path)
+                normalized_roof_points = load_normalized_roof_points(
+                    pointcloud, workspace, settings
+                )
+                facet_consolidation: dict[str, Any] | None = None
+                if settings.facet_consolidation_enabled:
+                    feature, transform, facet_consolidation = consolidate_roofer_feature(
+                        feature,
+                        transform,
+                        normalized_roof_points,
+                        request.solarReference,
+                        settings,
+                        solar_dsm_path=footprint.solar_dsm_path,
+                        projected_crs=f"EPSG:{target_epsg}",
+                        solar_imagery_date=request.solarReference.imageryDate,
+                        lidar_reference_date=(
+                            lidar.tile_acquisition_date or lidar.acquired_end
+                        ),
+                    )
                 geometry = extract_roof_geometry(
                     feature,
                     transform,
                     flat_pitch_degrees=settings.flat_pitch_degrees,
                     edge_node_tolerance_meters=settings.roof_edge_node_tolerance_meters,
+                    edge_node_vertical_tolerance_meters=(
+                        settings.roof_edge_vertical_node_tolerance_meters
+                    ),
+                    plane_intersection_maximum_displacement_meters=(
+                        settings.roof_plane_intersection_maximum_displacement_meters
+                    ),
+                    shared_edge_maximum_direction_variance_degrees=(
+                        settings.roof_shared_edge_maximum_direction_variance_degrees
+                    ),
+                    roofprint_boundary=projected_footprint.boundary,
+                    exterior_boundary_maximum_distance_meters=(
+                        settings.roof_exterior_boundary_maximum_distance_meters
+                    ),
                     minimum_density=settings.minimum_point_density,
                     maximum_nodata_fraction=settings.maximum_nodata_fraction,
                     maximum_rmse_meters=settings.maximum_roofer_rmse_meters,
                     include_validation_facets=True,
+                )
+                if facet_consolidation is not None:
+                    geometry["facetConsolidation"] = facet_consolidation
+                _enforce_shared_boundary_completeness(
+                    geometry,
+                    settings.maximum_unmatched_interior_boundary_feet,
                 )
                 _enforce_roofprint_perimeter_consistency(
                     geometry,
@@ -664,7 +819,11 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 )
                 validation_facets = geometry.pop("_validationFacets")
                 plane_validation = validate_roofer_planes(
-                    pointcloud, validation_facets, workspace, settings
+                    pointcloud,
+                    validation_facets,
+                    workspace,
+                    settings,
+                    points=normalized_roof_points,
                 )
                 geometry["independentPlaneValidation"] = plane_validation
                 reconciliation = _solar_reconciliation(geometry, request, settings)
@@ -750,17 +909,28 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
             "NOAA-PUBLIC-DATASET" if lidar_component == "NOAA/DigitalCoast" else "USGS-PUBLIC-DOMAIN"
         )
 
+        pricing_allowed = bool(imagery_decision["pricingAllowed"])
+        status = imagery_decision["status"]
+        hold_reason = imagery_decision["holdReason"]
+        if not settings.facet_calibration_approved:
+            pricing_allowed = False
+            status = "FACET_CALIBRATION_HOLD"
+            hold_reason = "FACET_CALIBRATION_NOT_APPROVED"
+
         return {
+            "schemaVersion": "1.1",
+            "coordinateReferenceSystem": f"EPSG:{target_epsg}",
             "available": True,
             "verificationStatus": imagery_decision["verificationStatus"],
-            "pricingAllowed": imagery_decision["pricingAllowed"],
-            "status": imagery_decision["status"],
-            "holdReason": imagery_decision["holdReason"],
-            "provider": f"3DBAG Roofer + PDAL + {lidar.provider}",
+            "pricingAllowed": pricing_allowed,
+            "status": status,
+            "holdReason": hold_reason,
+            "provider": f"3DBAG Roofer + Open3D + PDAL + {lidar.provider}",
             "provenance": {
                 "serviceLicense": "GPL-3.0",
                 "sourceCodeUrl": settings.service_source_url,
                 "modelVersion": f"service:{settings.service_commit};roofer:{settings.roofer_commit}",
+                "facetCalibrationDatasetVersion": settings.facet_calibration_dataset_version,
                 "registryIds": [
                     "3DBAG/roofer",
                     "PDAL/PDAL",
@@ -807,6 +977,14 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "acquiredStart": lidar.acquired_start,
                     "acquiredEnd": lidar.acquired_end,
                     "tileAcquisitionDate": lidar.tile_acquisition_date,
+                    "acquisitionReferenceDate": (
+                        lidar.tile_acquisition_date or lidar.acquired_end
+                    ),
+                    "acquisitionDatePrecision": (
+                        "EXACT_GPS_DATE"
+                        if lidar.tile_acquisition_date
+                        else "REGISTERED_PROJECT_WINDOW_END"
+                    ),
                     "acquisitionYear": int((lidar.tile_acquisition_date or lidar.acquired_end)[:4]),
                     "ageYears": lidar.age_years,
                     "coverageRatio": lidar.coverage_ratio,
@@ -832,6 +1010,7 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "license": "BSD-3-Clause",
                 },
                 "planeValidation": geometry["independentPlaneValidation"],
+                "facetConsolidation": geometry.get("facetConsolidation"),
                 "footprintClient": {
                     "provider": "overturemaps-py",
                     "version": settings.overturemaps_version,
@@ -850,11 +1029,26 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                     "minimumCoverageRatio": settings.minimum_lidar_coverage_ratio,
                     "maximumNoDataFraction": settings.maximum_nodata_fraction,
                     "maximumRooferRmseMeters": settings.maximum_roofer_rmse_meters,
+                    "rooferPlaneDetectMinimumPoints": (
+                        settings.roofer_plane_detect_min_points
+                    ),
+                    "rooferPlaneDetectNeighborhoodPoints": (
+                        settings.roofer_plane_detect_k
+                    ),
                     "rooferPlaneDetectEpsilonMeters": (
                         settings.roofer_plane_detect_epsilon_meters
                     ),
                     "rooferComplexityFactor": settings.roofer_complexity_factor,
+                    "maximumUnmatchedInteriorBoundaryFeet": (
+                        settings.maximum_unmatched_interior_boundary_feet
+                    ),
                     "minimumServiceConfidence": settings.minimum_service_confidence,
+                    "facetConsolidationEnabled": settings.facet_consolidation_enabled,
+                    "facetCalibrationApproved": settings.facet_calibration_approved,
+                    "facetCalibrationDatasetVersion": (
+                        settings.facet_calibration_dataset_version
+                    ),
+                    "solarDsmEnabled": settings.solar_dsm_enabled,
                 },
                 "warnings": imagery_decision["warnings"],
             },
@@ -877,3 +1071,4 @@ def runtime_dependencies() -> dict[str, bool]:
     except (ImportError, OSError):
         dependencies["gdalPython"] = False
     return dependencies
+

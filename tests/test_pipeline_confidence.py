@@ -6,6 +6,7 @@ from app.pipeline import (
     _combined_confidence,
     _confidence_diagnostics,
     _enforce_roofprint_perimeter_consistency,
+    _enforce_shared_boundary_completeness,
 )
 
 
@@ -67,11 +68,18 @@ class PipelineConfidenceTests(unittest.TestCase):
                 "currentImagery": {
                     "sourceId": "public-current-imagery",
                     "captureDate": "2026-03-22",
+                    "captureDatePrecision": "PROJECT_WINDOW_END",
+                    "footprintIou": 0.8132,
+                    "centroidShiftMeters": 2.113,
+                    "areaChangePercent": 9.412,
+                    "providerFeatureId": "75249",
                     "validation": "NOT_RUN",
                     "rawImage": "must-not-be-returned",
                 },
             },
-            SimpleNamespace(source_id="usgs-public-lidar"),
+            SimpleNamespace(
+                source_id="usgs-public-lidar", acquired_end="2019-03-31"
+            ),
             {"tileAcquisitionDate": ""},
             12.3456,
         )
@@ -83,6 +91,21 @@ class PipelineConfidenceTests(unittest.TestCase):
             result["geometry"]["independentPlaneValidation"], "PASSED"
         )
         self.assertNotIn("rawImage", result["currentStructure"]["currentImagery"])
+        self.assertEqual(
+            result["currentStructure"]["currentImagery"]["footprintIou"],
+            0.8132,
+        )
+        self.assertEqual(
+            result["currentStructure"]["currentImagery"]["providerFeatureId"],
+            "75249",
+        )
+        self.assertEqual(
+            result["pointCloud"]["acquisitionReferenceDate"], "2019-03-31"
+        )
+        self.assertEqual(
+            result["pointCloud"]["acquisitionDatePrecision"],
+            "REGISTERED_PROJECT_WINDOW_END",
+        )
         self.assertEqual(result["pointCloud"]["pointDensityPpsm"], 12.346)
 
     def test_roofprint_perimeter_reconciliation_passes_without_inference(self):
@@ -95,6 +118,7 @@ class PipelineConfidenceTests(unittest.TestCase):
 
         self.assertAlmostEqual(result["variancePercent"], 0.0, delta=0.001)
         self.assertEqual(geometry["roofprintPerimeterReconciliation"], result)
+        self.assertEqual(result["topology"]["nodedEdgeCount"], None)
 
     def test_roofprint_perimeter_mismatch_fails_closed(self):
         geometry = {"externalProjectedPerimeterFeet": 145.0}
@@ -110,6 +134,54 @@ class PipelineConfidenceTests(unittest.TestCase):
         self.assertEqual(context.exception.details["variancePercent"], 45.0)
         self.assertNotIn("roofprintPerimeterReconciliation", geometry)
 
+    def test_small_unmatched_boundary_is_audited_without_inventing_an_edge(self):
+        geometry = {
+            "topology": {
+                "unmatchedInteriorBoundaryCount": 1,
+                "unmatchedInteriorBoundaryFeet": 3.25,
+            }
+        }
+
+        result = _enforce_shared_boundary_completeness(geometry, 5.0)
+
+        self.assertEqual(result["unmatchedInteriorBoundaryFeet"], 3.25)
+        self.assertEqual(geometry["sharedBoundaryCompleteness"], result)
+
+    def test_material_unmatched_boundaries_fail_closed(self):
+        geometry = {
+            "topology": {
+                "unmatchedInteriorBoundaryCount": 4,
+                "unmatchedInteriorBoundaryFeet": 18.75,
+                "offsetBoundaryCandidateCount": 7,
+                "repairedSharedBoundaryCount": 2,
+                "offsetBoundaryRejectionCounts": {
+                    "BOUNDARY_DIRECTION_MISMATCH": 5
+                },
+            }
+        }
+
+        with self.assertRaises(UnreliableGeometryError) as context:
+            _enforce_shared_boundary_completeness(geometry, 5.0)
+
+        self.assertEqual(
+            context.exception.code,
+            "ROOF_TOPOLOGY_SHARED_BOUNDARY_INCOMPLETE",
+        )
+        self.assertEqual(
+            context.exception.details["unmatchedInteriorBoundaryFeet"], 18.75
+        )
+        self.assertEqual(
+            context.exception.details["offsetBoundaryCandidateCount"], 7
+        )
+        self.assertEqual(
+            context.exception.details["repairedSharedBoundaryCount"], 2
+        )
+        self.assertEqual(
+            context.exception.details["offsetBoundaryRejectionCounts"],
+            {"BOUNDARY_DIRECTION_MISMATCH": 5},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
