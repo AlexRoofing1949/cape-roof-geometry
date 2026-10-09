@@ -23,7 +23,7 @@ jobs:
 
       - name: Confirm Roofer exposes the configured reconstruction flags
         run: |
-          docker run --rm --entrypoint roofer cape-roof-geometry:ci --help > roofer-help.txt
+          docker run --rm --entrypoint roofer cape-roof-geometry:ci --help-all > roofer-help.txt
           grep -q -- '--plane-detect-k' roofer-help.txt
           grep -q -- '--plane-detect-min-points' roofer-help.txt
           grep -q -- '--plane-detect-epsilon' roofer-help.txt
