@@ -44,6 +44,7 @@ jobs:
           echo '12096b4bc2f96d9134aba4b9a5d9268c06c69b873619a742b08c6f22ba2c2e99  '"$archive" | sha256sum --check
           mkdir -p "$RUNNER_TEMP/roofer"
           tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP/roofer"
+          chmod +x "$RUNNER_TEMP/roofer/bin/roofer"
           echo "$RUNNER_TEMP/roofer/bin" >> "$GITHUB_PATH"
           echo "ROOFER_GDAL_DATA=$RUNNER_TEMP/roofer/share/gdal" >> "$GITHUB_ENV"
           echo "ROOFER_PROJ_DATA=$RUNNER_TEMP/roofer/share/proj" >> "$GITHUB_ENV"
