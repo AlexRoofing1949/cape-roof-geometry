@@ -186,7 +186,7 @@ class Settings:
             solar_mask_simplification_tolerance_meters=_float(
                 "SOLAR_MASK_SIMPLIFICATION_TOLERANCE_METERS", 0.15
             ),
-            solar_dsm_enabled=os.getenv("SOLAR_DSM_ENABLED", "true").strip().lower()
+            solar_dsm_enabled=os.getenv("SOLAR_DSM_ENABLED", "false").strip().lower()
             in {"1", "true", "yes"},
             solar_dsm_maximum_bytes=_int("SOLAR_DSM_MAXIMUM_BYTES", 40_000_000),
             solar_dsm_minimum_sample_coverage=_float(
