@@ -30,7 +30,7 @@ jobs:
 
       - name: Confirm Overture client version includes the STAC href fix
         run: |
-          version="$(docker run --rm --entrypoint overturemaps cape-roof-geometry:ci --version)"
+          version="$(docker run --rm --entrypoint /opt/conda/bin/overturemaps cape-roof-geometry:ci --version)"
           test "$version" = "overturemaps, version 1.0.2"
 
       - name: Run the full suite inside the GDAL and PDAL image
