@@ -53,7 +53,7 @@ docker run --rm --env-file .env -p 8080:8080 cape-roof-geometry:1.1.0-beta.1-can
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-The candidate Docker image pins the official `3dgi/roofer:v1.1.0-beta.1` and Micromamba images by immutable registry digest and installs PDAL 2.9.2 plus `overturemaps-py` 1.0.1. Roofer's GDAL/PROJ data paths are isolated to the Roofer subprocess; PDAL and `ogr2ogr` use the pinned conda data files. `/healthz` remains `503 not_ready` if required source provenance or executables are missing. `SOLAR_DSM_ENABLED` defaults to false because it makes an additional provider data-layer request; enable it only when that provider use is authorized. The GitHub Actions workflow builds this pinned container, checks Roofer's configured CLI flags, runs the unit suite inside the image, and checks that the HTTP service starts ready.
+The candidate Docker image pins the official `3dgi/roofer:v1.1.0-beta.1` and Micromamba images by immutable registry digest and installs PDAL 2.9.2 plus `overturemaps-py` 1.0.2. Version 1.0.2 fixes parsing of absolute Overture STAC catalog links used to validate releases. Roofer's GDAL/PROJ data paths are isolated to the Roofer subprocess; PDAL and `ogr2ogr` use the pinned conda data files. `/healthz` remains `503 not_ready` if required source provenance or executables are missing. `SOLAR_DSM_ENABLED` defaults to false because it makes an additional provider data-layer request; enable it only when that provider use is authorized. The GitHub Actions workflow builds this pinned container, checks Roofer's configured CLI flags, runs the unit suite inside the image, and checks that the HTTP service starts ready.
 
 ## Publish and deploy
 

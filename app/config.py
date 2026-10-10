@@ -152,7 +152,7 @@ class Settings:
             ).strip().lower(),
             roofer_version=os.getenv("ROOFER_VERSION", "1.1.0-beta.1").strip(),
             pdal_version=os.getenv("PDAL_VERSION", "2.9.2").strip(),
-            overturemaps_version=os.getenv("OVERTUREMAPS_VERSION", "1.0.1").strip(),
+            overturemaps_version=os.getenv("OVERTUREMAPS_VERSION", "1.0.2").strip(),
             open3d_version=os.getenv("OPEN3D_VERSION", "0.19.0").strip(),
             overture_release=os.getenv("OVERTURE_RELEASE", "2026-08-19.0").strip(),
             microsoft_bfp_enabled=os.getenv("MICROSOFT_BFP_ENABLED", "true").strip().lower()

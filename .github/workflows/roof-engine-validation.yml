@@ -28,6 +28,11 @@ jobs:
           grep -q -- '--plane-detect-min-points' roofer-help.txt
           grep -q -- '--plane-detect-epsilon' roofer-help.txt
 
+      - name: Confirm Overture client version includes the STAC href fix
+        run: |
+          version="$(docker run --rm --entrypoint overturemaps cape-roof-geometry:ci --version)"
+          test "$version" = "overturemaps, version 1.0.2"
+
       - name: Run the full suite inside the GDAL and PDAL image
         run: >-
           docker run --rm
