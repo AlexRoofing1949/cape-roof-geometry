@@ -1,6 +1,8 @@
 import json
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from dataclasses import replace
 from datetime import date, datetime, timezone
@@ -8,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.errors import ConfigurationError
+from app.errors import ConfigurationError, TransientProviderError
 from app.source_registry import load_registries
 
 try:
@@ -24,6 +26,7 @@ try:
     from app.providers import (
         FootprintResult,
         _bing_quadkey,
+        _cached_json_url,
         _simplify_google_solar_mask,
         fetch_best_footprint,
         fetch_google_solar_roofprint,
@@ -100,6 +103,40 @@ sources:
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     def test_microsoft_quadkey_is_stable_for_cape_coral(self):
         self.assertEqual(_bing_quadkey(-81.9495, 26.5629, 9), "032023011")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch("app.providers._download_file")
+    def test_shared_json_cache_is_populated_once_for_concurrent_requests(self, download):
+        calls: list[Path] = []
+
+        def write_payload(_url, destination, **_kwargs):
+            calls.append(destination)
+            time.sleep(0.05)
+            destination.write_text('{"features": []}', encoding="utf-8")
+
+        download.side_effect = write_payload
+        with tempfile.TemporaryDirectory() as directory:
+            configured = SimpleNamespace(
+                work_root=Path(directory),
+                catalog_cache_seconds=3600,
+                catalog_download_timeout_seconds=30,
+                catalog_maximum_bytes=1_000_000,
+            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(
+                        _cached_json_url,
+                        "https://example.invalid/shared.json",
+                        "shared",
+                        configured,
+                    )
+                    for _ in range(2)
+                ]
+                results = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(results, [{"features": []}, {"features": []}])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].name.endswith(".download"))
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.fetch_osm_footprint")
@@ -288,6 +325,29 @@ sources:
         self.assertEqual(audit["toleranceMeters"], 0.25)
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    def test_google_solar_mask_reduces_tolerance_when_area_would_change(self):
+        notched = Polygon(
+            [
+                (0, 0),
+                (10, 0),
+                (10, 10),
+                (8, 10),
+                (8, 9.6),
+                (2, 9.6),
+                (2, 10),
+                (0, 10),
+            ]
+        )
+
+        simplified, audit = _simplify_google_solar_mask(notched, 0.50)
+
+        self.assertAlmostEqual(simplified.area, notched.area, places=6)
+        self.assertEqual(audit["requestedToleranceMeters"], 0.50)
+        self.assertEqual(audit["toleranceMeters"], 0.25)
+        self.assertTrue(audit["fallbackApplied"])
+        self.assertGreater(audit["attempts"][0]["areaChangePercent"], 2.0)
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers.fetch_county_footprint")
     @patch("app.providers.fetch_overture_footprint")
     def test_footprint_consensus_conflict_fails_closed(self, overture, county):
@@ -351,7 +411,10 @@ sources:
         self.assertFalse(result.consensus_records[-1]["independent"])
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
-    @patch("app.providers._require_pinned_overture_release", side_effect=["2026-08-19.0", "2026-08-19.0"])
+    @patch(
+        "app.providers._require_pinned_overture_release",
+        return_value="2026-08-19.0",
+    )
     @patch("app.providers._run")
     def test_overture_download_works_around_absolute_catalog_link_bug(self, run, _release):
         observed = {}
@@ -399,17 +462,29 @@ sources:
                 -81.95855, 26.63265, Path(directory), configured
             )
         self.assertEqual(result.overture_release, "2026-08-19.0")
-        self.assertFalse(any(value.startswith("--release") for value in observed["command"]))
+        self.assertIn("--release=2026-08-19.0", observed["command"])
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
-    @patch("app.providers._current_overture_release", return_value="2026-09-16.0")
-    def test_overture_release_mismatch_fails_closed(self, _release):
+    @patch(
+        "app.providers._overture_release_catalog",
+        return_value=("2026-09-23.1", ("2026-09-23.0", "2026-09-23.1")),
+    )
+    def test_expired_overture_pin_rolls_forward_to_available_latest(self, _catalog):
         from app.providers import _require_pinned_overture_release
 
         configured = SimpleNamespace(overture_release="2026-08-19.0")
-        with self.assertRaises(UnreliableGeometryError) as raised:
-            _require_pinned_overture_release(configured)
-        self.assertEqual(raised.exception.code, "OVERTURE_RELEASE_MISMATCH")
+        self.assertEqual(_require_pinned_overture_release(configured), "2026-09-23.1")
+
+    @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
+    @patch(
+        "app.providers._overture_release_catalog",
+        return_value=("2026-09-23.1", ("2026-08-19.0", "2026-09-23.0", "2026-09-23.1")),
+    )
+    def test_overture_uses_configured_pin_while_release_is_available(self, _catalog):
+        from app.providers import _require_pinned_overture_release
+
+        configured = SimpleNamespace(overture_release="2026-08-19.0")
+        self.assertEqual(_require_pinned_overture_release(configured), "2026-08-19.0")
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.providers._cached_json_url")
@@ -698,6 +773,57 @@ sources:
             )
             self.assertEqual(_classification_histogram(path), {})
 
+    def test_missing_classification_audit_reports_safe_schema_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "filters.stats": {
+                                "statistic": [
+                                    {
+                                        "name": "Classification",
+                                        "count": 120,
+                                        "bins": ["not-a-supported-histogram"],
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(UnreliableGeometryError) as context:
+                _classification_histogram(path)
+
+        self.assertEqual(context.exception.code, "LIDAR_CLASSIFICATION_AUDIT_MISSING")
+        self.assertTrue(context.exception.details["classificationStatisticFound"])
+        self.assertEqual(context.exception.details["classificationPointCount"], 120)
+        self.assertIn("bins", context.exception.details["classificationStatisticKeys"])
+        self.assertNotIn("not-a-supported-histogram", str(context.exception.details))
+
+    @patch("app.providers.subprocess.run")
+    def test_failed_open_command_has_sanitized_diagnostics(self, run):
+        from subprocess import CalledProcessError
+
+        run.side_effect = CalledProcessError(
+            2,
+            ["ogr2ogr", "private-argument"],
+            stderr="HTTP 503 https://private.example/path?token=secret",
+        )
+        from app.providers import _run
+
+        with self.assertRaises(TransientProviderError) as context:
+            _run(["ogr2ogr", "private-argument"], timeout=10)
+
+        self.assertEqual(context.exception.code, "OPEN_DATA_COMMAND_FAILED")
+        self.assertEqual(context.exception.details["command"], "ogr2ogr")
+        self.assertEqual(context.exception.details["failureClass"], "UPSTREAM_UNAVAILABLE")
+        self.assertNotIn("private-argument", str(context.exception.details))
+        self.assertNotIn("secret", str(context.exception))
+        self.assertEqual(len(context.exception.details["diagnosticFingerprintSha256"]), 64)
+
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
     @patch("app.pipeline._run")
     def test_unclassified_roof_returns_are_normalized_after_audit(self, run):
@@ -750,6 +876,15 @@ sources:
             stage_types = [stage["type"] for stage in stages]
             self.assertLess(stage_types.index("filters.stats"), stage_types.index("filters.assign"))
             self.assertLess(stage_types.index("filters.outlier"), stage_types.index("filters.stats"))
+            self.assertEqual(stage_types.count("filters.mortonorder"), 1)
+            self.assertLess(
+                stage_types.index("filters.reprojection"),
+                stage_types.index("filters.mortonorder"),
+            )
+            self.assertLess(
+                stage_types.index("filters.mortonorder"),
+                stage_types.index("filters.outlier"),
+            )
             self.assertLess(stage_types.index("filters.reprojection"), stage_types.index("filters.hag_delaunay"))
             self.assertLess(stage_types.index("filters.hag_delaunay"), stage_types.index("filters.cluster"))
             self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.normal"))
@@ -768,6 +903,14 @@ sources:
             )
             self.assertEqual(audit["classHistogram"], {"1": 120, "2": 80})
             self.assertEqual(audit["noiseFilter"]["outlierClassRemoved"], 7)
+            self.assertEqual(
+                audit["pointOrder"],
+                {
+                    "provider": "PDAL filters.mortonorder",
+                    "method": "XY Morton order",
+                    "reverse": False,
+                },
+            )
             self.assertTrue(audit["classOneCorrection"]["applied"])
             self.assertEqual(audit["classOneCorrection"]["normalKnn"], 12)
             self.assertEqual(audit["classOneCorrection"]["minimumNormalZ"], 0.65)

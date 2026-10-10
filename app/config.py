@@ -59,8 +59,18 @@ class Settings:
     solar_mask_maximum_bytes: int
     solar_mask_maximum_ground_area_variance_percent: float
     solar_mask_simplification_tolerance_meters: float
+    solar_dsm_enabled: bool
+    solar_dsm_maximum_bytes: int
+    solar_dsm_minimum_sample_coverage: float
+    solar_dsm_maximum_centered_rmse_meters: float
+    solar_dsm_maximum_facet_offset_range_meters: float
     roof_edge_node_tolerance_meters: float
+    roof_edge_vertical_node_tolerance_meters: float
+    roof_plane_intersection_maximum_displacement_meters: float
+    roof_shared_edge_maximum_direction_variance_degrees: float
+    roof_exterior_boundary_maximum_distance_meters: float
     maximum_roofprint_perimeter_variance_percent: float
+    maximum_unmatched_interior_boundary_feet: float
     usgs_catalog_url: str
     county_boundaries_url: str
     lidar_registry_path: Path
@@ -87,7 +97,10 @@ class Settings:
     minimum_lidar_acquisition_date: date
     minimum_point_density: float
     maximum_nodata_fraction: float
+    maximum_recoverable_nodata_fraction: float
     maximum_roofer_rmse_meters: float
+    roofer_plane_detect_k: int
+    roofer_plane_detect_min_points: int
     roofer_plane_detect_epsilon_meters: float
     roofer_complexity_factor: float
     flat_pitch_degrees: float
@@ -111,6 +124,22 @@ class Settings:
     open3d_maximum_normal_variance_degrees: float
     open3d_maximum_plane_rmse_meters: float
     open3d_ransac_iterations: int
+    facet_consolidation_enabled: bool
+    facet_consolidation_crop_buffer_meters: float
+    facet_consolidation_normal_radius_meters: float
+    facet_consolidation_neighbor_radius_meters: float
+    facet_consolidation_maximum_normal_angle_degrees: float
+    facet_consolidation_maximum_local_residual_meters: float
+    facet_consolidation_minimum_points: int
+    facet_consolidation_maximum_plane_rmse_meters: float
+    facet_consolidation_merge_angle_degrees: float
+    facet_consolidation_merge_plane_distance_meters: float
+    facet_consolidation_merge_gap_meters: float
+    facet_consolidation_assignment_gap_meters: float
+    facet_consolidation_minimum_support_fraction: float
+    facet_consolidation_maximum_solar_rejected_support_fraction: float
+    facet_calibration_approved: bool
+    facet_calibration_dataset_version: str
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -119,11 +148,11 @@ class Settings:
             service_source_url=os.getenv("SERVICE_SOURCE_URL", "").strip(),
             service_commit=os.getenv("SERVICE_COMMIT", "").strip().lower(),
             roofer_commit=os.getenv(
-                "ROOFER_COMMIT", "bb2a85a99c424001e698dac0e97485a5da31e27e"
+                "ROOFER_COMMIT", "1c06fb1aed9096f4b16f894c2da12bc2d785b71b"
             ).strip().lower(),
-            roofer_version=os.getenv("ROOFER_VERSION", "1.0.0").strip(),
+            roofer_version=os.getenv("ROOFER_VERSION", "1.1.0-beta.1").strip(),
             pdal_version=os.getenv("PDAL_VERSION", "2.9.2").strip(),
-            overturemaps_version=os.getenv("OVERTUREMAPS_VERSION", "1.0.1").strip(),
+            overturemaps_version=os.getenv("OVERTUREMAPS_VERSION", "1.0.2").strip(),
             open3d_version=os.getenv("OPEN3D_VERSION", "0.19.0").strip(),
             overture_release=os.getenv("OVERTURE_RELEASE", "2026-08-19.0").strip(),
             microsoft_bfp_enabled=os.getenv("MICROSOFT_BFP_ENABLED", "true").strip().lower()
@@ -156,13 +185,40 @@ class Settings:
                 "SOLAR_MASK_MAXIMUM_GROUND_AREA_VARIANCE_PERCENT", 8
             ),
             solar_mask_simplification_tolerance_meters=_float(
-                "SOLAR_MASK_SIMPLIFICATION_TOLERANCE_METERS", 0.25
+                "SOLAR_MASK_SIMPLIFICATION_TOLERANCE_METERS", 0.15
+            ),
+            solar_dsm_enabled=os.getenv("SOLAR_DSM_ENABLED", "false").strip().lower()
+            in {"1", "true", "yes"},
+            solar_dsm_maximum_bytes=_int("SOLAR_DSM_MAXIMUM_BYTES", 40_000_000),
+            solar_dsm_minimum_sample_coverage=_float(
+                "SOLAR_DSM_MINIMUM_SAMPLE_COVERAGE", 0.80
+            ),
+            solar_dsm_maximum_centered_rmse_meters=_float(
+                "SOLAR_DSM_MAXIMUM_CENTERED_RMSE_METERS", 0.75
+            ),
+            solar_dsm_maximum_facet_offset_range_meters=_float(
+                "SOLAR_DSM_MAXIMUM_FACET_OFFSET_RANGE_METERS", 1.50
             ),
             roof_edge_node_tolerance_meters=_float(
                 "ROOF_EDGE_NODE_TOLERANCE_METERS", 0.10
             ),
+            roof_edge_vertical_node_tolerance_meters=_float(
+                "ROOF_EDGE_VERTICAL_NODE_TOLERANCE_METERS", 0.30
+            ),
+            roof_plane_intersection_maximum_displacement_meters=_float(
+                "ROOF_PLANE_INTERSECTION_MAXIMUM_DISPLACEMENT_METERS", 0.35
+            ),
+            roof_shared_edge_maximum_direction_variance_degrees=_float(
+                "ROOF_SHARED_EDGE_MAXIMUM_DIRECTION_VARIANCE_DEGREES", 5.0
+            ),
+            roof_exterior_boundary_maximum_distance_meters=_float(
+                "ROOF_EXTERIOR_BOUNDARY_MAXIMUM_DISTANCE_METERS", 0.50
+            ),
             maximum_roofprint_perimeter_variance_percent=_float(
                 "MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT", 10.0
+            ),
+            maximum_unmatched_interior_boundary_feet=_float(
+                "MAXIMUM_UNMATCHED_INTERIOR_BOUNDARY_FEET", 5.0
             ),
             usgs_catalog_url=os.getenv(
                 "USGS_3DEP_CATALOG_URL", "https://usgs.entwine.io/boundaries/resources.geojson"
@@ -207,7 +263,12 @@ class Settings:
             ),
             minimum_point_density=_float("MINIMUM_POINT_DENSITY", 8),
             maximum_nodata_fraction=_float("MAXIMUM_NODATA_FRACTION", 0.10),
+            maximum_recoverable_nodata_fraction=_float(
+                "MAXIMUM_RECOVERABLE_NODATA_FRACTION", 0.15
+            ),
             maximum_roofer_rmse_meters=_float("MAXIMUM_ROOFER_RMSE_METERS", 0.35),
+            roofer_plane_detect_k=_int("ROOFER_PLANE_DETECT_K", 15),
+            roofer_plane_detect_min_points=_int("ROOFER_PLANE_DETECT_MIN_POINTS", 20),
             roofer_plane_detect_epsilon_meters=_float(
                 "ROOFER_PLANE_DETECT_EPSILON_METERS", 0.15
             ),
@@ -239,6 +300,54 @@ class Settings:
             ),
             open3d_maximum_plane_rmse_meters=_float("OPEN3D_MAXIMUM_PLANE_RMSE_METERS", 0.15),
             open3d_ransac_iterations=_int("OPEN3D_RANSAC_ITERATIONS", 1000),
+            facet_consolidation_enabled=os.getenv(
+                "FACET_CONSOLIDATION_ENABLED", "true"
+            ).strip().lower() in {"1", "true", "yes"},
+            facet_consolidation_crop_buffer_meters=_float(
+                "FACET_CONSOLIDATION_CROP_BUFFER_METERS", 0.20
+            ),
+            facet_consolidation_normal_radius_meters=_float(
+                "FACET_CONSOLIDATION_NORMAL_RADIUS_METERS", 0.45
+            ),
+            facet_consolidation_neighbor_radius_meters=_float(
+                "FACET_CONSOLIDATION_NEIGHBOR_RADIUS_METERS", 0.40
+            ),
+            facet_consolidation_maximum_normal_angle_degrees=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_NORMAL_ANGLE_DEGREES", 4.0
+            ),
+            facet_consolidation_maximum_local_residual_meters=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_LOCAL_RESIDUAL_METERS", 0.06
+            ),
+            facet_consolidation_minimum_points=_int(
+                "FACET_CONSOLIDATION_MINIMUM_POINTS", 20
+            ),
+            facet_consolidation_maximum_plane_rmse_meters=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_PLANE_RMSE_METERS", 0.15
+            ),
+            facet_consolidation_merge_angle_degrees=_float(
+                "FACET_CONSOLIDATION_MERGE_ANGLE_DEGREES", 4.0
+            ),
+            facet_consolidation_merge_plane_distance_meters=_float(
+                "FACET_CONSOLIDATION_MERGE_PLANE_DISTANCE_METERS", 0.18
+            ),
+            facet_consolidation_merge_gap_meters=_float(
+                "FACET_CONSOLIDATION_MERGE_GAP_METERS", 2.0
+            ),
+            facet_consolidation_assignment_gap_meters=_float(
+                "FACET_CONSOLIDATION_ASSIGNMENT_GAP_METERS", 1.0
+            ),
+            facet_consolidation_minimum_support_fraction=_float(
+                "FACET_CONSOLIDATION_MINIMUM_SUPPORT_FRACTION", 0.75
+            ),
+            facet_consolidation_maximum_solar_rejected_support_fraction=_float(
+                "FACET_CONSOLIDATION_MAXIMUM_SOLAR_REJECTED_SUPPORT_FRACTION", 0.05
+            ),
+            facet_calibration_approved=os.getenv(
+                "FACET_CALIBRATION_APPROVED", "false"
+            ).strip().lower() in {"1", "true", "yes"},
+            facet_calibration_dataset_version=os.getenv(
+                "FACET_CALIBRATION_DATASET_VERSION", ""
+            ).strip(),
         )
         settings.validate()
         return settings
@@ -285,17 +394,46 @@ class Settings:
             10 <= self.solar_data_layer_radius_meters <= 100
             and 1_000_000 <= self.solar_mask_maximum_bytes <= 50_000_000
             and 1 <= self.solar_mask_maximum_ground_area_variance_percent <= 10
-            and 0.10 <= self.solar_mask_simplification_tolerance_meters <= 0.50
+            and 0.10 <= self.solar_mask_simplification_tolerance_meters <= 0.20
+            and 1_000_000 <= self.solar_dsm_maximum_bytes <= 100_000_000
+            and 0.50 <= self.solar_dsm_minimum_sample_coverage <= 1.0
+            and 0.10 <= self.solar_dsm_maximum_centered_rmse_meters <= 1.0
+            and 0.25 <= self.solar_dsm_maximum_facet_offset_range_meters <= 3.0
             and 0.02 <= self.roof_edge_node_tolerance_meters <= 0.15
+            and 0.10 <= self.roof_edge_vertical_node_tolerance_meters <= 0.40
+            and 0.10
+            <= self.roof_plane_intersection_maximum_displacement_meters
+            <= 0.50
+            and 1.0
+            <= self.roof_shared_edge_maximum_direction_variance_degrees
+            <= 10.0
+            and 0.10
+            <= self.roof_exterior_boundary_maximum_distance_meters
+            <= 1.0
         ):
             raise ConfigurationError(
                 "SOLAR_ROOFPRINT_CONFIG_INVALID",
                 "Google Solar roof-mask limits are outside the supported fail-closed range.",
             )
+        if not (
+            0.01 <= self.maximum_nodata_fraction <= 0.15
+            and self.maximum_nodata_fraction
+            <= self.maximum_recoverable_nodata_fraction
+            <= 0.20
+        ):
+            raise ConfigurationError(
+                "LIDAR_NODATA_THRESHOLD_INVALID",
+                "The strict LiDAR no-data threshold must be at most 0.15 and no greater than the recoverable threshold, which may not exceed 0.20.",
+            )
         if not 2 <= self.maximum_roofprint_perimeter_variance_percent <= 15:
             raise ConfigurationError(
                 "ROOFPRINT_PERIMETER_THRESHOLD_INVALID",
                 "MAXIMUM_ROOFPRINT_PERIMETER_VARIANCE_PERCENT must be between 2 and 15.",
+            )
+        if not 0 <= self.maximum_unmatched_interior_boundary_feet <= 10:
+            raise ConfigurationError(
+                "ROOF_TOPOLOGY_COMPLETENESS_THRESHOLD_INVALID",
+                "MAXIMUM_UNMATCHED_INTERIOR_BOUNDARY_FEET must be between 0 and 10.",
             )
         if self.microsoft_bfp_zoom != 9 or self.microsoft_bfp_maximum_tile_bytes < 25_000_000:
             raise ConfigurationError(
@@ -354,6 +492,16 @@ class Settings:
                 "ROOFER_PLANE_EPSILON_INVALID",
                 "ROOFER_PLANE_DETECT_EPSILON_METERS must be between 0.05 and 0.30.",
             )
+        if not 10 <= self.roofer_plane_detect_min_points <= 100:
+            raise ConfigurationError(
+                "ROOFER_PLANE_SUPPORT_INVALID",
+                "ROOFER_PLANE_DETECT_MIN_POINTS must be between 10 and 100.",
+            )
+        if not 5 <= self.roofer_plane_detect_k <= 100:
+            raise ConfigurationError(
+                "ROOFER_PLANE_NEIGHBORHOOD_INVALID",
+                "ROOFER_PLANE_DETECT_K must be between 5 and 100.",
+            )
         if not 0.50 <= self.roofer_complexity_factor <= 1.0:
             raise ConfigurationError(
                 "ROOFER_COMPLEXITY_FACTOR_INVALID",
@@ -403,5 +551,33 @@ class Settings:
             raise ConfigurationError(
                 "OPEN3D_GEOMETRY_THRESHOLD_INVALID",
                 "Open3D geometry thresholds are outside the supported fail-closed range.",
+            )
+        if not (
+            0 <= self.facet_consolidation_crop_buffer_meters <= 0.50
+            and 0.20 <= self.facet_consolidation_normal_radius_meters <= 1.0
+            and 0.20 <= self.facet_consolidation_neighbor_radius_meters <= 1.0
+            and 1.0 <= self.facet_consolidation_maximum_normal_angle_degrees <= 10.0
+            and 0.02 <= self.facet_consolidation_maximum_local_residual_meters <= 0.20
+            and 10 <= self.facet_consolidation_minimum_points <= 200
+            and 0.02 <= self.facet_consolidation_maximum_plane_rmse_meters <= 0.30
+            and 1.0 <= self.facet_consolidation_merge_angle_degrees <= 10.0
+            and 0.02 <= self.facet_consolidation_merge_plane_distance_meters <= 0.30
+            and 0.20 <= self.facet_consolidation_merge_gap_meters <= 3.0
+            and 0.20 <= self.facet_consolidation_assignment_gap_meters <= 2.0
+            and 0.50 <= self.facet_consolidation_minimum_support_fraction <= 1.0
+            and 0.0
+            <= self.facet_consolidation_maximum_solar_rejected_support_fraction
+            <= 0.10
+        ):
+            raise ConfigurationError(
+                "FACET_CONSOLIDATION_CONFIG_INVALID",
+                "Facet-consolidation thresholds are outside the supported fail-closed range.",
+            )
+        if self.facet_calibration_approved and not re.fullmatch(
+            r"CCR-EV-[0-9a-f]{16}", self.facet_calibration_dataset_version
+        ):
+            raise ConfigurationError(
+                "FACET_CALIBRATION_VERSION_INVALID",
+                "An approved facet calibration requires its immutable private dataset version.",
             )
         self.work_root.mkdir(parents=True, exist_ok=True)

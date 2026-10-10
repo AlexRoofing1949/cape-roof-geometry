@@ -9,7 +9,7 @@ dependencies:
   - pip:
       - fastapi==0.141.1
       - uvicorn==0.52.4
-      - overturemaps==1.0.1
+      - overturemaps==1.0.2
       - ijson==3.5.1
       - shapely==2.1.2
       - pyproj==3.7.2

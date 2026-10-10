@@ -1,0 +1,65 @@
+name: Roof engine validation
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build the pinned runtime image
+        run: docker build --pull --tag cape-roof-geometry:ci .
+
+      - name: Confirm Roofer exposes the configured reconstruction flags
+        run: |
+          docker run --rm --entrypoint roofer cape-roof-geometry:ci --help-all > roofer-help.txt
+          grep -q -- '--plane-detect-k' roofer-help.txt
+          grep -q -- '--plane-detect-min-points' roofer-help.txt
+          grep -q -- '--plane-detect-epsilon' roofer-help.txt
+
+      - name: Confirm Overture client version includes the STAC href fix
+        run: |
+          version="$(docker run --rm --entrypoint /opt/conda/bin/overturemaps cape-roof-geometry:ci --version)"
+          test "$version" = "overturemaps, version 1.0.2"
+
+      - name: Run the full suite inside the GDAL and PDAL image
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/workspace:ro"
+          --workdir /workspace
+          --entrypoint /opt/conda/bin/python
+          cape-roof-geometry:ci
+          -m unittest discover -s tests -v
+
+      - name: Start service and verify readiness
+        env:
+          SERVICE_COMMIT: ${{ github.sha }}
+        run: |
+          docker run --detach --name cape-roof-geometry-smoke \
+            --publish 8080:8080 \
+            --env AUTH_BEARER_TOKEN=ci-only-roof-engine-token-00000000000000000000000000000000 \
+            --env SERVICE_SOURCE_URL=https://github.com/AlexRoofing1949/cape-roof-geometry \
+            --env SERVICE_COMMIT="$SERVICE_COMMIT" \
+            cape-roof-geometry:ci
+          trap 'docker rm --force cape-roof-geometry-smoke >/dev/null' EXIT
+          ready=false
+          for attempt in $(seq 1 30); do
+            if curl --silent --show-error --fail http://127.0.0.1:8080/healthz --output healthz.json; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          python -c 'import json; data=json.load(open("healthz.json", encoding="utf-8")); assert data["status"] == "ready", data; assert data["configured"] is True, data; assert all(data["dependencies"].values()), data'

@@ -27,12 +27,59 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 
 from .config import Settings
-from .errors import NoCoverageError, TransientProviderError, UnreliableGeometryError
+from .errors import (
+    NoCoverageError,
+    TransientProviderError,
+    UnreliableGeometryError,
+    command_failure_details,
+)
 from .source_registry import LidarSource, RegistryBundle, SERVICE_COUNTIES
 
 
-_CATALOG_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
 _OVERTURE_STAC_CATALOG_URL = "https://stac.overturemaps.org/catalog.json"
+
+
+def _cache_is_fresh(path: Path, maximum_age_seconds: int | None = None) -> bool:
+    """Return whether an atomic provider cache entry can be reused."""
+
+    try:
+        if not path.is_file():
+            return False
+        return maximum_age_seconds is None or time.time() - path.stat().st_mtime <= maximum_age_seconds
+    except OSError:
+        return False
+
+
+def _unique_cache_temporary(path: Path) -> Path:
+    """Use one staging name per writer so concurrent requests cannot delete each other's file."""
+
+    return path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.download"
+    )
+
+
+def _populate_download_cache(
+    path: Path,
+    url: str,
+    *,
+    timeout: int,
+    maximum_bytes: int,
+    maximum_age_seconds: int | None = None,
+) -> None:
+    """Download a shared cache entry once and publish it with an atomic rename."""
+
+    if _cache_is_fresh(path, maximum_age_seconds):
+        return
+    with _CACHE_LOCK:
+        if _cache_is_fresh(path, maximum_age_seconds):
+            return
+        temporary = _unique_cache_temporary(path)
+        try:
+            _download_file(url, temporary, timeout=timeout, maximum_bytes=maximum_bytes)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -48,6 +95,7 @@ class FootprintResult:
     consensus_status: str = "SINGLE_SOURCE"
     consensus_records: tuple[dict[str, Any], ...] = ()
     lineage_group: str = "OPEN_MAP_FAMILY"
+    solar_dsm_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -93,15 +141,31 @@ def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str
     try:
         return subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as error:
-        raise TransientProviderError("OPEN_DATA_COMMAND_TIMEOUT", "An open-data provider command timed out.") from error
-    except subprocess.CalledProcessError as error:
-        safe_tail = (error.stderr or error.stdout or "")[-500:].replace("\n", " ")
         raise TransientProviderError(
-            "OPEN_DATA_COMMAND_FAILED", f"An open-data provider command failed: {safe_tail}"
+            "OPEN_DATA_COMMAND_TIMEOUT",
+            "An open-data provider command timed out.",
+            details={
+                "command": Path(command[0]).name if command else "unknown",
+                "timeoutSeconds": timeout,
+                "failureClass": "COMMAND_TIMEOUT",
+            },
+        ) from error
+    except subprocess.CalledProcessError as error:
+        raise TransientProviderError(
+            "OPEN_DATA_COMMAND_FAILED",
+            "An open-data provider command failed; see sanitized command diagnostics.",
+            details=command_failure_details(
+                command, error.returncode, error.stderr or error.stdout
+            ),
         ) from error
     except OSError as error:
         raise TransientProviderError(
-            "OPEN_DATA_COMMAND_UNAVAILABLE", "An open-data provider command is unavailable."
+            "OPEN_DATA_COMMAND_UNAVAILABLE",
+            "An open-data provider command is unavailable.",
+            details={
+                "command": Path(command[0]).name if command else "unknown",
+                "launchErrorType": type(error).__name__,
+            },
         ) from error
 
 
@@ -218,7 +282,7 @@ def _footprint_iou(first: BaseGeometry, second: BaseGeometry) -> float:
     return _footprint_comparison(first, second)["intersectionOverUnion"]
 
 
-def _current_overture_release(settings: Settings) -> str:
+def _overture_release_catalog(settings: Settings) -> tuple[str, tuple[str, ...]]:
     request = urllib.request.Request(
         _OVERTURE_STAC_CATALOG_URL, headers={"User-Agent": "CapeRoofGeometry/1.0"}
     )
@@ -230,22 +294,44 @@ def _current_overture_release(settings: Settings) -> str:
             "OVERTURE_CATALOG_UNAVAILABLE", "The Overture release catalog is temporarily unavailable."
         ) from error
     latest = str(payload.get("latest") or "").strip() if isinstance(payload, dict) else ""
-    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", latest):
+    links = payload.get("links") if isinstance(payload, dict) else None
+    if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", latest) or not isinstance(links, list):
         raise TransientProviderError(
-            "OVERTURE_CATALOG_INVALID", "The Overture release catalog did not identify a valid latest release."
+            "OVERTURE_CATALOG_INVALID", "The Overture release catalog did not identify valid releases."
         )
-    return latest
+    releases: set[str] = set()
+    for link in links:
+        if not isinstance(link, dict) or link.get("rel") != "child":
+            continue
+        href = str(link.get("href") or "").strip()
+        release = urllib.parse.urlparse(href).path.rstrip("/").split("/")[-1]
+        if release == "catalog.json":
+            path_parts = [part for part in urllib.parse.urlparse(href).path.split("/") if part]
+            release = path_parts[-2] if len(path_parts) >= 2 else ""
+        if re.fullmatch(r"20\d{2}-\d{2}-\d{2}\.\d+", release):
+            releases.add(release)
+    if latest not in releases:
+        raise TransientProviderError(
+            "OVERTURE_CATALOG_INVALID", "The Overture release catalog latest release is absent from its release links."
+        )
+    return latest, tuple(sorted(releases))
+
+
+def _current_overture_release(settings: Settings) -> str:
+    return _overture_release_catalog(settings)[0]
 
 
 def _require_pinned_overture_release(settings: Settings) -> str:
-    latest = _current_overture_release(settings)
-    if latest != settings.overture_release:
-        raise UnreliableGeometryError(
-            "OVERTURE_RELEASE_MISMATCH",
-            "The configured Overture release is not the current published release.",
-            details={"configuredRelease": settings.overture_release, "currentRelease": latest},
-        )
-    return latest
+    """Keep a configured release while it is published, then roll forward safely.
+
+    Overture retains only a small number of monthly releases.  A stale
+    deployment pin must therefore not take every footprint lookup offline.
+    The selected release is always passed explicitly to the downloader so a
+    catalog update during the request cannot silently change the input data.
+    """
+
+    latest, available = _overture_release_catalog(settings)
+    return settings.overture_release if settings.overture_release in available else latest
 
 
 def fetch_overture_footprint(
@@ -264,16 +350,12 @@ def fetch_overture_footprint(
             "-f",
             "geojson",
             "--type=building",
+            f"--release={release}",
             "--output",
             str(output_path),
         ],
         timeout=settings.provider_timeout_seconds,
     )
-    if _require_pinned_overture_release(settings) != release:
-        raise UnreliableGeometryError(
-            "OVERTURE_RELEASE_CHANGED_DURING_DOWNLOAD",
-            "The Overture release changed while the building footprint was being downloaded.",
-        )
     try:
         payload = json.loads(output_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -314,19 +396,13 @@ def _bing_quadkey(longitude: float, latitude: float, zoom: int) -> str:
 
 def _microsoft_catalog_row(longitude: float, latitude: float, settings: Settings) -> dict[str, str]:
     catalog = settings.work_root / f"microsoft-bfp-{settings.microsoft_bfp_release}-catalog.csv"
-    if not catalog.exists() or time.time() - catalog.stat().st_mtime > settings.catalog_cache_seconds:
-        temporary = catalog.with_suffix(".download")
-        temporary.unlink(missing_ok=True)
-        try:
-            _download_file(
-                settings.microsoft_bfp_catalog_url,
-                temporary,
-                timeout=settings.catalog_download_timeout_seconds,
-                maximum_bytes=min(settings.catalog_maximum_bytes, 25_000_000),
-            )
-            os.replace(temporary, catalog)
-        finally:
-            temporary.unlink(missing_ok=True)
+    _populate_download_cache(
+        catalog,
+        settings.microsoft_bfp_catalog_url,
+        timeout=settings.catalog_download_timeout_seconds,
+        maximum_bytes=min(settings.catalog_maximum_bytes, 25_000_000),
+        maximum_age_seconds=settings.catalog_cache_seconds,
+    )
     quadkey = _bing_quadkey(longitude, latitude, settings.microsoft_bfp_zoom)
     try:
         with catalog.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -366,19 +442,12 @@ def fetch_microsoft_footprint(
         )
     quadkey = row.get("quadkey") or _bing_quadkey(longitude, latitude, settings.microsoft_bfp_zoom)
     tile = settings.work_root / f"microsoft-bfp-{settings.microsoft_bfp_release}-{quadkey}.csv.gz"
-    if not tile.exists():
-        temporary = tile.with_suffix(".download")
-        temporary.unlink(missing_ok=True)
-        try:
-            _download_file(
-                url,
-                temporary,
-                timeout=settings.catalog_download_timeout_seconds,
-                maximum_bytes=settings.microsoft_bfp_maximum_tile_bytes,
-            )
-            os.replace(temporary, tile)
-        finally:
-            temporary.unlink(missing_ok=True)
+    _populate_download_cache(
+        tile,
+        url,
+        timeout=settings.catalog_download_timeout_seconds,
+        maximum_bytes=settings.microsoft_bfp_maximum_tile_bytes,
+    )
 
     west, south, east, north = _bbox(longitude, latitude, settings.footprint_search_radius_meters)
     search = box(west, south, east, north)
@@ -515,11 +584,13 @@ def fetch_osm_footprint(
             raise TransientProviderError(
                 "OSM_OVERPASS_UNAVAILABLE", "The OpenStreetMap footprint service is unavailable."
             ) from error
-        temporary = cache.with_suffix(".download")
+        temporary = _unique_cache_temporary(cache)
         try:
             temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
             os.replace(temporary, cache)
         except OSError:
+            temporary.unlink(missing_ok=True)
+        finally:
             temporary.unlink(missing_ok=True)
     features: list[dict[str, Any]] = []
     for element in payload.get("elements") or []:
@@ -594,6 +665,7 @@ def fetch_best_footprint(
                     "provider": provider_name,
                     "decision": "UNAVAILABLE",
                     "errorCode": error.code,
+                    **({"errorDetails": error.details} if error.details else {}),
                 }
             )
     if primary is None:
@@ -620,6 +692,7 @@ def fetch_best_footprint(
                     "provider": provider_name,
                     "decision": "CORROBORATION_UNAVAILABLE",
                     "errorCode": error.code,
+                    **({"errorDetails": error.details} if error.details else {}),
                 }
             )
             continue
@@ -750,43 +823,60 @@ def _polygonize_google_solar_mask(mask_path: Path) -> list[BaseGeometry]:
 
 def _simplify_google_solar_mask(
     projected: BaseGeometry, tolerance_meters: float
-) -> tuple[BaseGeometry, dict[str, float | int]]:
-    """Remove raster stair steps without materially changing rooftop area."""
+) -> tuple[BaseGeometry, dict[str, Any]]:
+    """Remove raster stair steps at the highest area-safe tolerance."""
 
     raw_area = float(projected.area)
     raw_perimeter = float(projected.length)
     raw_vertices = len(getattr(projected.exterior, "coords", []))
-    simplified = projected.simplify(tolerance_meters, preserve_topology=True)
-    if (
-        simplified.is_empty
-        or not simplified.is_valid
-        or simplified.geom_type != "Polygon"
-        or simplified.area <= 0
-    ):
-        raise UnreliableGeometryError(
-            "SOLAR_ROOF_MASK_SIMPLIFICATION_INVALID",
-            "The Google Solar rooftop mask could not be safely simplified.",
+    tolerances: list[float] = []
+    for candidate in (tolerance_meters, max(0.10, tolerance_meters / 2), 0.10):
+        rounded = round(candidate, 3)
+        if rounded not in tolerances:
+            tolerances.append(rounded)
+    attempts: list[dict[str, Any]] = []
+    for candidate in tolerances:
+        simplified = projected.simplify(candidate, preserve_topology=True)
+        valid = (
+            not simplified.is_empty
+            and simplified.is_valid
+            and simplified.geom_type == "Polygon"
+            and simplified.area > 0
         )
-    area_change_percent = abs(float(simplified.area) - raw_area) / max(raw_area, 0.01) * 100
-    if area_change_percent > 2.0:
-        raise UnreliableGeometryError(
-            "SOLAR_ROOF_MASK_SIMPLIFICATION_CONFLICT",
-            "Rooftop-mask simplification changed the measured area beyond the safety limit.",
-            details={
-                "areaChangePercent": round(area_change_percent, 3),
-                "maximumAreaChangePercent": 2.0,
-            },
+        area_change_percent = (
+            abs(float(simplified.area) - raw_area) / max(raw_area, 0.01) * 100
+            if valid
+            else float("inf")
         )
-    return simplified, {
-        "toleranceMeters": round(tolerance_meters, 3),
-        "rawVertexCount": raw_vertices,
-        "simplifiedVertexCount": len(simplified.exterior.coords),
-        "areaChangePercent": round(area_change_percent, 3),
-        "perimeterChangePercent": round(
-            abs(float(simplified.length) - raw_perimeter) / max(raw_perimeter, 0.01) * 100,
-            3,
-        ),
-    }
+        attempts.append(
+            {
+                "toleranceMeters": candidate,
+                "valid": valid,
+                "areaChangePercent": (
+                    round(area_change_percent, 3) if math.isfinite(area_change_percent) else None
+                ),
+            }
+        )
+        if not valid or area_change_percent > 2.0:
+            continue
+        return simplified, {
+            "requestedToleranceMeters": round(tolerance_meters, 3),
+            "toleranceMeters": candidate,
+            "fallbackApplied": candidate != round(tolerance_meters, 3),
+            "rawVertexCount": raw_vertices,
+            "simplifiedVertexCount": len(simplified.exterior.coords),
+            "areaChangePercent": round(area_change_percent, 3),
+            "perimeterChangePercent": round(
+                abs(float(simplified.length) - raw_perimeter) / max(raw_perimeter, 0.01) * 100,
+                3,
+            ),
+            "attempts": attempts,
+        }
+    raise UnreliableGeometryError(
+        "SOLAR_ROOF_MASK_SIMPLIFICATION_CONFLICT",
+        "Rooftop-mask simplification changed the measured area beyond the safety limit at every supported tolerance.",
+        details={"maximumAreaChangePercent": 2.0, "attempts": attempts},
+    )
 
 
 def fetch_google_solar_roofprint(
@@ -866,6 +956,77 @@ def fetch_google_solar_roofprint(
         timeout=settings.provider_timeout_seconds,
         maximum_bytes=settings.solar_mask_maximum_bytes,
     )
+    dsm_path: Path | None = None
+    if getattr(settings, "solar_dsm_enabled", False):
+        dsm_query = urllib.parse.urlencode(
+            {
+                "location.latitude": latitude,
+                "location.longitude": longitude,
+                "radiusMeters": settings.solar_data_layer_radius_meters,
+                "view": "DSM_LAYER",
+                "requiredQuality": "HIGH",
+                "exactQualityRequired": "true",
+                "pixelSizeMeters": 0.1,
+                "key": settings.solar_api_key,
+            }
+        )
+        dsm_request = urllib.request.Request(
+            f"https://solar.googleapis.com/v1/dataLayers:get?{dsm_query}",
+            headers={"User-Agent": "CapeRoofGeometry/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(
+                dsm_request, timeout=settings.provider_timeout_seconds
+            ) as response:
+                dsm_payload = json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code >= 500 or error.code in {408, 429}:
+                raise TransientProviderError(
+                    "SOLAR_DSM_HTTP_ERROR",
+                    "Google Solar DSM evidence is temporarily unavailable.",
+                ) from error
+            raise NoCoverageError(
+                "SOLAR_DSM_NOT_FOUND",
+                "Google Solar has no authorized high-quality DSM for this property.",
+            ) from error
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            raise TransientProviderError(
+                "SOLAR_DSM_UNAVAILABLE",
+                "Google Solar DSM evidence is temporarily unavailable.",
+            ) from error
+        if not isinstance(dsm_payload, dict):
+            dsm_payload = {}
+        dsm_imagery = dsm_payload.get("imageryDate")
+        try:
+            dsm_imagery_date = (
+                f"{int(dsm_imagery['year']):04d}-{int(dsm_imagery['month']):02d}-"
+                f"{int(dsm_imagery['day']):02d}"
+            )
+        except (KeyError, TypeError, ValueError):
+            dsm_imagery_date = ""
+        dsm_url = str(dsm_payload.get("dsmUrl") or "").strip()
+        if (
+            str(dsm_payload.get("imageryQuality") or "").upper() != "HIGH"
+            or dsm_imagery_date != imagery_date
+            or not dsm_url.startswith("https://solar.googleapis.com/")
+        ):
+            raise UnreliableGeometryError(
+                "SOLAR_DSM_EVIDENCE_INVALID",
+                "Google Solar DSM evidence is missing, undated, or inconsistent with the roof mask.",
+                details={
+                    "maskImageryDate": imagery_date,
+                    "dsmImageryDate": dsm_imagery_date,
+                    "dsmImageryQuality": str(dsm_payload.get("imageryQuality") or "").upper(),
+                },
+            )
+        dsm_path = workspace / "google-solar-dsm.tif"
+        separator = "&" if "?" in dsm_url else "?"
+        _download_file(
+            f"{dsm_url}{separator}{urllib.parse.urlencode({'key': settings.solar_api_key})}",
+            dsm_path,
+            timeout=settings.provider_timeout_seconds,
+            maximum_bytes=settings.solar_dsm_maximum_bytes,
+        )
     polygons = _polygonize_google_solar_mask(mask_path)
     features = [
         {
@@ -971,12 +1132,14 @@ def fetch_google_solar_roofprint(
                 "imageryDate": imagery_date,
                 "imageryQuality": imagery_quality,
                 "pixelSizeMeters": 0.1,
+                "dsmReconciliationRequired": bool(dsm_path),
                 "maskSimplification": simplification_audit,
             }
         ],
         consensus_status="ROOF_MASK_CORROBORATED",
         consensus_records=tuple(audit),
         lineage_group="GOOGLE_SOLAR_ROOF_MASK",
+        solar_dsm_path=dsm_path,
     )
 
 
@@ -1067,23 +1230,13 @@ def _download_file(url: str, destination: Path, *, timeout: int, maximum_bytes: 
 
 def _catalog_path(settings: Settings) -> Path:
     cache = settings.work_root / "usgs-3dep-resources.geojson"
-    if cache.exists() and time.time() - cache.stat().st_mtime <= settings.catalog_cache_seconds:
-        return cache
-    with _CATALOG_LOCK:
-        if cache.exists() and time.time() - cache.stat().st_mtime <= settings.catalog_cache_seconds:
-            return cache
-        temporary = cache.with_suffix(".download")
-        temporary.unlink(missing_ok=True)
-        try:
-            _download_file(
-                settings.usgs_catalog_url,
-                temporary,
-                timeout=settings.catalog_download_timeout_seconds,
-                maximum_bytes=settings.catalog_maximum_bytes,
-            )
-            os.replace(temporary, cache)
-        finally:
-            temporary.unlink(missing_ok=True)
+    _populate_download_cache(
+        cache,
+        settings.usgs_catalog_url,
+        timeout=settings.catalog_download_timeout_seconds,
+        maximum_bytes=settings.catalog_maximum_bytes,
+        maximum_age_seconds=settings.catalog_cache_seconds,
+    )
     return cache
 
 
@@ -1115,19 +1268,13 @@ def _coverage_ratio(coverage_wgs84: BaseGeometry, target_wgs84: BaseGeometry) ->
 def _cached_json_url(url: str, prefix: str, settings: Settings) -> dict[str, Any]:
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
     cache = settings.work_root / f"{prefix}-{digest}.json"
-    if not cache.exists() or time.time() - cache.stat().st_mtime > settings.catalog_cache_seconds:
-        temporary = cache.with_suffix(".download")
-        temporary.unlink(missing_ok=True)
-        try:
-            _download_file(
-                url,
-                temporary,
-                timeout=settings.catalog_download_timeout_seconds,
-                maximum_bytes=min(settings.catalog_maximum_bytes, 25_000_000),
-            )
-            os.replace(temporary, cache)
-        finally:
-            temporary.unlink(missing_ok=True)
+    _populate_download_cache(
+        cache,
+        url,
+        timeout=settings.catalog_download_timeout_seconds,
+        maximum_bytes=min(settings.catalog_maximum_bytes, 25_000_000),
+        maximum_age_seconds=settings.catalog_cache_seconds,
+    )
     try:
         payload = json.loads(cache.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:

@@ -21,6 +21,13 @@ from typing import Any, Iterable
 
 REPORT_ID_RE = re.compile(r"^(\d{6,12})")
 NUMBER = r"([0-9][0-9,]*(?:\.[0-9]+)?)"
+EDGE_FIELDS = {
+    "ridges": ("ridges_ft", "ridgesFeet"),
+    "hips": ("hips_ft", "hipsFeet"),
+    "valleys": ("valleys_ft", "valleysFeet"),
+    "rakes": ("rakes_ft", "rakesFeet"),
+    "eaves": ("eaves_ft", "eavesFeet"),
+}
 
 
 @dataclass(frozen=True)
@@ -253,7 +260,165 @@ def _percent_error(actual: float, expected: float) -> float:
     return abs(actual - expected) / expected * 100.0
 
 
-def build_manifest(directory: Path, max_area_error_percent: float, max_pitch_error_degrees: float) -> dict[str, Any]:
+def _candidate_geometry(payload: dict[str, Any]) -> dict[str, Any]:
+    geometry = payload.get("geometry")
+    if isinstance(geometry, dict):
+        return geometry
+    if isinstance(payload.get("metrics"), dict):
+        return payload["metrics"]
+    return payload
+
+
+def _candidate_topology_hash(payload: dict[str, Any], geometry: dict[str, Any]) -> str:
+    for value in (
+        (geometry.get("topology") or {}).get("topologyHash"),
+        geometry.get("topologyHash"),
+        (payload.get("topology") or {}).get("topologyHash"),
+        payload.get("topologyHash"),
+    ):
+        text = str(value or "")
+        if re.fullmatch(r"[0-9a-f]{64}", text):
+            return text
+    return ""
+
+
+def _candidate_formula_error_percent(geometry: dict[str, Any]) -> float | None:
+    facets = geometry.get("facets")
+    if not isinstance(facets, list) or not facets:
+        return None
+    errors = []
+    for facet in facets:
+        reported_error = facet.get("slopeAreaFormulaErrorPercent")
+        if reported_error is not None:
+            try:
+                errors.append(float(reported_error))
+                continue
+            except (TypeError, ValueError):
+                return None
+        try:
+            area = float(facet["areaSqFt"])
+            horizontal = float(facet["horizontalAreaSqFt"])
+            pitch = float(facet["pitchDegrees"])
+            calculated = horizontal / math.cos(math.radians(pitch))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            return None
+        if area <= 0 or not all(math.isfinite(value) for value in (area, calculated)):
+            return None
+        errors.append(abs(calculated - area) / area * 100.0)
+    return max(errors)
+
+
+def evaluate_candidate_runs(
+    reference: ReferenceMeasurements,
+    payloads: list[dict[str, Any]],
+    *,
+    maximum_area_error_percent: float = 1.0,
+    maximum_pitch_error_degrees: float = 1.0,
+    maximum_edge_error_feet: float = 1.0,
+    minimum_repeat_runs: int = 2,
+) -> dict[str, Any]:
+    """Apply every production promotion gate to repeated Cape Roof results."""
+
+    if len(payloads) < minimum_repeat_runs:
+        return {
+            "status": "INSUFFICIENT_REPEAT_RUNS",
+            "inspectionRequired": True,
+            "repeatRunCount": len(payloads),
+            "minimumRepeatRuns": minimum_repeat_runs,
+        }
+    evaluations = []
+    topology_hashes = []
+    for run_index, payload in enumerate(payloads, start=1):
+        geometry = _candidate_geometry(payload)
+        topology_hash = _candidate_topology_hash(payload, geometry)
+        topology_hashes.append(topology_hash)
+        try:
+            area = float(geometry["roofAreaSqFt"])
+            pitch = float(geometry["averagePitchDegrees"])
+            facet_count = len(geometry["facets"])
+        except (KeyError, TypeError, ValueError):
+            evaluations.append(
+                {
+                    "run": run_index,
+                    "status": "FAIL",
+                    "failures": ["CANDIDATE_GEOMETRY_INCOMPLETE"],
+                }
+            )
+            continue
+        area_error = _percent_error(area, reference.roof_area_sq_ft)
+        pitch_error = abs(pitch - reference.predominant_pitch_degrees)
+        formula_error = _candidate_formula_error_percent(geometry)
+        failures = []
+        if area_error > maximum_area_error_percent:
+            failures.append("ROOF_AREA_ERROR_EXCEEDED")
+        if pitch_error > maximum_pitch_error_degrees:
+            failures.append("PITCH_ERROR_EXCEEDED")
+        if facet_count != reference.facet_count:
+            failures.append("FACET_COUNT_MISMATCH")
+        if formula_error is None or formula_error > 1e-6:
+            failures.append("COSINE_FORMULA_ERROR_EXCEEDED")
+        edge_results: dict[str, Any] = {}
+        for edge_name, (reference_field, candidate_field) in EDGE_FIELDS.items():
+            expected = getattr(reference, reference_field)
+            actual = geometry.get(candidate_field)
+            if expected is None or actual is None:
+                failures.append(f"{edge_name.upper()}_MEASUREMENT_MISSING")
+                edge_results[edge_name] = {"status": "MISSING"}
+                continue
+            absolute_error = abs(float(actual) - float(expected))
+            passed = absolute_error <= maximum_edge_error_feet
+            if not passed:
+                failures.append(f"{edge_name.upper()}_ERROR_EXCEEDED")
+            edge_results[edge_name] = {
+                "expectedFeet": float(expected),
+                "actualFeet": float(actual),
+                "absoluteErrorFeet": round(absolute_error, 4),
+                "status": "PASS" if passed else "FAIL",
+            }
+        if not topology_hash:
+            failures.append("TOPOLOGY_HASH_MISSING")
+        evaluations.append(
+            {
+                "run": run_index,
+                "status": "PASS" if not failures else "FAIL",
+                "failures": failures,
+                "areaErrorPercent": round(area_error, 6),
+                "pitchErrorDegrees": round(pitch_error, 6),
+                "facetCount": facet_count,
+                "maximumFormulaErrorPercent": (
+                    None if formula_error is None else round(formula_error, 9)
+                ),
+                "edges": edge_results,
+                "topologyHash": topology_hash,
+            }
+        )
+    stable_hash = (
+        len(topology_hashes) >= minimum_repeat_runs
+        and all(topology_hashes)
+        and len(set(topology_hashes)) == 1
+    )
+    if not stable_hash:
+        for evaluation in evaluations:
+            evaluation.setdefault("failures", []).append("TOPOLOGY_HASH_NOT_DETERMINISTIC")
+            evaluation["status"] = "FAIL"
+    passed = bool(evaluations) and all(item["status"] == "PASS" for item in evaluations)
+    return {
+        "status": "PASS" if passed else "FAIL",
+        "inspectionRequired": not passed,
+        "repeatRunCount": len(payloads),
+        "topologyHashDeterministic": stable_hash,
+        "topologyHash": topology_hashes[0] if stable_hash else "",
+        "runs": evaluations,
+    }
+
+
+def build_manifest(
+    directory: Path,
+    max_area_error_percent: float,
+    max_pitch_error_degrees: float,
+    max_edge_error_feet: float = 1.0,
+    minimum_repeat_runs: int = 2,
+) -> dict[str, Any]:
     premium_pdfs = {
         report_id: path
         for path in directory.glob("*_ECPremiumReport.PDF")
@@ -265,6 +430,11 @@ def build_manifest(directory: Path, max_area_error_percent: float, max_pitch_err
         if report_id and report_id not in json_files:
             json_files[report_id] = path
     obj_files = {report_id: path for path in directory.glob("*.obj") if (report_id := _report_id(path))}
+    candidate_files: dict[str, list[Path]] = {}
+    for path in sorted(directory.glob("*_CapeRoofGeometry*.json")):
+        report_id = _report_id(path)
+        if report_id:
+            candidate_files.setdefault(report_id, []).append(path)
 
     report_ids = sorted(set(premium_pdfs) | set(json_files))
     records: list[dict[str, Any]] = []
@@ -284,7 +454,7 @@ def build_manifest(directory: Path, max_area_error_percent: float, max_pitch_err
             "reference": asdict(reference),
             "referenceFile": reference_path.name,
             "referenceSha256": _sha256(reference_path),
-            "status": "MISSING_OBJ",
+            "status": "MISSING_CANDIDATE",
             "inspectionRequired": True,
         }
         if obj_path:
@@ -309,15 +479,48 @@ def build_manifest(directory: Path, max_area_error_percent: float, max_pitch_err
                     "areaErrorPercent": area_error,
                     "pitchErrorDegrees": pitch_error,
                     "facetCountMatches": facet_match,
-                    "status": "PASS" if passed else "FAIL",
-                    "inspectionRequired": not passed,
+                    "referenceObjStatus": "PASS" if passed else "FAIL",
+                }
+            )
+        payloads: list[dict[str, Any]] = []
+        for candidate_path in candidate_files.get(report_id, []):
+            candidate_payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+            contained_runs = candidate_payload.get("runs")
+            if isinstance(contained_runs, list):
+                payloads.extend(run for run in contained_runs if isinstance(run, dict))
+            else:
+                payloads.append(candidate_payload)
+        if payloads:
+            candidate_evaluation = evaluate_candidate_runs(
+                reference,
+                payloads,
+                maximum_area_error_percent=max_area_error_percent,
+                maximum_pitch_error_degrees=max_pitch_error_degrees,
+                maximum_edge_error_feet=max_edge_error_feet,
+                minimum_repeat_runs=minimum_repeat_runs,
+            )
+            record.update(
+                {
+                    "candidateFiles": [
+                        path.name for path in candidate_files.get(report_id, [])
+                    ],
+                    "candidateFileSha256": [
+                        _sha256(path) for path in candidate_files.get(report_id, [])
+                    ],
+                    "candidate": candidate_evaluation,
+                    "status": candidate_evaluation["status"],
+                    "inspectionRequired": candidate_evaluation["inspectionRequired"],
                 }
             )
         records.append(record)
 
     source_fingerprint = hashlib.sha256(
         "\n".join(
-            f"{record['reportId']}|{record['referenceSha256']}|{record.get('objSha256', '')}"
+            (
+                f"{record['reportId']}|{record['referenceSha256']}|"
+                f"{record.get('objSha256', '')}|"
+                f"{','.join(record.get('candidateFileSha256', []))}"
+            )
             for record in records
         ).encode("utf-8")
     ).hexdigest()
@@ -330,12 +533,17 @@ def build_manifest(directory: Path, max_area_error_percent: float, max_pitch_err
             "maximumPitchErrorDegrees": max_pitch_error_degrees,
             "facetCountMustMatch": True,
             "maximumFormulaErrorPercent": 1e-6,
+            "maximumEdgeErrorFeet": max_edge_error_feet,
+            "minimumRepeatRuns": minimum_repeat_runs,
+            "topologyHashMustBeDeterministic": True,
         },
         "summary": {
             "reports": len(records),
             "passed": sum(record["status"] == "PASS" for record in records),
             "failed": sum(record["status"] == "FAIL" for record in records),
-            "missingObj": sum(record["status"] == "MISSING_OBJ" for record in records),
+            "missingCandidate": sum(
+                record["status"] == "MISSING_CANDIDATE" for record in records
+            ),
         },
         "records": records,
     }
@@ -347,15 +555,23 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="Write de-identified JSON here; otherwise print it.")
     parser.add_argument("--max-area-error-percent", type=float, default=1.0)
     parser.add_argument("--max-pitch-error-degrees", type=float, default=1.0)
+    parser.add_argument("--max-edge-error-feet", type=float, default=1.0)
+    parser.add_argument("--minimum-repeat-runs", type=int, default=2)
     args = parser.parse_args(argv)
-    manifest = build_manifest(args.directory, args.max_area_error_percent, args.max_pitch_error_degrees)
+    manifest = build_manifest(
+        args.directory,
+        args.max_area_error_percent,
+        args.max_pitch_error_degrees,
+        args.max_edge_error_feet,
+        args.minimum_repeat_runs,
+    )
     rendered = json.dumps(manifest, indent=2, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered + "\n", encoding="utf-8")
     else:
         print(rendered)
-    return 0 if manifest["summary"]["failed"] == 0 else 2
+    return 0 if manifest["summary"]["passed"] == manifest["summary"]["reports"] else 2
 
 
 if __name__ == "__main__":

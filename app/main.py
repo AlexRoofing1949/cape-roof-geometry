@@ -97,7 +97,9 @@ async def roof_geometry(request: GeometryRequest, configured: Settings = Depends
         )
         return JSONResponse(
             status_code=error.http_status,
+            headers={"X-Request-ID": request.requestId},
             content={
+                "requestId": request.requestId,
                 "available": False,
                 "verificationStatus": "INSPECTION_REQUIRED",
                 "pricingAllowed": False,
@@ -112,7 +114,9 @@ async def roof_geometry(request: GeometryRequest, configured: Settings = Depends
         LOGGER.exception("geometry_unexpected_error request_id=%s", request.requestId)
         return JSONResponse(
             status_code=500,
+            headers={"X-Request-ID": request.requestId},
             content={
+                "requestId": request.requestId,
                 "available": False,
                 "verificationStatus": "INSPECTION_REQUIRED",
                 "pricingAllowed": False,
@@ -128,4 +132,8 @@ async def roof_geometry(request: GeometryRequest, configured: Settings = Depends
         result["pricingAllowed"],
         result["geometry"]["confidence"],
     )
-    return JSONResponse(status_code=200, content=result)
+    return JSONResponse(
+        status_code=200,
+        headers={"X-Request-ID": request.requestId},
+        content=result,
+    )
