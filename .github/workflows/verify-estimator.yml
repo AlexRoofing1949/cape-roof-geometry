@@ -25,6 +25,7 @@ jobs:
         run: |
           mkdir -p verification
           python tools/apply_estimator_repairs.py
+          python tools/repair_overture_release_policy.py
           git diff --check
       - name: Install full regression dependencies
         run: python -m pip install fastapi==0.141.1 uvicorn==0.52.4 ijson==3.5.1 shapely==2.1.2 pyproj==3.7.2 PyYAML==6.0.3 open3d-cpu==0.19.0
@@ -46,7 +47,7 @@ jobs:
             test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
             git config user.name 'CapeRoof verified repair'
             git config user.email 'noreply@caperoof.com'
-            git commit -m 'Repair ground retention, density evidence and LiDAR source fallback'
+            git commit -m 'Repair geometry and audit current Overture releases'
             git push origin HEAD:refs/heads/repair/estimator-2026-10-11
           fi
       - name: Read public production health without credentials
@@ -81,4 +82,30 @@ jobs:
         with:
           name: estimator-verification
           path: verification/
+          retention-days: 7
+  native-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply identical reviewed source changes
+        run: |
+          python3 tools/apply_estimator_repairs.py
+          python3 tools/repair_overture_release_policy.py
+          mkdir -p native-evidence
+      - name: Build pinned production image
+        shell: bash
+        run: |
+          set -o pipefail
+          docker build -t caperoof-native-check . 2>&1 | tee native-evidence/build.txt
+      - name: Measure a synthetic gable with real PDAL Roofer and Open3D
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm -e PYTHONPATH=/srv/cape-roof-geometry -v "$PWD/tools:/checks:ro" caperoof-native-check python /checks/native_geometry_smoke.py 2>&1 | tee native-evidence/smoke.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-geometry-evidence
+          path: native-evidence/
           retention-days: 7
