@@ -54,6 +54,31 @@ def _quality_number(attributes: dict[str, Any], field: str) -> float:
             raise RuntimeError('Unexpected release test fixture layout')
         path.write_bytes(data.replace(before, after, 1))
 
+    # Local ground neighbours around a roof can be collinear; weighted HAG
+    # avoids a degenerate local triangulation without modifying roof elevations.
+    path = ROOT / 'app/pipeline.py'
+    data = path.read_bytes()
+    if b'"type": "filters.hag_nn"' not in data:
+        before = b'"type": "filters.hag_delaunay",\n                "count": 8,'
+        after = b'"type": "filters.hag_nn",\n                "count": 8,\n                "max_distance": 50.0,'
+        if data.count(before) != 1:
+            raise RuntimeError('Unexpected HAG stage layout')
+        data = data.replace(before, after, 1)
+        data = data.replace(b'"PDAL HAG + height filter + 3D cluster noise rejection + "',
+                            b'"PDAL distance-weighted HAG (8 neighbours, 50 m cap) + height filter + 3D cluster noise rejection + "')
+        path.write_bytes(data)
+    path = ROOT / 'tests/test_regional_sources.py'
+    data = path.read_bytes()
+    if b'filters.hag_delaunay' in data:
+        if data.count(b'filters.hag_delaunay') != 2:
+            raise RuntimeError('Unexpected HAG test layout')
+        data = data.replace(b'filters.hag_delaunay', b'filters.hag_nn')
+        anchor = b'            for stage_type in ("filters.cluster", "filters.normal"):'
+        extra = b'            hag = next(item for item in stages if item["type"] == "filters.hag_nn")\n            self.assertEqual(hag["count"], 8)\n            self.assertEqual(hag["max_distance"], 50.0)\n            self.assertIs(hag["allow_extrapolation"], False)\n'
+        if data.count(anchor) != 1:
+            raise RuntimeError('Unexpected HAG assertion layout')
+        path.write_bytes(data.replace(anchor, extra + anchor, 1))
+
     # Millimetre-scale synthetic LAS coordinates require a local integer offset.
     path = ROOT / 'tools/native_geometry_smoke.py'
     data = path.read_bytes()
