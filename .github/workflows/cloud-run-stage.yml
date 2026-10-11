@@ -1,0 +1,90 @@
+name: Stage CapeRoof Cloud Run release
+on:
+  push:
+    branches: [main]
+    paths: ['deploy/**', '.github/workflows/cloud-run-stage.yml', 'tests/test_cloud_run_release.py']
+  pull_request:
+    branches: [main]
+    paths: ['deploy/**', '.github/workflows/cloud-run-stage.yml', 'tests/test_cloud_run_release.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: caperoof-cloud-run-release
+  cancel-in-progress: false
+jobs:
+  release-guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test release guards and Apps Script helpers
+        run: |
+          python -m unittest discover -s tests -p 'test_cloud_run_release.py' -v
+          node --test tests/test_apps_script_repair.cjs
+  stage:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: release-guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || vars.WIF_PROVIDER || vars.WORKLOAD_IDENTITY_PROVIDER || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER || secrets.WIF_PROVIDER }}
+      DEPLOY_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT || vars.GCP_SERVICE_ACCOUNT || vars.SERVICE_ACCOUNT_EMAIL || secrets.GCP_DEPLOY_SERVICE_ACCOUNT || secrets.GCP_SERVICE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Require existing keyless Google authentication
+        run: |
+          python - <<'PY'
+          import os
+          if not os.environ.get('WIF_PROVIDER'):
+              raise SystemExit('DEPLOYMENT_AUTH_NOT_CONFIGURED: configure the existing workload identity provider; no cloud resources have been changed.')
+          PY
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: wise-dispatcher-506222-q4
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3
+      - name: Build, test and stage with no production traffic
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/caperoof-public-evidence"
+          python deploy/cloud_run_release.py --stage --state-dir "$RUNNER_TEMP/caperoof-private-state" | tee "$RUNNER_TEMP/caperoof-public-evidence/staging-result.json"
+      - name: Record public production health, not deployment success
+        if: always()
+        run: |
+          python - <<'PY'
+          import os, json, urllib.request, urllib.error
+          from pathlib import Path
+          from datetime import datetime, timezone
+          out=Path(os.environ['RUNNER_TEMP'])/'caperoof-public-evidence'
+          out.mkdir(exist_ok=True)
+          result={'checkedAt':datetime.now(timezone.utc).isoformat(),'requestedCommit':os.environ['GITHUB_SHA']}
+          try:
+              with urllib.request.urlopen('https://geometry.caperoof.com/healthz',timeout=40) as response:
+                  p=json.load(response)
+                  result.update(httpStatus=response.status, **{k:p.get(k) for k in ('status','serviceCommit','registryVersion')})
+          except urllib.error.HTTPError as e:
+              result['httpStatus']=e.code
+          except Exception as e:
+              result['errorType']=type(e).__name__
+          (out/'production-health.json').write_text(json.dumps(result,indent=2))
+          print(json.dumps(result))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: caperoof-release-public-evidence
+          path: ${{ runner.temp }}/caperoof-public-evidence/
+          retention-days: 7

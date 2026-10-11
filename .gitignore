@@ -2,3 +2,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
+gha-creds-*.json
+.clasprc.json
+.caperoof-releases/
+*.private.json
