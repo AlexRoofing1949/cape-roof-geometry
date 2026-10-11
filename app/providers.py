@@ -148,6 +148,9 @@ def _select_footprint_feature(
                 continue
         if geometry.geom_type != "Polygon" or geometry.is_empty or not geometry.is_valid:
             continue
+        # Identical duplicate records are not competing buildings.
+        if any(geometry.equals(existing[3]) for existing in candidates):
+            continue
         projected = transform_geometry(geometry, "EPSG:4326", f"EPSG:{epsg}")
         candidates.append(
             (float(projected.distance(point_projected)), float(projected.area), feature, geometry)
@@ -164,6 +167,7 @@ def _select_footprint_feature(
         if (
             second[0] <= settings.footprint_max_distance_meters
             and abs(second[0] - first[0]) <= settings.footprint_ambiguity_meters
+            and not (first[3].contains(point) and not second[3].covers(point))
         ):
             raise UnreliableGeometryError(
                 "BUILDING_FOOTPRINT_AMBIGUOUS",
@@ -1257,6 +1261,8 @@ def select_regional_lidar(
     candidates: list[LidarResource] = []
     audit: list[dict[str, Any]] = []
     catalog_features: list[dict[str, Any]] | None = None
+    catalog_error: str | None = None
+    transient_failures = False
 
     for source in registries.lidar_sources:
         record: dict[str, Any] = {
@@ -1281,8 +1287,16 @@ def select_regional_lidar(
             continue
 
         if source.access == "usgs_tnm":
-            if catalog_features is None:
-                catalog_features = list(_catalog_features(settings))
+            if catalog_features is None and catalog_error is None:
+                try:
+                    catalog_features = list(_catalog_features(settings))
+                except (TransientProviderError, NoCoverageError, UnreliableGeometryError) as error:
+                    catalog_error = error.code
+                    transient_failures = transient_failures or error.retryable
+            if catalog_error is not None:
+                record.update(decision="SOURCE_UNAVAILABLE", errorCode=catalog_error)
+                audit.append(record)
+                continue
             matched = False
             for feature in catalog_features:
                 properties = feature.get("properties") or {}
@@ -1316,7 +1330,13 @@ def select_regional_lidar(
             continue
 
         if source.endpoint:
-            coverage, point_count = _ept_coverage(source.endpoint, settings)
+            try:
+                coverage, point_count = _ept_coverage(source.endpoint, settings)
+            except (TransientProviderError, NoCoverageError, UnreliableGeometryError) as error:
+                record.update(decision="SOURCE_UNAVAILABLE", errorCode=error.code)
+                audit.append(record)
+                transient_failures = transient_failures or error.retryable
+                continue
             ratio = _coverage_ratio(coverage, buffered)
             record["coverageRatio"] = round(ratio, 6)
             if ratio >= settings.minimum_lidar_coverage_ratio:
@@ -1348,5 +1368,10 @@ def select_regional_lidar(
         reverse=True,
     )
     if not candidates:
+        if transient_failures:
+            raise TransientProviderError(
+                "LIDAR_SOURCES_TEMPORARILY_UNAVAILABLE",
+                "Eligible LiDAR sources are temporarily unavailable; retry this request.",
+            )
         raise NoCoverageError("NO_LIDAR_COVERAGE", "No enabled registered LiDAR source completely covers this building.")
     return county, candidates, audit

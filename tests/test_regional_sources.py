@@ -755,12 +755,20 @@ sources:
             self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.normal"))
             self.assertEqual(
                 sum(
-                    stage.get("expression") == "ClusterID > 0"
+                    stage.get("expression") == "Classification == 2 || ClusterID > 0"
                     for stage in stages
                     if stage.get("type") == "filters.expression"
                 ),
                 1,
             )
+            for stage_type in ("filters.cluster", "filters.normal"):
+                stage = next(item for item in stages if item["type"] == stage_type)
+                self.assertEqual(stage["where"], "Classification != 2")
+                self.assertIs(stage["where_merge"], True)
+            for dimension in ("HeightAboveGround", "NormalZ"):
+                expression = next(item["expression"] for item in stages
+                                  if dimension in item.get("expression", ""))
+                self.assertIn("Classification == 2 ||", expression)
             self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.assign"))
             self.assertEqual(
                 audit["rooferClassNormalization"],
