@@ -1,0 +1,47 @@
+name: Check production deployment access
+on:
+  push:
+    branches: ['deploy/production-2026-10-11']
+    paths: ['.github/workflows/deployment-access.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  access:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GCP_PROJECT: wise-dispatcher-506222-q4
+      WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || vars.WIF_PROVIDER || vars.WORKLOAD_IDENTITY_PROVIDER || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER || secrets.WIF_PROVIDER }}
+      DEPLOY_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT || vars.GCP_SERVICE_ACCOUNT || vars.SERVICE_ACCOUNT_EMAIL || secrets.GCP_DEPLOY_SERVICE_ACCOUNT || secrets.GCP_SERVICE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify authentication configuration presence only
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          result = {'workloadIdentityProviderConfigured': bool(os.environ.get('WIF_PROVIDER')), 'deploymentServiceAccountConfigured': bool(os.environ.get('DEPLOY_ACCOUNT')), 'cloudResourcesChanged': False}
+          pathlib.Path('verification').mkdir(exist_ok=True)
+          pathlib.Path('verification/deployment-access.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result))
+          if not result['workloadIdentityProviderConfigured']:
+              raise SystemExit('DEPLOYMENT_AUTH_NOT_CONFIGURED: no existing GitHub-to-Google workload identity provider is configured for this job. No cloud deployment attempted.')
+          PY
+      - uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3
+      - name: Check existing production service access without reading secret values
+        run: |
+          gcloud run services describe cape-roof-geometry --project="$GCP_PROJECT" --region=us-central1 --format='value(status.latestReadyRevisionName)' > verification/accessible-revision.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-deployment-access
+          path: verification/
+          retention-days: 7
