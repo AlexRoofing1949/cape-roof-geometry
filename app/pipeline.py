@@ -122,8 +122,9 @@ def _pdal_crop(
     if 1 in lidar.roof_classes:
         class_one_preprocessing = [
             {
-                "type": "filters.hag_delaunay",
+                "type": "filters.hag_nn",
                 "count": 8,
+                "max_distance": 50.0,
                 "allow_extrapolation": False,
             },
             {
@@ -255,7 +256,7 @@ def _pdal_crop(
         "classOneCorrection": {
             "applied": bool(class_one_preprocessing),
             "method": (
-                "PDAL HAG + height filter + 3D cluster noise rejection + "
+                "PDAL distance-weighted HAG (8 neighbours, 50 m cap) + height filter + 3D cluster noise rejection + "
                 "surface-normal/curvature filtering for unclassified returns"
             ),
             "minimumHeightAboveGroundMeters": settings.minimum_roof_hag_meters,

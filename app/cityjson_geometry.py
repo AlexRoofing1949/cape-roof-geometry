@@ -461,14 +461,32 @@ def _roof_facets(feature: dict[str, Any], transform: dict[str, Any] | None) -> t
     return facets, parent_attributes
 
 
+def _quality_number(attributes: dict[str, Any], field: str) -> float:
+    """Keep genuine zero; reject missing, non-finite, or impossible QA evidence."""
+    raw = attributes.get(field)
+    try:
+        if raw is None or isinstance(raw, bool) or (isinstance(raw, str) and not raw.strip()):
+            raise ValueError("missing or invalid")
+        value = float(raw)
+        if not math.isfinite(value) or value < 0 or (field == "rf_nodata_frac" and value > 1):
+            raise ValueError("out of range")
+        return value
+    except (TypeError, ValueError, OverflowError) as error:
+        raise UnreliableGeometryError(
+            "ROOFER_QUALITY_METADATA_INVALID",
+            "Roof reconstruction quality evidence is missing or invalid.",
+            details={"field": field},
+        ) from error
+
+
 def _quality_confidence(attributes: dict[str, Any], minimum_density: float, maximum_nodata_fraction: float, maximum_rmse: float) -> tuple[float, dict[str, float]]:
     if attributes.get("rf_success") is False or attributes.get("rf_pointcloud_unusable") is True:
         raise UnreliableGeometryError("ROOFER_RECONSTRUCTION_UNUSABLE", "Roofer marked the source point cloud or reconstruction unusable.")
     if str(attributes.get("rf_extrusion_mode", "standard")) != "standard":
         raise UnreliableGeometryError("ROOFER_FALLBACK_MODEL", "Roofer used a fallback extrusion instead of verified LoD2.2 roof planes.")
-    density = float(attributes.get("rf_pt_density", 0) or 0)
-    nodata = float(attributes.get("rf_nodata_frac", 1) or 1)
-    rmse = float(attributes.get("rf_rmse_lod22", math.inf) or math.inf)
+    density = _quality_number(attributes, "rf_pt_density")
+    nodata = _quality_number(attributes, "rf_nodata_frac")
+    rmse = _quality_number(attributes, "rf_rmse_lod22")
     if density < minimum_density:
         raise UnreliableGeometryError(
             "LIDAR_DENSITY_TOO_LOW",

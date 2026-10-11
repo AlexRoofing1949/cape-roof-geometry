@@ -44,7 +44,7 @@ def main():
         writer_pipeline.write_text(json.dumps({'pipeline':[
             {'type':'readers.text','filename':str(source),'override_srs':'EPSG:32617'},
             {'type':'writers.las','filename':str(las),'a_srs':'EPSG:32617',
-             'minor_version':4,'dataformat_id':6,'scale_x':0.001,'scale_y':0.001,'scale_z':0.001}]}))
+             'minor_version':4,'dataformat_id':6,'scale_x':0.001,'scale_y':0.001,'scale_z':0.001,'offset_x':'auto','offset_y':'auto','offset_z':'auto'}]}))
         subprocess.run(['pdal','pipeline',str(writer_pipeline)],check=True)
         outline=transform_geometry(box(500000,2940000,500020,2940010),'EPSG:32617','EPSG:4326')
         fp=FootprintResult(outline,'synthetic-gable','synthetic',0,[])

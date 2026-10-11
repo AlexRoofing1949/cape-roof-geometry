@@ -252,12 +252,25 @@ def _require_pinned_overture_release(settings: Settings) -> str:
     return latest
 
 
+def _download_overture_release(settings: Settings) -> str:
+    """Audit the official current release, or enforce an explicit strict pin."""
+    policy = os.getenv("OVERTURE_RELEASE_POLICY", "current").strip().lower()
+    if policy == "pinned":
+        return _require_pinned_overture_release(settings)
+    if policy != "current":
+        raise UnreliableGeometryError(
+            "OVERTURE_RELEASE_POLICY_INVALID",
+            "OVERTURE_RELEASE_POLICY must be current or pinned.",
+        )
+    return _current_overture_release(settings)
+
+
 def fetch_overture_footprint(
     longitude: float, latitude: float, workspace: Path, settings: Settings
 ) -> FootprintResult:
     """Download only nearby Overture buildings and select one unambiguous polygon."""
 
-    release = _require_pinned_overture_release(settings)
+    release = _download_overture_release(settings)
     west, south, east, north = _bbox(longitude, latitude, settings.footprint_search_radius_meters)
     output_path = workspace / "overture-buildings.geojson"
     _run(
@@ -273,7 +286,7 @@ def fetch_overture_footprint(
         ],
         timeout=settings.provider_timeout_seconds,
     )
-    if _require_pinned_overture_release(settings) != release:
+    if _download_overture_release(settings) != release:
         raise UnreliableGeometryError(
             "OVERTURE_RELEASE_CHANGED_DURING_DOWNLOAD",
             "The Overture release changed while the building footprint was being downloaded.",
