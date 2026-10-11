@@ -1,0 +1,86 @@
+name: Collect visual setup guide reference images
+on:
+  push:
+    branches: ['docs/visual-setup-guide-2026-10-11']
+    paths: ['.github/workflows/visual-guide-assets.yml']
+permissions:
+  contents: read
+jobs:
+  reference-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download public official-reference images only
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request, urllib.parse, pathlib, concurrent.futures
+          from html.parser import HTMLParser
+          out=pathlib.Path('reference-images'); out.mkdir()
+          allowed={'codelabs.developers.google.com','docs.github.com','docs.cloud.google.com','developers.google.com','storage.googleapis.com','www.gstatic.com'}
+          def get(url):
+              if urllib.parse.urlparse(url).hostname not in allowed:
+                  raise ValueError('Unapproved public documentation host')
+              with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'CapeRoof-setup-guide/1.0'}),timeout=25) as r:
+                  if urllib.parse.urlparse(r.url).hostname not in allowed: raise ValueError('Unexpected redirect')
+                  data=r.read(15000001)
+                  if len(data)>15000000: raise ValueError('Image too large')
+                  return data
+          class Images(HTMLParser):
+              def __init__(self): super().__init__(); self.images=[]
+              def handle_starttag(self,tag,attrs):
+                  if tag=='img':
+                      a=dict(attrs); src=a.get('src') or a.get('data-src')
+                      if src:self.images.append({'src':src,'alt':a.get('alt','')})
+          pages={
+            'cloud':'https://codelabs.developers.google.com/cloudshell-cloudcode-deepdive',
+            'authorize':'https://codelabs.developers.google.com/cloud-genai',
+            'script':'https://codelabs.developers.google.com/devsite/codelabs/apps-script-vibe-code-gmail-add-on-gemini-cli-mcp-servers',
+            'variables':'https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-variables',
+            'run':'https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow',
+          }
+          wanted={
+            'a78258af94ed9ec3.png':'cloud_project.png',
+            '5b4246f45b173ff4.png':'cloud_activate.png',
+            '8495f27a3ed0f05.png':'cloud_terminal.png',
+            '4a95152439f0159b.png':'cloud_authorize.png',
+            '3c1dabeca90e44e5.png':'cloud_header.png',
+            '9c92662c6a846a5c.png':'cloud_continue.png',
+            '9f0e51b578fecce5.png':'cloud_terminal_alt.png',
+            '41eb25a89e13e1ff.gif':'script_api.gif',
+            '2bc043bb3c3a216d.png':'script_settings.png',
+            'e74dca570d64e540.png':'script_manifest.png',
+            'repo-actions-settings.png':'github_settings.png',
+            'actions-variables-tab.png':'github_variables.png',
+            'actions-tab-global-nav-update.png':'github_actions.png',
+            'actions-select-workflow-2022.png':'github_select_workflow.png',
+            'actions-workflow-dispatch.png':'github_run.png',
+          }
+          manifest=[]; downloads=[]
+          for page,url in pages.items():
+              try:
+                  html=get(url).decode('utf-8'); p=Images();p.feed(html)
+                  (out/(page+'-image-index.json')).write_text(json.dumps(p.images,indent=2))
+                  for im in p.images:
+                      src=urllib.parse.urljoin(url,im['src']); name=urllib.parse.urlparse(src).path.rsplit('/',1)[-1]
+                      if name in wanted: downloads.append((wanted[name],src,url,im['alt']))
+              except Exception as e: manifest.append({'page':url,'errorType':type(e).__name__})
+          downloads.append(('cloud_shell_icon.png','https://docs.cloud.google.com/static/shell/docs/images/activate-cloud-shell-button-in-console.png','https://docs.cloud.google.com/shell/docs/launching-cloud-shell-editor','Cloud Shell header controls'))
+          def save(t):
+              filename,url,source,alt=t
+              try:
+                  data=get(url);(out/filename).write_bytes(data)
+                  return {'file':filename,'imageUrl':url,'sourcePage':source,'alt':alt,'bytes':len(data)}
+              except Exception as e:return {'file':filename,'imageUrl':url,'sourcePage':source,'errorType':type(e).__name__}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+              manifest.extend(pool.map(save,downloads))
+          (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
+          print(json.dumps(manifest,indent=2))
+          if not any('bytes' in row for row in manifest): raise SystemExit('No reference images retrieved')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: official-setup-reference-images
+          path: reference-images/
+          retention-days: 7
