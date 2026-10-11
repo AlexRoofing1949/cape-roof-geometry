@@ -40,6 +40,8 @@ def _quality_number(attributes: dict[str, Any], field: str) -> float:
             if data.count(before) != 1:
                 raise RuntimeError('Unexpected quality field layout')
             data = data.replace(before, after, 1)
+            # Changed lines use LF, preserving untouched mixed-ending source.
+            data = data.replace(after + b"\r\n", after + b"\n")
         path.write_bytes(data)
 
     # Mock the selected-release boundary, not the old strict-pin implementation.
