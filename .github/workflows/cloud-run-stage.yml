@@ -26,6 +26,7 @@ jobs:
       - name: Test release guards and Apps Script helpers
         run: |
           python -m unittest discover -s tests -p 'test_cloud_run_release.py' -v
+          python -m unittest discover -s tests -p 'test_connect_google.py' -v
           node --test tests/test_apps_script_repair.cjs
   stage:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -37,6 +38,8 @@ jobs:
       id-token: write
     env:
       WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER || vars.WIF_PROVIDER || vars.WORKLOAD_IDENTITY_PROVIDER || secrets.GCP_WORKLOAD_IDENTITY_PROVIDER || secrets.WIF_PROVIDER }}
+      CAPE_ROOF_BUILD_SERVICE_ACCOUNT: ${{ vars.CAPE_ROOF_BUILD_SERVICE_ACCOUNT }}
+      CAPE_ROOF_BUILD_STAGING_BUCKET: ${{ vars.CAPE_ROOF_BUILD_STAGING_BUCKET }}
       DEPLOY_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT || vars.GCP_SERVICE_ACCOUNT || vars.SERVICE_ACCOUNT_EMAIL || secrets.GCP_DEPLOY_SERVICE_ACCOUNT || secrets.GCP_SERVICE_ACCOUNT }}
     steps:
       - uses: actions/checkout@v4
@@ -49,13 +52,18 @@ jobs:
           if not os.environ.get('WIF_PROVIDER'):
               raise SystemExit('DEPLOYMENT_AUTH_NOT_CONFIGURED: configure the existing workload identity provider; no cloud resources have been changed.')
           PY
-      - uses: google-github-actions/auth@v3
+      - id: google-auth
+        uses: google-github-actions/auth@v3
         with:
+          token_format: access_token
+          access_token_lifetime: 3600s
           project_id: wise-dispatcher-506222-q4
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOY_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v3
       - name: Build, test and stage with no production traffic
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.google-auth.outputs.access_token }}
         shell: bash
         run: |
           set -o pipefail
