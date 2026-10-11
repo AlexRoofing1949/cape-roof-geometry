@@ -78,9 +78,23 @@ def traffic_map(service):
         raise ReleaseError('Cannot establish a complete production traffic snapshot.')
     return result
 
+def build_identity_config():
+    account = os.environ.get('CAPE_ROOF_BUILD_SERVICE_ACCOUNT', '').strip()
+    bucket = os.environ.get('CAPE_ROOF_BUILD_STAGING_BUCKET', '').strip()
+    if not account and not bucket:
+        return None, None
+    if not re.fullmatch(r'projects/' + re.escape(PROJECT) + r'/serviceAccounts/[a-z][a-z0-9-]{4,28}[a-z0-9]@' + re.escape(PROJECT) + r'\.iam\.gserviceaccount\.com', account):
+        raise ReleaseError('Invalid or missing same-project build service account.')
+    if bucket != PROJECT + '_cloudbuild':
+        raise ReleaseError('Build source bucket must match the owner-verified setup bucket.')
+    return account, bucket
+
+
 def build_config(image):
     mount = ['--rm','-v','/workspace:/checks:ro','-e','PYTHONPATH=/srv/cape-roof-geometry:/checks']
+    account, bucket = build_identity_config()
     return {
+        **({'serviceAccount': account, 'options': {'logging': 'CLOUD_LOGGING_ONLY'}} if account else {}),
         'steps': [
             {'name':'gcr.io/cloud-builders/docker','args':['build','-t',image,'.']},
             {'name':'gcr.io/cloud-builders/docker','args':['run',*mount,image,'python','-m','unittest','discover','-s','/checks/tests','-v']},
@@ -103,6 +117,7 @@ def staged_revision(service, commit, digest):
 def stage(apply=False, state_dir=None):
     if not shutil.which('gcloud'):
         raise ReleaseError('GOOGLE_AUTH_REQUIRED: run in an authenticated Google Cloud Shell; gcloud is unavailable here.')
+    build_account, source_bucket = build_identity_config()
     # Resolve the already existing service before submitting any billable build.
     before = json.loads(gcloud('run','services','describe',SERVICE,'--region='+REGION))
     stable = stable_config(before)
@@ -128,7 +143,8 @@ def stage(apply=False, state_dir=None):
     with tempfile.TemporaryDirectory(prefix='caperoof-build-') as temp:
         source = Path(temp)/'source.tgz'; source.write_bytes(archive)
         config = Path(temp)/'cloudbuild.json'; config.write_text(json.dumps(build_config(image)))
-        build = json.loads(gcloud('builds','submit',str(source),'--config='+str(config),'--suppress-logs','--timeout=1200s'))
+        source_args = ['--gcs-source-staging-dir=gs://'+source_bucket+'/source'] if source_bucket else []
+        build = json.loads(gcloud('builds','submit',str(source),'--config='+str(config),'--suppress-logs','--timeout=1200s','--region=global',*source_args))
     if isinstance(build,list):
         if len(build) != 1: raise ReleaseError('Unexpected Cloud Build response.')
         build=build[0]
