@@ -351,7 +351,7 @@ sources:
         self.assertFalse(result.consensus_records[-1]["independent"])
 
     @unittest.skipUnless(SPATIAL_RUNTIME_AVAILABLE, "container spatial dependencies are not installed")
-    @patch("app.providers._require_pinned_overture_release", side_effect=["2026-08-19.0", "2026-08-19.0"])
+    @patch("app.providers._download_overture_release", side_effect=["2026-08-19.0", "2026-08-19.0"])
     @patch("app.providers._run")
     def test_overture_download_works_around_absolute_catalog_link_bug(self, run, _release):
         observed = {}
@@ -750,17 +750,29 @@ sources:
             stage_types = [stage["type"] for stage in stages]
             self.assertLess(stage_types.index("filters.stats"), stage_types.index("filters.assign"))
             self.assertLess(stage_types.index("filters.outlier"), stage_types.index("filters.stats"))
-            self.assertLess(stage_types.index("filters.reprojection"), stage_types.index("filters.hag_delaunay"))
-            self.assertLess(stage_types.index("filters.hag_delaunay"), stage_types.index("filters.cluster"))
+            self.assertLess(stage_types.index("filters.reprojection"), stage_types.index("filters.hag_nn"))
+            self.assertLess(stage_types.index("filters.hag_nn"), stage_types.index("filters.cluster"))
             self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.normal"))
             self.assertEqual(
                 sum(
-                    stage.get("expression") == "ClusterID > 0"
+                    stage.get("expression") == "Classification == 2 || ClusterID > 0"
                     for stage in stages
                     if stage.get("type") == "filters.expression"
                 ),
                 1,
             )
+            hag = next(item for item in stages if item["type"] == "filters.hag_nn")
+            self.assertEqual(hag["count"], 8)
+            self.assertEqual(hag["max_distance"], 50.0)
+            self.assertIs(hag["allow_extrapolation"], False)
+            for stage_type in ("filters.cluster", "filters.normal"):
+                stage = next(item for item in stages if item["type"] == stage_type)
+                self.assertEqual(stage["where"], "Classification != 2")
+                self.assertIs(stage["where_merge"], True)
+            for dimension in ("HeightAboveGround", "NormalZ"):
+                expression = next(item["expression"] for item in stages
+                                  if dimension in item.get("expression", ""))
+                self.assertIn("Classification == 2 ||", expression)
             self.assertLess(stage_types.index("filters.cluster"), stage_types.index("filters.assign"))
             self.assertEqual(
                 audit["rooferClassNormalization"],

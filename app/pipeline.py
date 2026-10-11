@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -121,14 +122,15 @@ def _pdal_crop(
     if 1 in lidar.roof_classes:
         class_one_preprocessing = [
             {
-                "type": "filters.hag_delaunay",
+                "type": "filters.hag_nn",
                 "count": 8,
+                "max_distance": 50.0,
                 "allow_extrapolation": False,
             },
             {
                 "type": "filters.expression",
                 "expression": (
-                    "Classification == 6 || "
+                    "Classification == 2 || Classification == 6 || "
                     f"(Classification == 1 && HeightAboveGround >= {settings.minimum_roof_hag_meters} "
                     f"&& HeightAboveGround <= {settings.maximum_roof_hag_meters})"
                 ),
@@ -138,20 +140,24 @@ def _pdal_crop(
                 "tolerance": settings.roof_cluster_tolerance_meters,
                 "min_points": settings.minimum_roof_cluster_points,
                 "is3d": True,
+                "where": "Classification != 2",
+                "where_merge": True,
             },
             {
                 "type": "filters.expression",
-                "expression": "ClusterID > 0",
+                "expression": "Classification == 2 || ClusterID > 0",
             },
             {
                 "type": "filters.normal",
                 "knn": ROOF_NORMAL_KNN,
                 "always_up": True,
+                "where": "Classification != 2",
+                "where_merge": True,
             },
             {
                 "type": "filters.expression",
                 "expression": (
-                    "Classification == 6 || "
+                    "Classification == 2 || Classification == 6 || "
                     f"(Classification == 1 && NormalZ >= {MINIMUM_ROOF_NORMAL_Z} "
                     f"&& Curvature <= {MAXIMUM_ROOF_CURVATURE})"
                 ),
@@ -250,7 +256,7 @@ def _pdal_crop(
         "classOneCorrection": {
             "applied": bool(class_one_preprocessing),
             "method": (
-                "PDAL HAG + height filter + 3D cluster noise rejection + "
+                "PDAL distance-weighted HAG (8 neighbours, 50 m cap) + height filter + 3D cluster noise rejection + "
                 "surface-normal/curvature filtering for unclassified returns"
             ),
             "minimumHeightAboveGroundMeters": settings.minimum_roof_hag_meters,
@@ -264,6 +270,29 @@ def _pdal_crop(
         "tileAcquisitionDate": tile_acquisition_date,
         "pipeline": pipeline,
     }
+
+
+def _roofprint_point_density(
+    pointcloud: Path, projected_footprint: Any, workspace: Path, settings: Settings
+) -> dict[str, float | int | str]:
+    """Count roof returns inside the unbuffered roofprint, excluding ground."""
+    area = float(projected_footprint.area)
+    if not math.isfinite(area) or area <= 0:
+        raise UnreliableGeometryError("ROOFPRINT_AREA_INVALID", "The roofprint area is invalid.")
+    metadata_path = workspace / "roofprint-density-metadata.json"
+    pipeline_path = workspace / "roofprint-density-pipeline.json"
+    pipeline_path.write_text(json.dumps({"pipeline": [
+        {"type": "readers.las", "filename": str(pointcloud)},
+        {"type": "filters.crop", "polygon": projected_footprint.wkt},
+        {"type": "filters.expression", "expression": "Classification == 6"},
+        {"type": "filters.stats", "dimensions": "Classification", "count": "Classification"},
+    ]}), encoding="utf-8")
+    _run(["pdal", "pipeline", "--metadata", str(metadata_path), str(pipeline_path)],
+         timeout=settings.command_timeout_seconds)
+    count = _classification_histogram(metadata_path).get("6", 0)
+    return {"roofprintReturnCount": count, "roofprintAreaSqMeters": area,
+            "pointDensityPpsm": count / area,
+            "densityBasis": "class-6 returns inside unbuffered roofprint"}
 
 
 def _classification_histogram(metadata_path: Path) -> dict[str, int]:
@@ -626,9 +655,11 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                         tile_acquisition_date=point_audit["tileAcquisitionDate"],
                         age_years=age_years,
                     )
-                point_density = float(point_audit["filteredPointCount"]) / max(
-                    float(projected_footprint.area), 0.01
+                density_audit = _roofprint_point_density(
+                    pointcloud, projected_footprint, workspace, settings
                 )
+                point_audit.update(density_audit)
+                point_density = float(density_audit["pointDensityPpsm"])
                 required_density = max(settings.minimum_point_density, lidar.minimum_density_ppsm)
                 if point_density < required_density:
                     raise UnreliableGeometryError(
@@ -720,18 +751,24 @@ def reconstruct_roof(request: GeometryRequest, settings: Settings) -> dict[str, 
                 selected = (lidar, point_audit, point_density, geometry, imagery_decision)
                 attempts.append({"sourceId": lidar.source_id, "decision": "SELECTED_VALID_CROP"})
                 break
-            except UnreliableGeometryError as error:
+            except (UnreliableGeometryError, TransientProviderError) as error:
                 attempts.append(
                     {
                         "sourceId": lidar.source_id,
                         "decision": "REJECTED_PROPERTY_CROP",
                         "errorCode": error.code,
+                        "retryable": error.retryable,
                         **({"errorDetails": error.details} if error.details else {}),
                     }
                 )
 
         selection_audit.extend(attempts)
         if selected is None:
+            if any(item.get("retryable") for item in attempts):
+                raise TransientProviderError(
+                    "LIDAR_CANDIDATES_TEMPORARILY_UNAVAILABLE",
+                    "A LiDAR candidate could not be evaluated due to a temporary failure; retry this request.",
+                )
             error_codes = {str(item.get("errorCode") or "") for item in attempts}
             code = (
                 "NO_USABLE_ROOF_RETURNS"
